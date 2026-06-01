@@ -1,8 +1,17 @@
 """
-My-Agent-Mini — Lightweight Hybrid AI Slack Bot
-Runs on Oracle Cloud E2.1.Micro (1 OCPU / 1 GB RAM) or any small VPS.
-Calls free AI APIs directly — no LiteLLM, no Docker, no database needed.
-Hybrid failover: if one provider is down or out of credits, tries the next.
+My-Agent-Mini v2 — AI Agent Slack Bot
+Runs on Google Cloud e2-micro (1 GB RAM) or any small VPS.
+
+Upgrades from v1:
+  ✅ Persistent memory (SQLite) — survives restarts
+  ✅ ReAct agent loop — multi-step task execution
+  ✅ Web search (DuckDuckGo) — real-time information
+  ✅ URL fetching — read any webpage
+  ✅ Python execution — run code in a sandbox
+  ✅ Memory search — recall past conversations
+  ✅ User facts — remembers things about you
+
+Still lightweight: ~50 MB RAM, no Docker needed.
 """
 
 import os
@@ -16,6 +25,10 @@ from pathlib import Path
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+import memory
+import tools
+import agent
+
 # ── Logging ──
 logging.basicConfig(
     level=logging.INFO,
@@ -27,20 +40,20 @@ logger = logging.getLogger("my-agent-mini")
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]      # xoxb-...
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]       # xapp-...
 BOT_NAME = os.getenv("BOT_NAME", "My Agent")
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT",
-    f"You are {BOT_NAME}, a helpful AI assistant powered by multiple free AI providers. "
-    "You help with coding, research, analysis, writing, and any question. "
-    "Be concise but thorough. Use markdown formatting suitable for Slack."
+    f"You are {BOT_NAME}, a powerful AI assistant running as a Slack bot. "
+    "You can search the web, read URLs, execute Python code, and remember things. "
+    "You help with coding, research, analysis, writing, math, and any question. "
+    "Be concise but thorough. Use markdown formatting suitable for Slack. "
+    "When using tools, explain what you're doing so the user can follow along."
 )
 
 # ── AI Provider Config ──
-# Each provider is tried in order. If one fails, the next is tried.
-# Set the API key env vars for the providers you want to use.
-# You only need ONE working provider, but more = better reliability.
+PROVIDERS = []
 
-PROVIDERS = []  # Built at startup from available env vars
+import requests as http_requests
 
 
 def build_providers():
@@ -152,31 +165,29 @@ def build_providers():
 
 
 # ── AI Calling Logic ──
-import requests as http_requests  # renamed to avoid clash with slack events
 
-
-def call_gemini(provider: dict, messages: list[dict]) -> str:
+def call_gemini(provider: dict, messages: list[dict], system_prompt: str) -> str:
     """Call Google Gemini API."""
     url = provider["url"].format(model=provider["model"])
     url += f"?key={provider['api_key']}"
 
-    # Convert messages to Gemini format
     contents = []
     for msg in messages:
+        if msg["role"] == "system":
+            continue
         role = "user" if msg["role"] == "user" else "model"
         contents.append({
             "role": role,
             "parts": [{"text": msg["content"]}]
         })
 
-    # Add system instruction separately
     payload = {
         "contents": contents,
         "systemInstruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
+            "parts": [{"text": system_prompt}]
         },
         "generationConfig": {
-            "maxOutputTokens": 3000,
+            "maxOutputTokens": 4000,
             "temperature": 0.7,
         }
     }
@@ -187,7 +198,7 @@ def call_gemini(provider: dict, messages: list[dict]) -> str:
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def call_openai_compat(provider: dict, messages: list[dict]) -> str:
+def call_openai_compat(provider: dict, messages: list[dict], system_prompt: str) -> str:
     """Call any OpenAI-compatible API (Groq, xAI, Cerebras, Together, etc.)."""
     headers = {
         "Content-Type": "application/json",
@@ -196,8 +207,8 @@ def call_openai_compat(provider: dict, messages: list[dict]) -> str:
 
     payload = {
         "model": provider["model"],
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-        "max_tokens": 3000,
+        "messages": [{"role": "system", "content": system_prompt}] + messages,
+        "max_tokens": 4000,
         "temperature": 0.7,
     }
 
@@ -207,26 +218,22 @@ def call_openai_compat(provider: dict, messages: list[dict]) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-def call_cohere(provider: dict, messages: list[dict]) -> str:
+def call_cohere(provider: dict, messages: list[dict], system_prompt: str) -> str:
     """Call Cohere API."""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {provider['api_key']}",
     }
 
-    # Convert to Cohere format
-    cohere_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    cohere_messages = [{"role": "system", "content": system_prompt}]
     for msg in messages:
-        role = msg["role"]
-        if role == "user":
-            cohere_messages.append({"role": "user", "content": msg["content"]})
-        else:
-            cohere_messages.append({"role": "assistant", "content": msg["content"]})
+        role = msg["role"] if msg["role"] in ("user", "assistant") else "user"
+        cohere_messages.append({"role": role, "content": msg["content"]})
 
     payload = {
         "model": provider["model"],
         "messages": cohere_messages,
-        "max_tokens": 3000,
+        "max_tokens": 4000,
         "temperature": 0.7,
     }
 
@@ -236,8 +243,11 @@ def call_cohere(provider: dict, messages: list[dict]) -> str:
     return data["message"]["content"][0]["text"]
 
 
-def call_ai(messages: list[dict]) -> str:
+def call_ai(messages: list[dict], system_prompt: str = None) -> str:
     """Try each AI provider in order until one succeeds."""
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT
+
     if not PROVIDERS:
         return "❌ No AI providers configured! Add at least one API key to your `.env` file."
 
@@ -248,11 +258,11 @@ def call_ai(messages: list[dict]) -> str:
             start = time.time()
 
             if provider["type"] == "gemini":
-                result = call_gemini(provider, messages)
+                result = call_gemini(provider, messages, system_prompt)
             elif provider["type"] == "cohere":
-                result = call_cohere(provider, messages)
+                result = call_cohere(provider, messages, system_prompt)
             else:
-                result = call_openai_compat(provider, messages)
+                result = call_openai_compat(provider, messages, system_prompt)
 
             elapsed = round(time.time() - start, 1)
             logger.info(f"✅ {provider['name']} responded in {elapsed}s")
@@ -264,43 +274,54 @@ def call_ai(messages: list[dict]) -> str:
             errors.append(f"• {provider['name']}: {error_msg}")
             continue
 
-    # All providers failed
     error_list = "\n".join(errors)
     return f"❌ All AI providers failed:\n{error_list}\n\nPlease check your API keys or try again later."
 
 
-# ── Conversation Memory (in-memory, lightweight) ──
-conversations: dict[str, list[dict]] = {}
-
-
-def get_conv_key(channel: str, thread_ts: str | None) -> str:
-    return f"{channel}:{thread_ts or 'main'}"
-
-
-def get_history(key: str) -> list[dict]:
-    if key not in conversations:
-        conversations[key] = []
-    return conversations[key]
-
-
-def add_to_history(key: str, role: str, content: str):
-    history = get_history(key)
-    history.append({"role": role, "content": content})
-    if len(history) > MAX_HISTORY * 2:
-        conversations[key] = history[-(MAX_HISTORY * 2):]
-
-
 def truncate_for_slack(text: str, limit: int = 3900) -> str:
+    """Truncate text to fit in a single Slack message."""
     if len(text) <= limit:
         return text
     return text[:limit] + "\n\n_(truncated — reply to continue)_"
 
 
 # ── Slack App ──
-app = App(token=SLACK_BOT_TOKEN)
+slack_app = App(token=SLACK_BOT_TOKEN)
 
 
-@app.event("message")
+def get_conv_key(channel: str, thread_ts: str | None) -> str:
+    return f"{channel}:{thread_ts or 'main'}"
+
+
+def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, say):
+    """Process a message through the agent loop."""
+    conv_key = get_conv_key(channel, thread_ts)
+
+    # Store in persistent memory
+    memory.add_message(conv_key, "user", user_text)
+
+    # Get conversation history
+    history = memory.get_history(conv_key, limit=MAX_HISTORY)
+
+    # Run through agent loop (handles tool calls automatically)
+    response = agent.run_agent_loop(
+        messages=history,
+        call_ai_fn=call_ai,
+        system_prompt=SYSTEM_PROMPT,
+        user_id=user_id,
+    )
+
+    # Clean up any leftover tool call syntax from the response
+    response = agent.extract_final_text(response)
+
+    # Store response in memory
+    memory.add_message(conv_key, "assistant", response)
+
+    # Send to Slack
+    say(text=truncate_for_slack(response), thread_ts=thread_ts)
+
+
+@slack_app.event("message")
 def handle_message(event, say):
     """Handle DMs."""
     if event.get("bot_id") or event.get("subtype"):
@@ -309,45 +330,47 @@ def handle_message(event, say):
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event.get("ts")
     user_text = event.get("text", "").strip()
+    user_id = event.get("user", "unknown")
     channel_type = event.get("channel_type", "")
 
     if not user_text or channel_type not in ("im", "mpim"):
         return
 
-    conv_key = get_conv_key(channel, thread_ts)
-    add_to_history(conv_key, "user", user_text)
+    logger.info(f"💬 DM from {user_id}: {user_text[:80]}...")
 
-    logger.info(f"💬 DM: {user_text[:80]}...")
-    response = call_ai(get_history(conv_key))
-    add_to_history(conv_key, "assistant", response)
+    try:
+        process_message(user_text, channel, thread_ts, user_id, say)
+    except Exception as e:
+        logger.error(f"❌ Error processing message: {traceback.format_exc()}")
+        say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
 
-    say(text=truncate_for_slack(response), thread_ts=thread_ts)
 
-
-@app.event("app_mention")
+@slack_app.event("app_mention")
 def handle_mention(event, say):
     """Handle @mentions in channels."""
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event["ts"]
+    user_id = event.get("user", "unknown")
     user_text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
 
     if not user_text:
-        say(text=f"Hey! I'm {BOT_NAME} 👋 Ask me anything!", thread_ts=thread_ts)
+        say(text=f"Hey! I'm {BOT_NAME} 👋 Ask me anything — I can search the web, run code, and more!", thread_ts=thread_ts)
         return
 
-    conv_key = get_conv_key(channel, thread_ts)
-    add_to_history(conv_key, "user", user_text)
+    logger.info(f"📢 Mention from {user_id}: {user_text[:80]}...")
 
-    logger.info(f"📢 Mention: {user_text[:80]}...")
-    response = call_ai(get_history(conv_key))
-    add_to_history(conv_key, "assistant", response)
+    try:
+        process_message(user_text, channel, thread_ts, user_id, say)
+    except Exception as e:
+        logger.error(f"❌ Error processing mention: {traceback.format_exc()}")
+        say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
 
-    say(text=truncate_for_slack(response), thread_ts=thread_ts)
 
+# ── Slash Commands ──
 
-@app.command("/ask")
+@slack_app.command("/ask")
 def handle_ask(ack, command, say):
-    """/ask <question> — Quick one-shot question."""
+    """/ask <question> — Quick one-shot question (no memory)."""
     ack()
     question = command.get("text", "").strip()
     if not question:
@@ -355,25 +378,52 @@ def handle_ask(ack, command, say):
         return
 
     logger.info(f"❓ /ask: {question[:80]}...")
-    response = call_ai([{"role": "user", "content": question}])
+    response = agent.run_agent_loop(
+        messages=[{"role": "user", "content": question}],
+        call_ai_fn=call_ai,
+        system_prompt=SYSTEM_PROMPT,
+        user_id=command.get("user_id", "unknown"),
+    )
+    response = agent.extract_final_text(response)
     say(
         text=f"*Q:* {question}\n\n{truncate_for_slack(response)}",
         channel=command["channel_id"],
     )
 
 
-@app.command("/clear")
+@slack_app.command("/search")
+def handle_search(ack, command, say):
+    """/search <query> — Search the web."""
+    ack()
+    query = command.get("text", "").strip()
+    if not query:
+        say("Usage: `/search <what to search for>`", channel=command["channel_id"])
+        return
+
+    logger.info(f"🔍 /search: {query[:80]}...")
+    result = tools.run_tool("web_search", {"query": query})
+    say(
+        text=f"🔍 *Search:* {query}\n\n{truncate_for_slack(result)}",
+        channel=command["channel_id"],
+    )
+
+
+@slack_app.command("/clear")
 def handle_clear(ack, command, say):
-    """/clear — Reset conversation memory."""
+    """/clear — Reset conversation memory for this channel."""
     ack()
     channel = command["channel_id"]
-    keys_to_delete = [k for k in conversations if k.startswith(f"{channel}:")]
-    for k in keys_to_delete:
-        del conversations[k]
+    # Clear all conversations starting with this channel
+    conn = memory.get_db()
+    try:
+        conn.execute("DELETE FROM conversations WHERE conv_key LIKE ?", (f"{channel}:%",))
+        conn.commit()
+    finally:
+        conn.close()
     say(text="🧹 Conversation memory cleared!", channel=channel)
 
 
-@app.command("/providers")
+@slack_app.command("/providers")
 def handle_providers(ack, command, say):
     """/providers — Show active AI providers."""
     ack()
@@ -388,6 +438,25 @@ def handle_providers(ack, command, say):
     say(text="\n".join(lines), channel=command["channel_id"])
 
 
+@slack_app.command("/status")
+def handle_status(ack, command, say):
+    """/status — Show bot status and memory stats."""
+    ack()
+    stats = memory.get_stats()
+    status_text = (
+        f"🤖 *{BOT_NAME} Status*\n\n"
+        f"*Providers:* {len(PROVIDERS)} active\n"
+        f"*Memory:*\n"
+        f"  • {stats['messages']} messages stored\n"
+        f"  • {stats['facts']} facts remembered\n"
+        f"  • {stats['conversations']} conversations\n"
+        f"  • Database size: {stats['db_size_mb']} MB\n\n"
+        f"*Tools:* {', '.join(tools.TOOLS.keys())}\n\n"
+        f"_Running on e2-micro • v2.0 with agent loop_"
+    )
+    say(text=status_text, channel=command["channel_id"])
+
+
 # ── Start ──
 if __name__ == "__main__":
     build_providers()
@@ -396,9 +465,11 @@ if __name__ == "__main__":
         logger.warning("⚠️  No AI providers configured! Add API keys to .env")
         logger.warning("   The bot will start but won't be able to answer questions.")
 
-    logger.info(f"🤖 {BOT_NAME} starting (Socket Mode)...")
+    logger.info(f"🤖 {BOT_NAME} v2.0 starting (Socket Mode)...")
     logger.info(f"   Providers: {len(PROVIDERS)}")
     logger.info(f"   History: {MAX_HISTORY} messages per thread")
+    logger.info(f"   Tools: {list(tools.TOOLS.keys())}")
+    logger.info(f"   Memory: SQLite at {memory.DB_PATH}")
 
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+    handler = SocketModeHandler(slack_app, SLACK_APP_TOKEN)
     handler.start()
