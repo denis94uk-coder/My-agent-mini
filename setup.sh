@@ -1,65 +1,71 @@
 #!/bin/bash
-# ╔══════════════════════════════════════════════════════════╗
-# ║    My-Agent-Mini — One-Click Server Setup Script         ║
-# ║    Run this on your Oracle Cloud / VPS instance          ║
-# ╚══════════════════════════════════════════════════════════╝
+###############################################################################
+#  My-Agent-Mini v2 — One-Command Setup
+#  Tested on: Ubuntu 22.04 / 24.04, Debian 12, Google Cloud e2-micro
+#  Usage: curl -sSL https://raw.githubusercontent.com/denis94uk-coder/my-agent-mini/main/setup.sh | bash
+###############################################################################
 
 set -e
-echo "🤖 My-Agent-Mini Setup"
-echo "======================"
 
-# Update system
-echo "📦 Updating system..."
-sudo apt update && sudo apt upgrade -y
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║       🤖 My-Agent-Mini v2 — Smart Agent Setup           ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo ""
 
-# Install Python 3.11+ and pip
-echo "🐍 Installing Python..."
-sudo apt install -y python3 python3-pip python3-venv git
+APP_DIR="$HOME/my-agent-mini"
+REPO_URL="https://github.com/denis94uk-coder/my-agent-mini.git"
 
-# Clone repo
-echo "📥 Cloning repository..."
-cd ~
-if [ -d "my-agent-mini" ]; then
-    echo "   Repository already exists, pulling latest..."
-    cd my-agent-mini && git pull
+# ── Step 1: System packages ──
+echo "📦 Installing system packages..."
+sudo apt update -qq
+sudo apt install -y -qq python3 python3-venv python3-pip git curl > /dev/null 2>&1
+echo "   ✅ System packages ready"
+
+# ── Step 2: Clone or update repo ──
+if [ -d "$APP_DIR/.git" ]; then
+    echo "📥 Updating existing installation..."
+    cd "$APP_DIR"
+    git pull --ff-only
 else
-    git clone https://github.com/denis94uk-coder/my-agent-mini.git
-    cd my-agent-mini
+    echo "📥 Cloning repository..."
+    git clone "$REPO_URL" "$APP_DIR"
+    cd "$APP_DIR"
+fi
+echo "   ✅ Code ready"
+
+# ── Step 3: Python virtual environment ──
+echo "🐍 Setting up Python environment..."
+python3 -m venv "$APP_DIR/venv"
+source "$APP_DIR/venv/bin/activate"
+pip install -q --upgrade pip
+pip install -q -r requirements.txt
+echo "   ✅ Python packages installed"
+
+# ── Step 4: Create .env if missing ──
+if [ ! -f "$APP_DIR/.env" ]; then
+    cp "$APP_DIR/.env.example" "$APP_DIR/.env"
+    echo "   📝 Created .env from template — edit it with: nano $APP_DIR/.env"
+else
+    echo "   ✅ .env already exists (keeping your keys)"
 fi
 
-# Create virtual environment
-echo "🔧 Setting up Python environment..."
-python3 -m venv venv
-source venv/bin/activate
+# ── Step 5: Create systemd service ──
+echo "⚙️  Setting up auto-start service..."
+SERVICE_FILE="/etc/systemd/system/my-agent.service"
 
-# Install dependencies
-echo "📦 Installing dependencies..."
-pip install -r requirements.txt
-
-# Create .env if doesn't exist
-if [ ! -f .env ]; then
-    echo "📝 Creating .env file from template..."
-    cp .env.example .env
-    echo ""
-    echo "⚠️  IMPORTANT: Edit .env with your API keys!"
-    echo "   Run: nano .env"
-    echo ""
-fi
-
-# Create systemd service for auto-start
-echo "🔄 Creating systemd service..."
-sudo tee /etc/systemd/system/my-agent.service > /dev/null << 'EOF'
+sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=My Agent Mini - Slack AI Bot
-After=network.target
+Description=My Agent Mini v2 — AI Slack Bot
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/my-agent-mini
-Environment=PATH=/home/ubuntu/my-agent-mini/venv/bin:/usr/bin
-EnvironmentFile=/home/ubuntu/my-agent-mini/.env
-ExecStart=/home/ubuntu/my-agent-mini/venv/bin/python bot.py
+User=$(whoami)
+WorkingDirectory=$APP_DIR
+Environment=PATH=$APP_DIR/venv/bin:/usr/bin:/bin
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$APP_DIR/venv/bin/python bot.py
 Restart=always
 RestartSec=10
 
@@ -69,14 +75,27 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable my-agent
+echo "   ✅ Service configured (auto-starts on boot)"
 
+# ── Done ──
 echo ""
-echo "✅ Setup complete!"
-echo ""
-echo "📋 Next steps:"
-echo "   1. Edit your API keys:  nano .env"
-echo "   2. Start the bot:       sudo systemctl start my-agent"
-echo "   3. Check status:        sudo systemctl status my-agent"
-echo "   4. View logs:           sudo journalctl -u my-agent -f"
-echo ""
-echo "🔄 To restart after changes:  sudo systemctl restart my-agent"
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║  ✅ My-Agent-Mini v2 installed successfully!             ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+echo "║                                                          ║"
+echo "║  Next steps:                                             ║"
+echo "║  1. Edit your API keys:                                  ║"
+echo "║     nano $APP_DIR/.env                                   ║"
+echo "║                                                          ║"
+echo "║  2. Start the bot:                                       ║"
+echo "║     sudo systemctl start my-agent                        ║"
+echo "║                                                          ║"
+echo "║  3. Check status:                                        ║"
+echo "║     sudo systemctl status my-agent                       ║"
+echo "║                                                          ║"
+echo "║  4. Watch logs:                                          ║"
+echo "║     sudo journalctl -u my-agent -f                       ║"
+echo "║                                                          ║"
+echo "║  New in v2: 🔍 Web search • 🧠 Persistent memory        ║"
+echo "║             🐍 Python exec • 🔄 Agent loop               ║"
+echo "╚══════════════════════════════════════════════════════════╝"
