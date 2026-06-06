@@ -1,29 +1,36 @@
 """
-My-Agent-Mini v2 — AI Agent Slack Bot
+My-Agent-Mini v3 — AI Agent Slack Bot with Vision & Documents
 Runs on Google Cloud e2-micro (1 GB RAM) or any small VPS.
 
-Upgrades from v1:
-  ✅ Persistent memory (SQLite) — survives restarts
-  ✅ ReAct agent loop — multi-step task execution
-  ✅ Web search (DuckDuckGo) — real-time information
-  ✅ URL fetching — read any webpage
-  ✅ Python execution — run code in a sandbox
-  ✅ Memory search — recall past conversations
-  ✅ User facts — remembers things about you
+v3 upgrades:
+  ✅ Image understanding (Gemini Vision — sees photos, screenshots, diagrams)
+  ✅ Document reading (PDF, text, code files shared in Slack)
+  ✅ Smarter system prompt (focused, actionable, less generic)
+  ✅ Better error messages and user experience
+  ✅ File download from Slack (images + documents)
+  ✅ Multi-image support (analyze multiple images at once)
 
-Still lightweight: ~50 MB RAM, no Docker needed.
+Previous features (v2):
+  ✅ Persistent memory (SQLite)
+  ✅ ReAct agent loop
+  ✅ Web search, URL fetching, Python execution
+  ✅ Memory search and user facts
 """
 
 import os
 import re
+import io
 import json
 import time
+import base64
 import logging
+import mimetypes
 import traceback
 from pathlib import Path
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk import WebClient
 
 import memory
 import tools
@@ -37,17 +44,38 @@ logging.basicConfig(
 logger = logging.getLogger("my-agent-mini")
 
 # ── Slack Config ──
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]      # xoxb-...
-SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]       # xapp-...
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 BOT_NAME = os.getenv("BOT_NAME", "My Agent")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
+# Slack client for file downloads
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT",
-    f"You are {BOT_NAME}, a powerful AI assistant running as a Slack bot. "
-    "You can search the web, read URLs, execute Python code, and remember things. "
-    "You help with coding, research, analysis, writing, math, and any question. "
-    "Be concise but thorough. Use markdown formatting suitable for Slack. "
-    "When using tools, explain what you're doing so the user can follow along."
+    f"""You are {BOT_NAME}, a sharp AI assistant on Slack.
+
+PERSONALITY:
+- Be direct and actionable — skip filler phrases like "Great question!" or "Sure!"
+- Give concrete answers, not overviews. If someone asks how to do X, show them.
+- Use short paragraphs. Bullet points for lists. Code blocks for code.
+- When you don't know something, say so and offer to search the web.
+- Remember past conversations and facts about the user.
+
+CAPABILITIES:
+- 🔍 Search the web for real-time info
+- 🌐 Read any webpage or URL
+- 🐍 Run Python code for calculations, data processing
+- 🖼️ Analyze images (screenshots, photos, diagrams, documents)
+- 📄 Read uploaded files (PDF, text, code, CSV)
+- 🧠 Remember things about users across conversations
+
+FORMAT FOR SLACK:
+- Use *bold* for emphasis (not **bold**)
+- Use `code` for inline code
+- Use ```code blocks``` for multi-line code
+- Use > for quotes
+- Keep responses concise — expand only if asked"""
 )
 
 # ── AI Provider Config ──
@@ -61,7 +89,6 @@ def build_providers():
     global PROVIDERS
     PROVIDERS = []
 
-    # 1. Google Gemini (most generous free tier: 15 RPM, 1M tokens/day)
     if os.getenv("GEMINI_API_KEY"):
         PROVIDERS.append({
             "name": "Gemini",
@@ -71,7 +98,6 @@ def build_providers():
             "url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         })
 
-    # 2. Groq (very fast, free: 30 RPM)
     if os.getenv("GROQ_API_KEY"):
         PROVIDERS.append({
             "name": "Groq",
@@ -81,7 +107,6 @@ def build_providers():
             "url": "https://api.groq.com/openai/v1/chat/completions",
         })
 
-    # 3. xAI / Grok (free tier: 60 RPM)
     if os.getenv("XAI_API_KEY"):
         PROVIDERS.append({
             "name": "Grok",
@@ -91,7 +116,6 @@ def build_providers():
             "url": "https://api.x.ai/v1/chat/completions",
         })
 
-    # 4. Cerebras (ultra-fast inference, free tier)
     if os.getenv("CEREBRAS_API_KEY"):
         PROVIDERS.append({
             "name": "Cerebras",
@@ -101,7 +125,6 @@ def build_providers():
             "url": "https://api.cerebras.ai/v1/chat/completions",
         })
 
-    # 5. SambaNova (free fast inference)
     if os.getenv("SAMBANOVA_API_KEY"):
         PROVIDERS.append({
             "name": "SambaNova",
@@ -111,7 +134,6 @@ def build_providers():
             "url": "https://api.sambanova.ai/v1/chat/completions",
         })
 
-    # 6. Together AI (free tier: $5 credit)
     if os.getenv("TOGETHER_API_KEY"):
         PROVIDERS.append({
             "name": "Together",
@@ -121,7 +143,6 @@ def build_providers():
             "url": "https://api.together.xyz/v1/chat/completions",
         })
 
-    # 7. Mistral (free tier)
     if os.getenv("MISTRAL_API_KEY"):
         PROVIDERS.append({
             "name": "Mistral",
@@ -131,7 +152,6 @@ def build_providers():
             "url": "https://api.mistral.ai/v1/chat/completions",
         })
 
-    # 8. Cohere (free tier: 20 RPM)
     if os.getenv("COHERE_API_KEY"):
         PROVIDERS.append({
             "name": "Cohere",
@@ -141,7 +161,6 @@ def build_providers():
             "url": "https://api.cohere.com/v2/chat",
         })
 
-    # 9. OpenRouter (free models available)
     if os.getenv("OPENROUTER_API_KEY"):
         PROVIDERS.append({
             "name": "OpenRouter",
@@ -151,7 +170,6 @@ def build_providers():
             "url": "https://openrouter.ai/api/v1/chat/completions",
         })
 
-    # 10. HuggingFace Inference API (free tier)
     if os.getenv("HF_API_KEY"):
         PROVIDERS.append({
             "name": "HuggingFace",
@@ -164,10 +182,140 @@ def build_providers():
     logger.info(f"🧠 Loaded {len(PROVIDERS)} AI providers: {[p['name'] for p in PROVIDERS]}")
 
 
+# ── File Handling ──
+
+# Image types that Gemini Vision can process
+IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+# Document types we can extract text from
+DOC_TYPES = {
+    "text/plain", "text/csv", "text/html", "text/markdown",
+    "application/json", "application/xml",
+    "application/pdf",
+    "application/javascript", "text/x-python", "text/x-java-source",
+}
+
+# Extensions we treat as text even if MIME is wrong
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".json", ".xml", ".html", ".css", ".js", ".ts",
+    ".py", ".java", ".rb", ".go", ".rs", ".c", ".cpp", ".h", ".sh", ".bash",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env", ".log",
+    ".sql", ".r", ".php", ".swift", ".kt", ".scala", ".lua",
+}
+
+
+def download_slack_file(url: str) -> bytes:
+    """Download a file from Slack using the bot token."""
+    resp = http_requests.get(
+        url,
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def extract_text_from_pdf(data: bytes) -> str:
+    """Extract text from a PDF file."""
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=data, filetype="pdf")
+        text_parts = []
+        for page_num, page in enumerate(doc, 1):
+            page_text = page.get_text().strip()
+            if page_text:
+                text_parts.append(f"--- Page {page_num} ---\n{page_text}")
+        doc.close()
+        return "\n\n".join(text_parts) if text_parts else "(PDF has no extractable text — may be a scanned image)"
+    except ImportError:
+        # Fallback without PyMuPDF
+        return "(PDF reading requires PyMuPDF — install with: pip install PyMuPDF)"
+    except Exception as e:
+        return f"(Error reading PDF: {str(e)[:200]})"
+
+
+def is_text_file(filename: str, mimetype: str) -> bool:
+    """Check if a file should be treated as text."""
+    ext = Path(filename).suffix.lower() if filename else ""
+    if ext in TEXT_EXTENSIONS:
+        return True
+    if mimetype and (mimetype.startswith("text/") or mimetype in DOC_TYPES):
+        return True
+    return False
+
+
+def process_slack_files(files: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    Process files attached to a Slack message.
+    Returns: (images_for_vision, text_descriptions)
+    
+    images_for_vision: list of {"mime_type": str, "data": base64_str}
+    text_descriptions: list of text strings to prepend to the user message
+    """
+    images = []
+    texts = []
+
+    for f in files:
+        filename = f.get("name", "unknown")
+        mimetype = f.get("mimetype", "")
+        file_url = f.get("url_private_download") or f.get("url_private", "")
+        file_size = f.get("size", 0)
+
+        if not file_url:
+            texts.append(f"📎 {filename} (no download URL available)")
+            continue
+
+        # Skip very large files (>10 MB)
+        if file_size > 10 * 1024 * 1024:
+            texts.append(f"📎 {filename} (skipped — {file_size // 1024 // 1024} MB, too large)")
+            continue
+
+        logger.info(f"📥 Processing file: {filename} ({mimetype}, {file_size} bytes)")
+
+        try:
+            data = download_slack_file(file_url)
+
+            # Image → send to vision
+            if mimetype in IMAGE_TYPES:
+                b64 = base64.b64encode(data).decode("utf-8")
+                images.append({"mime_type": mimetype, "data": b64})
+                texts.append(f"🖼️ [Image: {filename}]")
+                logger.info(f"  → Image ready for vision ({len(data)} bytes)")
+
+            # PDF → extract text
+            elif mimetype == "application/pdf":
+                pdf_text = extract_text_from_pdf(data)
+                if len(pdf_text) > 6000:
+                    pdf_text = pdf_text[:6000] + "\n\n... (truncated, document is very long)"
+                texts.append(f"📄 *Document: {filename}*\n```\n{pdf_text}\n```")
+                logger.info(f"  → PDF text extracted ({len(pdf_text)} chars)")
+
+            # Text/code files → read content
+            elif is_text_file(filename, mimetype):
+                try:
+                    text_content = data.decode("utf-8", errors="replace")
+                except:
+                    text_content = data.decode("latin-1", errors="replace")
+                if len(text_content) > 6000:
+                    text_content = text_content[:6000] + "\n\n... (truncated)"
+                ext = Path(filename).suffix.lstrip(".")
+                texts.append(f"📄 *File: {filename}*\n```{ext}\n{text_content}\n```")
+                logger.info(f"  → Text file read ({len(text_content)} chars)")
+
+            else:
+                texts.append(f"📎 {filename} ({mimetype} — unsupported file type)")
+
+        except Exception as e:
+            logger.error(f"  → Failed to process {filename}: {e}")
+            texts.append(f"📎 {filename} (failed to download: {str(e)[:100]})")
+
+    return images, texts
+
+
 # ── AI Calling Logic ──
 
-def call_gemini(provider: dict, messages: list[dict], system_prompt: str) -> str:
-    """Call Google Gemini API."""
+def call_gemini(provider: dict, messages: list[dict], system_prompt: str, images: list[dict] = None) -> str:
+    """Call Google Gemini API with optional vision (images)."""
     url = provider["url"].format(model=provider["model"])
     url += f"?key={provider['api_key']}"
 
@@ -176,10 +324,26 @@ def call_gemini(provider: dict, messages: list[dict], system_prompt: str) -> str
         if msg["role"] == "system":
             continue
         role = "user" if msg["role"] == "user" else "model"
-        contents.append({
-            "role": role,
-            "parts": [{"text": msg["content"]}]
-        })
+
+        # Build parts for this message
+        parts = []
+
+        # Add text content
+        if msg.get("content"):
+            parts.append({"text": msg["content"]})
+
+        # Add images to the LAST user message only
+        if role == "user" and images and msg == messages[-1]:
+            for img in images:
+                parts.append({
+                    "inline_data": {
+                        "mime_type": img["mime_type"],
+                        "data": img["data"],
+                    }
+                })
+
+        if parts:
+            contents.append({"role": role, "parts": parts})
 
     payload = {
         "contents": contents,
@@ -198,16 +362,33 @@ def call_gemini(provider: dict, messages: list[dict], system_prompt: str) -> str
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def call_openai_compat(provider: dict, messages: list[dict], system_prompt: str) -> str:
-    """Call any OpenAI-compatible API (Groq, xAI, Cerebras, Together, etc.)."""
+def call_openai_compat(provider: dict, messages: list[dict], system_prompt: str, images: list[dict] = None) -> str:
+    """Call any OpenAI-compatible API."""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {provider['api_key']}",
     }
 
+    api_messages = [{"role": "system", "content": system_prompt}]
+
+    for msg in messages:
+        # For the last user message, include images if the provider supports it
+        if images and msg == messages[-1] and msg["role"] == "user":
+            content_parts = [{"type": "text", "text": msg["content"]}]
+            for img in images:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{img['mime_type']};base64,{img['data']}"
+                    }
+                })
+            api_messages.append({"role": "user", "content": content_parts})
+        else:
+            api_messages.append({"role": msg["role"], "content": msg["content"]})
+
     payload = {
         "model": provider["model"],
-        "messages": [{"role": "system", "content": system_prompt}] + messages,
+        "messages": api_messages,
         "max_tokens": 4000,
         "temperature": 0.7,
     }
@@ -218,8 +399,8 @@ def call_openai_compat(provider: dict, messages: list[dict], system_prompt: str)
     return data["choices"][0]["message"]["content"]
 
 
-def call_cohere(provider: dict, messages: list[dict], system_prompt: str) -> str:
-    """Call Cohere API."""
+def call_cohere(provider: dict, messages: list[dict], system_prompt: str, images: list[dict] = None) -> str:
+    """Call Cohere API (no vision support)."""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {provider['api_key']}",
@@ -243,7 +424,7 @@ def call_cohere(provider: dict, messages: list[dict], system_prompt: str) -> str
     return data["message"]["content"][0]["text"]
 
 
-def call_ai(messages: list[dict], system_prompt: str = None) -> str:
+def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] = None) -> str:
     """Try each AI provider in order until one succeeds."""
     if system_prompt is None:
         system_prompt = SYSTEM_PROMPT
@@ -251,14 +432,27 @@ def call_ai(messages: list[dict], system_prompt: str = None) -> str:
     if not PROVIDERS:
         return "❌ No AI providers configured! Add at least one API key to your `.env` file."
 
+    # If we have images, prefer Gemini (best free vision)
+    providers_order = list(PROVIDERS)
+    if images:
+        # Move Gemini to front if available
+        gemini = [p for p in providers_order if p["type"] == "gemini"]
+        others = [p for p in providers_order if p["type"] != "gemini"]
+        providers_order = gemini + others
+
     errors = []
-    for provider in PROVIDERS:
+    for provider in providers_order:
         try:
             logger.info(f"🔄 Trying {provider['name']} ({provider['model']})...")
             start = time.time()
 
+            # Only pass images to providers that support vision
+            provider_images = images if provider["type"] in ("gemini",) else None
+            # Note: Some OpenAI-compat providers support vision too (Groq with llava, etc.)
+            # but for free tiers, Gemini is the most reliable
+
             if provider["type"] == "gemini":
-                result = call_gemini(provider, messages, system_prompt)
+                result = call_gemini(provider, messages, system_prompt, provider_images)
             elif provider["type"] == "cohere":
                 result = call_cohere(provider, messages, system_prompt)
             else:
@@ -293,29 +487,50 @@ def get_conv_key(channel: str, thread_ts: str | None) -> str:
     return f"{channel}:{thread_ts or 'main'}"
 
 
-def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, say):
-    """Process a message through the agent loop."""
+def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, say, files: list[dict] = None):
+    """Process a message through the agent loop, with optional file attachments."""
     conv_key = get_conv_key(channel, thread_ts)
 
-    # Store in persistent memory
-    memory.add_message(conv_key, "user", user_text)
+    # Process any attached files
+    images = []
+    file_texts = []
+    if files:
+        images, file_texts = process_slack_files(files)
+
+    # Build the full user message with file content
+    full_message = user_text
+    if file_texts:
+        file_context = "\n\n".join(file_texts)
+        if full_message:
+            full_message = f"{full_message}\n\n{file_context}"
+        else:
+            full_message = f"The user shared these files. Analyze them:\n\n{file_context}"
+
+    # If we got images but user didn't say anything, prompt analysis
+    if images and not user_text.strip():
+        full_message = "The user shared an image. Describe what you see and offer to help with anything related to it."
+    elif images and user_text.strip():
+        full_message = f"{user_text}\n\n(The user also attached an image — analyze it in context of their message.)"
+
+    # Store in persistent memory (text only, not image data)
+    memory.add_message(conv_key, "user", full_message[:2000])
 
     # Get conversation history
     history = memory.get_history(conv_key, limit=MAX_HISTORY)
 
-    # Run through agent loop (handles tool calls automatically)
+    # Run through agent loop
     response = agent.run_agent_loop(
         messages=history,
-        call_ai_fn=call_ai,
+        call_ai_fn=lambda msgs, prompt: call_ai(msgs, prompt, images=images),
         system_prompt=SYSTEM_PROMPT,
         user_id=user_id,
     )
 
-    # Clean up any leftover tool call syntax from the response
+    # Clean up any leftover tool call syntax
     response = agent.extract_final_text(response)
 
     # Store response in memory
-    memory.add_message(conv_key, "assistant", response)
+    memory.add_message(conv_key, "assistant", response[:2000])
 
     # Send to Slack
     say(text=truncate_for_slack(response), thread_ts=thread_ts)
@@ -323,7 +538,7 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
 
 @slack_app.event("message")
 def handle_message(event, say):
-    """Handle DMs."""
+    """Handle DMs — now with file support."""
     if event.get("bot_id") or event.get("subtype"):
         return
 
@@ -332,37 +547,43 @@ def handle_message(event, say):
     user_text = event.get("text", "").strip()
     user_id = event.get("user", "unknown")
     channel_type = event.get("channel_type", "")
+    files = event.get("files", [])
 
-    if not user_text or channel_type not in ("im", "mpim"):
+    if not user_text and not files:
+        return
+    if channel_type not in ("im", "mpim"):
         return
 
-    logger.info(f"💬 DM from {user_id}: {user_text[:80]}...")
+    file_info = f" + {len(files)} file(s)" if files else ""
+    logger.info(f"💬 DM from {user_id}: {user_text[:80]}...{file_info}")
 
     try:
-        process_message(user_text, channel, thread_ts, user_id, say)
+        process_message(user_text, channel, thread_ts, user_id, say, files=files)
     except Exception as e:
-        logger.error(f"❌ Error processing message: {traceback.format_exc()}")
+        logger.error(f"❌ Error: {traceback.format_exc()}")
         say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
 
 
 @slack_app.event("app_mention")
 def handle_mention(event, say):
-    """Handle @mentions in channels."""
+    """Handle @mentions in channels — now with file support."""
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event["ts"]
     user_id = event.get("user", "unknown")
     user_text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
+    files = event.get("files", [])
 
-    if not user_text:
-        say(text=f"Hey! I'm {BOT_NAME} 👋 Ask me anything — I can search the web, run code, and more!", thread_ts=thread_ts)
+    if not user_text and not files:
+        say(text=f"Hey! I'm {BOT_NAME} 👋 Ask me anything — I can search the web, run code, analyze images, and more!", thread_ts=thread_ts)
         return
 
-    logger.info(f"📢 Mention from {user_id}: {user_text[:80]}...")
+    file_info = f" + {len(files)} file(s)" if files else ""
+    logger.info(f"📢 Mention from {user_id}: {user_text[:80]}...{file_info}")
 
     try:
-        process_message(user_text, channel, thread_ts, user_id, say)
+        process_message(user_text, channel, thread_ts, user_id, say, files=files)
     except Exception as e:
-        logger.error(f"❌ Error processing mention: {traceback.format_exc()}")
+        logger.error(f"❌ Error: {traceback.format_exc()}")
         say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
 
 
@@ -370,14 +591,12 @@ def handle_mention(event, say):
 
 @slack_app.command("/ask")
 def handle_ask(ack, command, say):
-    """/ask <question> — Quick one-shot question (no memory)."""
     ack()
     question = command.get("text", "").strip()
     if not question:
         say("Usage: `/ask <your question>`", channel=command["channel_id"])
         return
 
-    logger.info(f"❓ /ask: {question[:80]}...")
     response = agent.run_agent_loop(
         messages=[{"role": "user", "content": question}],
         call_ai_fn=call_ai,
@@ -385,47 +604,36 @@ def handle_ask(ack, command, say):
         user_id=command.get("user_id", "unknown"),
     )
     response = agent.extract_final_text(response)
-    say(
-        text=f"*Q:* {question}\n\n{truncate_for_slack(response)}",
-        channel=command["channel_id"],
-    )
+    say(text=f"*Q:* {question}\n\n{truncate_for_slack(response)}", channel=command["channel_id"])
 
 
 @slack_app.command("/search")
 def handle_search(ack, command, say):
-    """/search <query> — Search the web."""
     ack()
     query = command.get("text", "").strip()
     if not query:
         say("Usage: `/search <what to search for>`", channel=command["channel_id"])
         return
 
-    logger.info(f"🔍 /search: {query[:80]}...")
     result = tools.run_tool("web_search", {"query": query})
-    say(
-        text=f"🔍 *Search:* {query}\n\n{truncate_for_slack(result)}",
-        channel=command["channel_id"],
-    )
+    say(text=f"🔍 *Search:* {query}\n\n{truncate_for_slack(result)}", channel=command["channel_id"])
 
 
 @slack_app.command("/clear")
 def handle_clear(ack, command, say):
-    """/clear — Reset conversation memory for this channel."""
     ack()
     channel = command["channel_id"]
-    # Clear all conversations starting with this channel
     conn = memory.get_db()
     try:
         conn.execute("DELETE FROM conversations WHERE conv_key LIKE ?", (f"{channel}:%",))
         conn.commit()
     finally:
         conn.close()
-    say(text="🧹 Conversation memory cleared!", channel=channel)
+    say(text="🧹 Memory cleared!", channel=channel)
 
 
 @slack_app.command("/providers")
 def handle_providers(ack, command, say):
-    """/providers — Show active AI providers."""
     ack()
     if not PROVIDERS:
         say(text="❌ No providers configured.", channel=command["channel_id"])
@@ -434,25 +642,33 @@ def handle_providers(ack, command, say):
     lines = [f"🧠 *Active AI Providers ({len(PROVIDERS)}):*\n"]
     for i, p in enumerate(PROVIDERS, 1):
         lines.append(f"{i}. *{p['name']}* — `{p['model']}`")
-    lines.append(f"\n_Providers are tried in order. If one fails, the next is used automatically._")
+    lines.append(f"\n_Tried in order. If one fails, the next picks up._")
     say(text="\n".join(lines), channel=command["channel_id"])
 
 
 @slack_app.command("/status")
 def handle_status(ack, command, say):
-    """/status — Show bot status and memory stats."""
     ack()
     stats = memory.get_stats()
+    # Check which capabilities are available
+    has_vision = any(p["type"] == "gemini" for p in PROVIDERS)
+    try:
+        import fitz
+        has_pdf = True
+    except ImportError:
+        has_pdf = False
+
     status_text = (
-        f"🤖 *{BOT_NAME} Status*\n\n"
+        f"🤖 *{BOT_NAME} v3.0*\n\n"
         f"*Providers:* {len(PROVIDERS)} active\n"
+        f"*Vision:* {'✅ Gemini' if has_vision else '❌ Add GEMINI_API_KEY'}\n"
+        f"*PDF reading:* {'✅' if has_pdf else '❌ Install PyMuPDF'}\n"
         f"*Memory:*\n"
         f"  • {stats['messages']} messages stored\n"
         f"  • {stats['facts']} facts remembered\n"
         f"  • {stats['conversations']} conversations\n"
-        f"  • Database size: {stats['db_size_mb']} MB\n\n"
-        f"*Tools:* {', '.join(tools.TOOLS.keys())}\n\n"
-        f"_Running on e2-micro • v2.0 with agent loop_"
+        f"  • Database: {stats['db_size_mb']} MB\n\n"
+        f"*Tools:* {', '.join(tools.TOOLS.keys())}\n"
     )
     say(text=status_text, channel=command["channel_id"])
 
@@ -461,12 +677,14 @@ def handle_status(ack, command, say):
 if __name__ == "__main__":
     build_providers()
 
+    has_vision = any(p["type"] == "gemini" for p in PROVIDERS)
+
     if not PROVIDERS:
         logger.warning("⚠️  No AI providers configured! Add API keys to .env")
-        logger.warning("   The bot will start but won't be able to answer questions.")
 
-    logger.info(f"🤖 {BOT_NAME} v2.0 starting (Socket Mode)...")
+    logger.info(f"🤖 {BOT_NAME} v3.0 starting (Socket Mode)...")
     logger.info(f"   Providers: {len(PROVIDERS)}")
+    logger.info(f"   Vision: {'✅ Gemini' if has_vision else '❌ no Gemini key'}")
     logger.info(f"   History: {MAX_HISTORY} messages per thread")
     logger.info(f"   Tools: {list(tools.TOOLS.keys())}")
     logger.info(f"   Memory: SQLite at {memory.DB_PATH}")
