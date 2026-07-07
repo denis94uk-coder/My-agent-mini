@@ -68,11 +68,13 @@ add_provider("Mistral",     "MISTRAL_API_KEY",      make_openai_test("https://ap
 add_provider("Cohere",      "COHERE_API_KEY",       test_cohere)
 add_provider("OpenRouter",  "OPENROUTER_API_KEY",   make_openai_test("https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.0-flash-exp:free"))
 add_provider("HuggingFace", "HF_API_KEY",           make_openai_test("https://api-inference.huggingface.co/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct"))
+add_provider("NVIDIA",     "NVIDIA_API_KEY",    make_openai_test("https://integrate.api.nvidia.com/v1/chat/completions", "nvidia/nemotron-3-ultra-550b-a55b"))
 
 # ── Run tests ──
 ALL_KEYS = ["GEMINI_API_KEY", "GROQ_API_KEY", "XAI_API_KEY", "CEREBRAS_API_KEY",
             "SAMBANOVA_API_KEY", "TOGETHER_API_KEY", "MISTRAL_API_KEY",
-            "COHERE_API_KEY", "OPENROUTER_API_KEY", "HF_API_KEY"]
+            "COHERE_API_KEY", "OPENROUTER_API_KEY", "HF_API_KEY",
+            "NVIDIA_API_KEY"]
 
 def main():
     print("=" * 60)
