@@ -179,6 +179,16 @@ def build_providers():
             "url": "https://api-inference.huggingface.co/v1/chat/completions",
         })
 
+    # 11. NVIDIA NIM (free 1,000 API calls)
+    if os.getenv("NVIDIA_API_KEY"):
+        PROVIDERS.append({
+            "name": "NVIDIA",
+            "type": "openai_compat",
+            "api_key": os.environ["NVIDIA_API_KEY"],
+            "model": os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"),
+            "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        })
+
     logger.info(f"🧠 Loaded {len(PROVIDERS)} AI providers: {[p['name'] for p in PROVIDERS]}")
 
 
