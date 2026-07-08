@@ -1,8 +1,15 @@
 """
-My-Agent-Mini v3 — AI Agent Slack Bot with Vision & Documents
+My-Agent-Mini v4 — Full Agent: reasoning framework + real execution
 Runs on Google Cloud e2-micro (1 GB RAM) or any small VPS.
 
-v3 upgrades:
+v4 upgrades:
+  ✅ 4-phase reasoning framework (Understand → Plan → Execute → Deliver)
+  ✅ Shell access (run_shell) — install packages, git, system tasks
+  ✅ Persistent file workspace (write_file, read_file, list_files)
+  ✅ 10 tool steps per task (was 5) — completes multi-step work
+  ✅ Robust tool-call parsing (handles nested code and braces)
+
+Previous features (v3):
   ✅ Image understanding (Gemini Vision — sees photos, screenshots, diagrams)
   ✅ Document reading (PDF, text, code files shared in Slack)
   ✅ Smarter system prompt (focused, actionable, less generic)
@@ -66,9 +73,14 @@ CAPABILITIES:
 - 🔍 Search the web for real-time info
 - 🌐 Read any webpage or URL
 - 🐍 Run Python code for calculations, data processing
+- 💻 Run shell commands on the server (install, git, files, system tasks)
+- 📁 Save and read files in a persistent workspace
 - 🖼️ Analyze images (screenshots, photos, diagrams, documents)
 - 📄 Read uploaded files (PDF, text, code, CSV)
 - 🧠 Remember things about users across conversations
+
+You are a doer, not just a talker. When asked to accomplish something,
+actually do it with your tools, verify it worked, and report the result.
 
 FORMAT FOR SLACK:
 - Use *bold* for emphasis (not **bold**)
