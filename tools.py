@@ -205,3 +205,88 @@ def remember(fact: str, user_id: str = "default") -> str:
     """Store a fact about the user."""
     memory.add_fact(user_id, fact)
     return f"✅ Noted: {fact}"
+
+
+# ── v4 "Full Agent" Tools — shell, files, workspace ──
+
+WORKSPACE = os.path.expanduser("~/agent_workspace")
+os.makedirs(WORKSPACE, exist_ok=True)
+
+# Commands that are never allowed (protect the VM)
+BLOCKED_PATTERNS = [
+    r"rm\s+-rf\s+/\s*$", r"rm\s+-rf\s+/\s", r"mkfs", r"dd\s+if=", r":\(\)\{",
+    r"shutdown", r"reboot", r"passwd", r">\s*/dev/sd",
+]
+
+
+@tool("run_shell", "Run a shell command on the server (Ubuntu). Use for installing packages, managing files, checking system status, git, curl, etc.", "command")
+def run_shell(command: str) -> str:
+    """Execute a shell command with safety checks and timeout."""
+    for pattern in BLOCKED_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            return "❌ Blocked: this command could damage the server."
+    try:
+        result = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=WORKSPACE,
+        )
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            output += f"\n[stderr]: {result.stderr}"
+        if result.returncode != 0:
+            output += f"\n[exit code: {result.returncode}]"
+        return output.strip() or "(command ran, no output)"
+    except subprocess.TimeoutExpired:
+        return "❌ Command timed out (60s limit)"
+    except Exception as e:
+        return f"❌ Shell error: {str(e)[:300]}"
+
+
+@tool("write_file", "Create or overwrite a file in the agent workspace. Use for saving scripts, notes, data, reports.", "filename, content")
+def write_file(filename: str, content: str) -> str:
+    """Write a file inside the workspace."""
+    safe_name = os.path.basename(filename)
+    path = os.path.join(WORKSPACE, safe_name)
+    try:
+        with open(path, "w") as f:
+            f.write(content)
+        return f"✅ Saved {safe_name} ({len(content)} chars) in workspace."
+    except Exception as e:
+        return f"❌ Write error: {str(e)[:300]}"
+
+
+@tool("read_file", "Read a file from the agent workspace.", "filename")
+def read_file(filename: str) -> str:
+    """Read a file from the workspace."""
+    safe_name = os.path.basename(filename)
+    path = os.path.join(WORKSPACE, safe_name)
+    try:
+        with open(path, "r") as f:
+            content = f.read()
+        return content[:4000] if content else "(empty file)"
+    except FileNotFoundError:
+        return f"❌ File not found: {safe_name}. Use list_files to see what exists."
+    except Exception as e:
+        return f"❌ Read error: {str(e)[:300]}"
+
+
+@tool("list_files", "List all files in the agent workspace.", "")
+def list_files() -> str:
+    """List workspace files with sizes."""
+    try:
+        files = sorted(os.listdir(WORKSPACE))
+        if not files:
+            return "Workspace is empty."
+        lines = []
+        for name in files:
+            path = os.path.join(WORKSPACE, name)
+            size = os.path.getsize(path)
+            lines.append(f"  {name} ({size} bytes)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ List error: {str(e)[:300]}"
