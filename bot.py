@@ -35,6 +35,13 @@ import mimetypes
 import traceback
 from pathlib import Path
 
+# ── Load .env file (must happen BEFORE reading any tokens) ──
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    print("⚠️  python-dotenv not installed — run: pip3 install python-dotenv")
+
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
@@ -51,8 +58,15 @@ logging.basicConfig(
 logger = logging.getLogger("my-agent-mini")
 
 # ── Slack Config ──
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN", "")
+if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
+    print("❌ Missing Slack tokens!")
+    print("   Make sure the .env file exists in this folder and contains:")
+    print("   SLACK_BOT_TOKEN=xoxb-...")
+    print("   SLACK_APP_TOKEN=xapp-...")
+    print("   Check with:  grep SLACK .env")
+    raise SystemExit(1)
 BOT_NAME = os.getenv("BOT_NAME", "My Agent")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
