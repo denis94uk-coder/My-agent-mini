@@ -19,7 +19,7 @@ import tools
 
 logger = logging.getLogger("my-agent-mini")
 
-MAX_ITERATIONS = 5  # Safety limit to prevent infinite loops
+MAX_ITERATIONS = 10  # Safety limit to prevent infinite loops
 
 
 def get_agent_system_prompt(base_prompt: str, user_facts: list[str] = None) -> str:
@@ -38,49 +38,93 @@ Use these to personalize your responses.
     return f"""{base_prompt}
 
 {facts_section}
-YOU HAVE ACCESS TO THESE TOOLS:
+═══════════════════════════════════════════════
+YOUR REASONING FRAMEWORK (how a full agent thinks)
+═══════════════════════════════════════════════
+
+For every non-trivial request, work in four phases:
+
+1. UNDERSTAND — What is the user really asking for? What would a great
+   result look like? If the request is ambiguous, make the most useful
+   assumption and state it.
+
+2. PLAN — Break the task into concrete steps. Decide which tools you need
+   and in what order. Prefer checking real data (shell, files, web) over
+   guessing.
+
+3. EXECUTE — Work step by step with tools. After each result, re-evaluate:
+   Did it work? What did I learn? Do I need to adjust the plan? If a tool
+   fails, try a different approach — don't give up after one error.
+
+4. DELIVER — Give a clear, complete answer. Show what you did, what you
+   found, and what the user should do next. Never claim you did something
+   you didn't actually do — if something failed, say so honestly.
+
+═══════════════════════════════════════════════
+YOUR TOOLS
+═══════════════════════════════════════════════
 {tools_desc}
 
 HOW TO USE TOOLS:
-When you need to search the web, fetch a URL, run code, or search memory, respond with:
+Respond with exactly this format when you need a tool:
 
 [TOOL_CALL]
 {{"tool": "tool_name", "args": {{"param": "value"}}}}
 [/TOOL_CALL]
 
-You can use ONE tool per response. After receiving the result, you can use another
-tool or give your final answer.
+ONE tool per response. You'll get the result back, then you can use
+another tool or give your final answer. You have up to 10 tool steps
+per task — use them to actually complete work, not just talk about it.
 
-IMPORTANT RULES:
-- Only use tools when genuinely needed — simple questions don't need tools
-- After getting tool results, analyze them and respond to the user
-- For web_search: provide a clear search query
-- For fetch_url: provide a full URL starting with http:// or https://
-- For run_python: write complete, runnable Python code
-- For memory_search: use keywords from what you're looking for
-- For remember: state the fact clearly and concisely
-- When you have enough information, respond normally WITHOUT tool calls
-- Always be helpful, clear, and concise in your final answer
+TOOL SELECTION GUIDE:
+- run_shell → real actions on the server: install packages, git, curl,
+  check disk/memory, cron jobs, move files, run programs
+- run_python → calculations, data processing, parsing, quick scripts
+- write_file / read_file / list_files → save scripts, reports, notes in
+  your persistent workspace (~/agent_workspace)
+- web_search → current events, facts you're unsure about, research
+- fetch_url → read a specific webpage or API
+- memory_search → recall past conversations
+- remember → store important facts about the user
+
+EXECUTION PRINCIPLES:
+- DO the task, don't describe how the user could do it themselves
+- Verify your work: after creating/changing something, check it succeeded
+  (e.g. after writing a script, run it; after installing, test it)
+- If a command fails, read the error, fix the cause, and retry differently
+- Chain tools: search → fetch → process → save → verify → report
+- Simple questions (greetings, opinions, known facts) need NO tools
+- Final answers: lead with the result, keep it clear and concise
+- Be honest about limits: you cannot access private accounts, send emails,
+  or act outside this server unless a tool allows it
 """
 
 
 def parse_tool_call(text: str) -> dict | None:
     """Extract a tool call from the AI response."""
-    match = re.search(r"\[TOOL_CALL\]\s*(\{.*?\})\s*\[/TOOL_CALL\]", text, re.DOTALL)
+    match = re.search(r"\[TOOL_CALL\]\s*(\{.*\})\s*\[/TOOL_CALL\]", text, re.DOTALL)
+    if not match:
+        # Fallback: model forgot the closing tag
+        match = re.search(r"\[TOOL_CALL\]\s*(\{.*\})", text, re.DOTALL)
     if not match:
         return None
-    try:
-        call = json.loads(match.group(1))
-        if "tool" in call and "args" in call:
-            return call
-    except json.JSONDecodeError:
-        pass
+    raw = match.group(1).strip()
+    # Try parsing; if extra text follows the JSON, trim to the last brace
+    for candidate in (raw, raw[: raw.rfind("}") + 1]):
+        try:
+            call = json.loads(candidate)
+            if isinstance(call, dict) and "tool" in call and "args" in call:
+                return call
+        except (json.JSONDecodeError, ValueError):
+            continue
     return None
 
 
 def extract_final_text(text: str) -> str:
     """Remove tool call blocks from text to get the human-readable part."""
     cleaned = re.sub(r"\[TOOL_CALL\].*?\[/TOOL_CALL\]", "", text, flags=re.DOTALL)
+    # Also handle a tool call missing its closing tag
+    cleaned = re.sub(r"\[TOOL_CALL\].*", "", cleaned, flags=re.DOTALL)
     return cleaned.strip()
 
 
