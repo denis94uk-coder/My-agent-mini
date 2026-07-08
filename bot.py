@@ -226,7 +226,17 @@ def build_providers():
             "url": "https://api-inference.huggingface.co/v1/chat/completions",
         })
 
-    # 11. NVIDIA NIM (free 1,000 API calls)
+    # 11. Merge Gateway (OpenAI-compatible proxy — Claude, GPT, etc.)
+    if os.getenv("MERGE_API_KEY"):
+        PROVIDERS.append({
+            "name": "Merge",
+            "type": "openai_compat",
+            "api_key": os.environ["MERGE_API_KEY"],
+            "model": os.getenv("MERGE_MODEL", "anthropic/claude-sonnet-4-20250514"),
+            "url": "https://api-gateway.merge.dev/v1/openai/chat/completions",
+        })
+
+    # 12. NVIDIA NIM (free 1,000 API calls)
     if os.getenv("NVIDIA_API_KEY"):
         PROVIDERS.append({
             "name": "NVIDIA",
