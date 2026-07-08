@@ -104,6 +104,27 @@ FORMAT FOR SLACK:
 - Keep responses concise — expand only if asked"""
 )
 
+# ── Operating Manual (optional) ──
+# If operating_manual.md exists next to bot.py, it is appended to the
+# system prompt and governs every response the agent produces.
+# Edit the file, restart the bot, and the new rules apply.
+MANUAL_PATH = Path(__file__).parent / "operating_manual.md"
+OPERATING_MANUAL = ""
+try:
+    if MANUAL_PATH.exists():
+        OPERATING_MANUAL = MANUAL_PATH.read_text(encoding="utf-8").strip()
+except Exception as e:
+    print(f"⚠️  Could not read operating_manual.md: {e}")
+
+if OPERATING_MANUAL:
+    SYSTEM_PROMPT += (
+        "\n\n═══════════ OPERATING MANUAL ═══════════\n"
+        "The following manual governs every response you produce. "
+        "When a rule below conflicts with a request's phrasing, "
+        "the rule that protects correctness wins.\n\n"
+        + OPERATING_MANUAL
+    )
+
 # ── AI Provider Config ──
 PROVIDERS = []
 
@@ -724,6 +745,10 @@ if __name__ == "__main__":
     logger.info(f"   History: {MAX_HISTORY} messages per thread")
     logger.info(f"   Tools: {list(tools.TOOLS.keys())}")
     logger.info(f"   Memory: SQLite at {memory.DB_PATH}")
+    if OPERATING_MANUAL:
+        logger.info(f"   Operating manual: ✅ loaded ({len(OPERATING_MANUAL)} chars)")
+    else:
+        logger.info("   Operating manual: none (add operating_manual.md to enable)")
 
     handler = SocketModeHandler(slack_app, SLACK_APP_TOKEN)
     handler.start()
