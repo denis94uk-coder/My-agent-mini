@@ -1,34 +1,24 @@
 # 🤖 My-Agent-Mini
 
-**A lightweight, hybrid AI Slack bot that runs on any free server.**
+**A lightweight, hybrid AI Slack bot with a built-in smart router.**
 
-No Docker. No database. No complex setup. Just a single Python script that connects to Slack and routes your messages through up to 10 free AI providers with automatic failover.
+No Docker. No second gateway service. Just one Python bot that connects to Slack, uses a keyless best-effort route by default, and falls back across any optional provider keys you add.
 
 ## ✨ Features
 
-- **Hybrid AI** — Up to 10 free AI providers with automatic failover
+- **Built-in smart router** — keyless best-effort route plus optional providers
+- **Automatic fallback** — skips rate-limited/unhealthy routes with cooldowns
 - **Slack Integration** — DMs, @mentions, slash commands (`/ask`, `/clear`, `/providers`)
 - **Threaded Conversations** — Maintains context within Slack threads
 - **Zero Cost** — Runs on Oracle Cloud free tier + free AI APIs
 - **Lightweight** — ~50MB RAM, single Python process
 - **Auto-restart** — Systemd service keeps it running 24/7
 
-## 🧠 Supported AI Providers (all free!)
+## 🧠 Optional AI providers
 
-| # | Provider | Free Tier | Speed |
-|---|----------|-----------|-------|
-| 1 | Google Gemini | 15 RPM, 1M tokens/day | ⚡ Fast |
-| 2 | Groq | 30 RPM | ⚡⚡ Ultra-fast |
-| 3 | xAI (Grok) | 60 RPM | ⚡ Fast |
-| 4 | Cerebras | Free tier | ⚡⚡ Ultra-fast |
-| 5 | SambaNova | Free tier | ⚡ Fast |
-| 6 | Together AI | $5 free credit | ⚡ Fast |
-| 7 | Mistral | Free tier | ⚡ Fast |
-| 8 | Cohere | 20 RPM | ⚡ Fast |
-| 9 | OpenRouter | Free models | ⚡ Fast |
-| 10 | HuggingFace | Free tier | 🐢 Slower |
+The built-in router can also use the provider integrations already in the bot, including Gemini, Groq, xAI, Cerebras, SambaNova, Together, Mistral, Cohere, OpenRouter, HuggingFace, Merge, and NVIDIA. Add only the keys you choose to use; the bot never requires all of them.
 
-> Only need ONE provider to work. More providers = better reliability.
+> The default Pollinations route is keyless. Optional free API keys improve reliability, but every provider still has its own quota and terms.
 
 ## 🚀 Quick Start
 
@@ -58,13 +48,13 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-### 4. Add your API keys
+### 4. Configure the router (no AI key is required)
 
 ```bash
 nano .env
 ```
 
-Add your Slack tokens and at least one AI provider API key.
+The default `POLLINATIONS_ENABLED=true` route needs no AI API key. It is best-effort only and can be rate-limited or unavailable. For stronger reliability, add one or more optional provider keys in `.env` (for example NVIDIA, Gemini, Groq, or Mistral). Save with **Ctrl+O**, Enter, then **Ctrl+X**.
 
 ### 5. Start the bot
 
@@ -85,7 +75,7 @@ sudo journalctl -u my-agent -f  # live logs
 |---------|-------------|
 | `/ask <question>` | Quick one-shot question |
 | `/clear` | Reset conversation memory |
-| `/providers` | Show active AI providers |
+| `/providers` | Show routes, keyless/key-backed status, and cooldown health |
 
 ## 🔧 Management Commands
 
@@ -128,18 +118,14 @@ my-agent-mini/
 ```
 User sends message in Slack
          ↓
-   Try Provider #1 (Gemini)
-         ↓ fails?
-   Try Provider #2 (Groq)
-         ↓ fails?
-   Try Provider #3 (Grok)
-         ↓ fails?
-   ... continues through all configured providers
+ Built-in router chooses a healthy route
+         ↓ fails or rate-limited?
+ Cool that route down and try the next route
          ↓
-   Send response back to Slack
+ Send response back to Slack
 ```
 
-If a provider is rate-limited, returns an error, or times out, the bot automatically tries the next one. You get seamless responses regardless of which provider handles them.
+If a route is rate-limited, returns an error, or times out, the bot automatically cools it down and tries the next healthy route. The router is best-effort: it cannot guarantee unlimited free access, bypass authentication, or make an unavailable service work.
 
 ## 📊 Resource Usage
 
