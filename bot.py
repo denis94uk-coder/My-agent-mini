@@ -33,6 +33,7 @@ import base64
 import logging
 import mimetypes
 import traceback
+import threading
 from pathlib import Path
 
 # ── Load .env file (must happen BEFORE reading any tokens) ──
@@ -130,11 +131,79 @@ PROVIDERS = []
 
 import requests as http_requests
 
+# ── Lightweight router state ──
+# Inspired by OmniRoute, but kept inside this process so the 1 GB VM needs
+# no second gateway service. Health is in-memory only and contains no secrets.
+ROUTER_COOLDOWN_SECONDS = max(10, int(os.getenv("ROUTER_COOLDOWN_SECONDS", "90")))
+ROUTER_LOCK = threading.Lock()
+PROVIDER_HEALTH = {}
+
+
+def _provider_is_available(provider: dict) -> bool:
+    """Return False while a provider is cooling down after a failed call."""
+    with ROUTER_LOCK:
+        return PROVIDER_HEALTH.get(provider["name"], {}).get("cooldown_until", 0) <= time.time()
+
+
+def _record_provider_success(provider: dict) -> None:
+    with ROUTER_LOCK:
+        PROVIDER_HEALTH[provider["name"]] = {
+            "cooldown_until": 0,
+            "failures": 0,
+            "last_error": "",
+            "last_ok": time.time(),
+        }
+
+
+def _record_provider_failure(provider: dict, error: Exception) -> None:
+    """Back off rate-limited/unhealthy routes instead of hammering them."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    with ROUTER_LOCK:
+        old = PROVIDER_HEALTH.get(provider["name"], {})
+        failures = int(old.get("failures", 0)) + 1
+        if status == 429:
+            cooldown = ROUTER_COOLDOWN_SECONDS
+        elif status is not None and status >= 500:
+            cooldown = min(ROUTER_COOLDOWN_SECONDS, 30)
+        else:
+            cooldown = min(ROUTER_COOLDOWN_SECONDS, 20)
+        PROVIDER_HEALTH[provider["name"]] = {
+            "cooldown_until": time.time() + cooldown,
+            "failures": failures,
+            "last_error": f"HTTP {status}" if status else str(error)[:120],
+            "last_ok": old.get("last_ok", 0),
+        }
+
+
+def _provider_status(provider: dict) -> str:
+    with ROUTER_LOCK:
+        state = PROVIDER_HEALTH.get(provider["name"], {})
+    remaining = max(0, int(state.get("cooldown_until", 0) - time.time()))
+    if remaining:
+        return f"cooldown ({remaining}s)"
+    if state.get("last_ok"):
+        return "healthy"
+    return "ready"
+
 
 def build_providers():
     """Build list of available AI providers from environment variables."""
     global PROVIDERS
     PROVIDERS = []
+
+    # Keyless best-effort route. It is first by default so stale/expired API
+    # keys in an older .env cannot delay or block the free route. Set
+    # ROUTER_PREFER_KEYLESS=false to use configured keys first.
+    keyless_provider = None
+    if os.getenv("POLLINATIONS_ENABLED", "true").lower() not in ("0", "false", "no"):
+        keyless_provider = {
+            "name": "Pollinations (keyless)",
+            "type": "openai_compat",
+            "api_key": "",
+            "model": os.getenv("POLLINATIONS_MODEL", "openai-fast"),
+            "url": "https://text.pollinations.ai/{model}",
+            "keyless": True,
+        }
 
     if os.getenv("GEMINI_API_KEY"):
         PROVIDERS.append({
@@ -226,13 +295,16 @@ def build_providers():
             "url": "https://api-inference.huggingface.co/v1/chat/completions",
         })
 
-    # 11. Merge Gateway (OpenAI-compatible proxy — Claude, GPT, etc.)
-    if os.getenv("MERGE_API_KEY"):
+    # Merge Gateway (OpenAI-compatible paid gateway; one key can route to
+    # multiple providers). Prefer the documented variable, while accepting
+    # the older MERGE_API_KEY name as a backwards-compatible alias.
+    merge_key = os.getenv("MERGE_GATEWAY_API_KEY") or os.getenv("MERGE_API_KEY")
+    if merge_key:
         PROVIDERS.append({
-            "name": "Merge",
+            "name": "Merge Gateway",
             "type": "openai_compat",
-            "api_key": os.environ["MERGE_API_KEY"],
-            "model": os.getenv("MERGE_MODEL", "anthropic/claude-sonnet-4-20250514"),
+            "api_key": merge_key,
+            "model": os.getenv("MERGE_GATEWAY_MODEL", os.getenv("MERGE_MODEL", "openai/gpt-4o-mini")),
             "url": "https://api-gateway.merge.dev/v1/openai/chat/completions",
         })
 
@@ -246,7 +318,13 @@ def build_providers():
             "url": "https://integrate.api.nvidia.com/v1/chat/completions",
         })
 
-    logger.info(f"🧠 Loaded {len(PROVIDERS)} AI providers: {[p['name'] for p in PROVIDERS]}")
+    if keyless_provider:
+        if os.getenv("ROUTER_PREFER_KEYLESS", "true").lower() not in ("0", "false", "no"):
+            PROVIDERS.insert(0, keyless_provider)
+        else:
+            PROVIDERS.append(keyless_provider)
+
+    logger.info(f"🧠 Loaded {len(PROVIDERS)} AI routes: {[p['name'] for p in PROVIDERS]}")
 
 
 # ── File Handling ──
@@ -431,10 +509,9 @@ def call_gemini(provider: dict, messages: list[dict], system_prompt: str, images
 
 def call_openai_compat(provider: dict, messages: list[dict], system_prompt: str, images: list[dict] = None) -> str:
     """Call any OpenAI-compatible API."""
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {provider['api_key']}",
-    }
+    headers = {"Content-Type": "application/json"}
+    if provider.get("api_key"):
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
 
     api_messages = [{"role": "system", "content": system_prompt}]
 
@@ -460,10 +537,17 @@ def call_openai_compat(provider: dict, messages: list[dict], system_prompt: str,
         "temperature": 0.7,
     }
 
-    resp = http_requests.post(provider["url"], headers=headers, json=payload, timeout=120)
+    request_url = provider["url"].format(model=provider["model"])
+    resp = http_requests.post(request_url, headers=headers, json=payload, timeout=120)
     resp.raise_for_status()
     data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("provider returned no choices")
+    content = choices[0].get("message", {}).get("content")
+    if not content:
+        raise RuntimeError("provider returned empty content")
+    return content
 
 
 def call_cohere(provider: dict, messages: list[dict], system_prompt: str, images: list[dict] = None) -> str:
@@ -492,51 +576,50 @@ def call_cohere(provider: dict, messages: list[dict], system_prompt: str, images
 
 
 def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] = None) -> str:
-    """Try each AI provider in order until one succeeds."""
+    """Route through healthy providers, cooling down failures automatically."""
     if system_prompt is None:
         system_prompt = SYSTEM_PROMPT
 
     if not PROVIDERS:
-        return "❌ No AI providers configured! Add at least one API key to your `.env` file."
+        return "❌ No AI routes configured. Enable POLLINATIONS_ENABLED or add a provider key."
 
-    # If we have images, prefer Gemini (best free vision)
+    # Vision requests prefer Gemini; keyless text routes are text-only.
     providers_order = list(PROVIDERS)
     if images:
-        # Move Gemini to front if available
-        gemini = [p for p in providers_order if p["type"] == "gemini"]
+        vision = [p for p in providers_order if p["type"] == "gemini"]
         others = [p for p in providers_order if p["type"] != "gemini"]
-        providers_order = gemini + others
+        providers_order = vision + others
+
+    available = [p for p in providers_order if _provider_is_available(p)]
+    if not available:
+        return "❌ All AI routes are temporarily cooling down after errors or rate limits. Try again shortly."
 
     errors = []
-    for provider in providers_order:
+    for provider in available:
         try:
             logger.info(f"🔄 Trying {provider['name']} ({provider['model']})...")
             start = time.time()
-
-            # Only pass images to providers that support vision
-            provider_images = images if provider["type"] in ("gemini",) else None
-            # Note: Some OpenAI-compat providers support vision too (Groq with llava, etc.)
-            # but for free tiers, Gemini is the most reliable
+            provider_images = images if provider["type"] == "gemini" else None
 
             if provider["type"] == "gemini":
                 result = call_gemini(provider, messages, system_prompt, provider_images)
             elif provider["type"] == "cohere":
                 result = call_cohere(provider, messages, system_prompt)
             else:
-                result = call_openai_compat(provider, messages, system_prompt)
+                result = call_openai_compat(provider, messages, system_prompt, provider_images)
 
-            elapsed = round(time.time() - start, 1)
-            logger.info(f"✅ {provider['name']} responded in {elapsed}s")
+            _record_provider_success(provider)
+            logger.info(f"✅ {provider['name']} responded in {round(time.time() - start, 1)}s")
             return result
 
         except Exception as e:
+            _record_provider_failure(provider, e)
             error_msg = str(e)[:200]
-            logger.warning(f"⚠️ {provider['name']} failed: {error_msg}")
+            logger.warning(f"⚠️ {provider['name']} failed; cooling down: {error_msg}")
             errors.append(f"• {provider['name']}: {error_msg}")
-            continue
 
     error_list = "\n".join(errors)
-    return f"❌ All AI providers failed:\n{error_list}\n\nPlease check your API keys or try again later."
+    return f"❌ All AI providers failed:\n{error_list}\n\nThe router will retry cooled-down providers automatically."
 
 
 def truncate_for_slack(text: str, limit: int = 3900) -> str:
@@ -706,10 +789,11 @@ def handle_providers(ack, command, say):
         say(text="❌ No providers configured.", channel=command["channel_id"])
         return
 
-    lines = [f"🧠 *Active AI Providers ({len(PROVIDERS)}):*\n"]
+    lines = [f"🧠 *AI Router ({len(PROVIDERS)} routes):*\n"]
     for i, p in enumerate(PROVIDERS, 1):
-        lines.append(f"{i}. *{p['name']}* — `{p['model']}`")
-    lines.append(f"\n_Tried in order. If one fails, the next picks up._")
+        kind = "keyless best-effort" if p.get("keyless") else "your key"
+        lines.append(f"{i}. *{p['name']}* — `{p['model']}` ({kind}; {_provider_status(p)})")
+    lines.append("\n_Healthy routes are tried first. Rate-limited routes cool down automatically._")
     say(text="\n".join(lines), channel=command["channel_id"])
 
 
@@ -727,7 +811,7 @@ def handle_status(ack, command, say):
 
     status_text = (
         f"🤖 *{BOT_NAME} v3.0*\n\n"
-        f"*Providers:* {len(PROVIDERS)} active\n"
+        f"*AI routes:* {len(PROVIDERS)} active (automatic fallback + cooldowns)\n"
         f"*Vision:* {'✅ Gemini' if has_vision else '❌ Add GEMINI_API_KEY'}\n"
         f"*PDF reading:* {'✅' if has_pdf else '❌ Install PyMuPDF'}\n"
         f"*Memory:*\n"
