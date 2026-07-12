@@ -640,6 +640,20 @@ def get_conv_key(channel: str, thread_ts: str | None) -> str:
 def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, say, files: list[dict] = None):
     """Process a message through the agent loop, with optional file attachments."""
     conv_key = get_conv_key(channel, thread_ts)
+    # Slack reaction gives immediate visual feedback without cluttering the chat.
+    loading_reaction = os.getenv("LOADING_REACTION", "hourglass_flowing_sand").strip()
+    try:
+        if loading_reaction:
+            slack_client.reactions_add(channel=channel, timestamp=thread_ts, name=loading_reaction)
+    except Exception as e:
+        logger.debug(f"Could not add loading reaction: {e}")
+
+    def remove_loading_reaction():
+        try:
+            if loading_reaction:
+                slack_client.reactions_remove(channel=channel, timestamp=thread_ts, name=loading_reaction)
+        except Exception as e:
+            logger.debug(f"Could not remove loading reaction: {e}")
 
     # Process any attached files
     images = []
@@ -682,8 +696,11 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
     # Store response in memory
     memory.add_message(conv_key, "assistant", response[:2000])
 
-    # Send to Slack
-    say(text=truncate_for_slack(response), thread_ts=thread_ts)
+    # Send to Slack, then remove the temporary thinking indicator.
+    try:
+        say(text=truncate_for_slack(response), thread_ts=thread_ts)
+    finally:
+        remove_loading_reaction()
 
 
 @slack_app.event("message")
@@ -711,6 +728,10 @@ def handle_message(event, say):
         process_message(user_text, channel, thread_ts, user_id, say, files=files)
     except Exception as e:
         logger.error(f"❌ Error: {traceback.format_exc()}")
+        try:
+            slack_client.reactions_remove(channel=channel, timestamp=thread_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
+        except Exception:
+            pass
         say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
 
 
@@ -734,6 +755,10 @@ def handle_mention(event, say):
         process_message(user_text, channel, thread_ts, user_id, say, files=files)
     except Exception as e:
         logger.error(f"❌ Error: {traceback.format_exc()}")
+        try:
+            slack_client.reactions_remove(channel=channel, timestamp=thread_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
+        except Exception:
+            pass
         say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
 
 
