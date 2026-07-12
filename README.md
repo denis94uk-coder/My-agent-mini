@@ -54,7 +54,7 @@ chmod +x setup.sh
 nano .env
 ```
 
-The default `POLLINATIONS_ENABLED=true` route needs no AI API key. It is best-effort only and can be rate-limited or unavailable. For stronger reliability, add one or more optional provider keys in `.env` (for example NVIDIA, Gemini, Groq, or Mistral). Save with **Ctrl+O**, Enter, then **Ctrl+X**.
+The default `POLLINATIONS_ENABLED=true` route needs no AI API key and is tried first, so an old/expired API key cannot block it. It is best-effort only and can be rate-limited or unavailable. For stronger reliability, add one or more optional provider keys in `.env` (for example NVIDIA, Gemini, Groq, or Mistral). Save with **Ctrl+O**, Enter, then **Ctrl+X**.
 
 ### 5. Start the bot
 

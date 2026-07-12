@@ -191,8 +191,9 @@ def build_providers():
     global PROVIDERS
     PROVIDERS = []
 
-    # Keyless best-effort route. Keep configured providers first when present,
-    # preserving the user's chosen primary model; use this as a free fallback.
+    # Keyless best-effort route. It is first by default so stale/expired API
+    # keys in an older .env cannot delay or block the free route. Set
+    # ROUTER_PREFER_KEYLESS=false to use configured keys first.
     keyless_provider = None
     if os.getenv("POLLINATIONS_ENABLED", "true").lower() not in ("0", "false", "no"):
         keyless_provider = {
@@ -315,7 +316,10 @@ def build_providers():
         })
 
     if keyless_provider:
-        PROVIDERS.append(keyless_provider)
+        if os.getenv("ROUTER_PREFER_KEYLESS", "true").lower() not in ("0", "false", "no"):
+            PROVIDERS.insert(0, keyless_provider)
+        else:
+            PROVIDERS.append(keyless_provider)
 
     logger.info(f"🧠 Loaded {len(PROVIDERS)} AI routes: {[p['name'] for p in PROVIDERS]}")
 
