@@ -18,7 +18,7 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 
 The built-in router can also use the provider integrations already in the bot, including Gemini, Groq, xAI, Cerebras, SambaNova, Together, Mistral, Cohere, OpenRouter, HuggingFace, Merge, and NVIDIA. Add only the keys you choose to use; the bot never requires all of them.
 
-> The default Pollinations route is keyless. Optional free API keys improve reliability, but every provider still has its own quota and terms.
+> The default Pollinations route is keyless. Optional free API keys improve reliability, but every provider still has its own quota and terms. Merge Gateway can be added as a paid-credit route using one `mg_...` key; it is not an unlimited/free provider.
 
 ## 🚀 Quick Start
 

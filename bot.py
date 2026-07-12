@@ -295,13 +295,16 @@ def build_providers():
             "url": "https://api-inference.huggingface.co/v1/chat/completions",
         })
 
-    # 11. Merge Gateway (OpenAI-compatible proxy — Claude, GPT, etc.)
-    if os.getenv("MERGE_API_KEY"):
+    # Merge Gateway (OpenAI-compatible paid gateway; one key can route to
+    # multiple providers). Prefer the documented variable, while accepting
+    # the older MERGE_API_KEY name as a backwards-compatible alias.
+    merge_key = os.getenv("MERGE_GATEWAY_API_KEY") or os.getenv("MERGE_API_KEY")
+    if merge_key:
         PROVIDERS.append({
-            "name": "Merge",
+            "name": "Merge Gateway",
             "type": "openai_compat",
-            "api_key": os.environ["MERGE_API_KEY"],
-            "model": os.getenv("MERGE_MODEL", "anthropic/claude-sonnet-4-20250514"),
+            "api_key": merge_key,
+            "model": os.getenv("MERGE_GATEWAY_MODEL", os.getenv("MERGE_MODEL", "openai/gpt-4o-mini")),
             "url": "https://api-gateway.merge.dev/v1/openai/chat/completions",
         })
 
