@@ -346,3 +346,301 @@ def list_files() -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"❌ List error: {str(e)[:300]}"
+
+
+# ── GitHub Automation Tools ──
+# The VM has no git credential helper configured, so plain `git push` inside
+# run_shell fails ("could not read Username"). These tools use the GitHub
+# REST API with a personal access token instead — the reliable way to read
+# or write repo files, and to manage issues, from this agent.
+
+GITHUB_API = "https://api.github.com"
+
+
+def _github_headers() -> dict | None:
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not token:
+        return None
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _github_repo_slug(owner: str, repo: str) -> tuple[str, str]:
+    """Fill in defaults from env if the model omits owner/repo."""
+    owner = owner or os.environ.get("GITHUB_DEFAULT_OWNER", "")
+    repo = repo or os.environ.get("GITHUB_DEFAULT_REPO", "")
+    return owner, repo
+
+
+@tool(
+    "github_read_file",
+    "Read a file's content from a GitHub repo (no local git clone needed).",
+    "path, owner='', repo='', branch='main'",
+)
+def github_read_file(path: str, owner: str = "", repo: str = "", branch: str = "main") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        resp = http_requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}",
+            headers=headers,
+            params={"ref": branch},
+            timeout=15,
+        )
+        if resp.status_code == 404:
+            return f"❌ File not found: {owner}/{repo}/{path} on {branch}"
+        resp.raise_for_status()
+        data = resp.json()
+        import base64
+        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        return content[:4000]
+    except Exception as e:
+        return f"❌ GitHub read error: {str(e)[:300]}"
+
+
+@tool(
+    "github_write_file",
+    "Create or update a single file in a GitHub repo via the API and commit it directly (bypasses the broken local git push). Overwrites existing content.",
+    "path, content, message, owner='', repo='', branch='main'",
+)
+def github_write_file(
+    path: str,
+    content: str,
+    message: str,
+    owner: str = "",
+    repo: str = "",
+    branch: str = "main",
+) -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        import base64
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
+        # Look up existing sha (required by the API to update, not to create).
+        sha = None
+        existing = http_requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
+        if existing.status_code == 200:
+            sha = existing.json().get("sha")
+
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        resp = http_requests.put(url, headers=headers, json=payload, timeout=20)
+        resp.raise_for_status()
+        commit_sha = resp.json().get("commit", {}).get("sha", "")[:8]
+        action = "Updated" if sha else "Created"
+        return f"✅ {action} {owner}/{repo}/{path} on {branch} (commit {commit_sha})"
+    except Exception as e:
+        return f"❌ GitHub write error: {str(e)[:300]}"
+
+
+@tool(
+    "github_list_issues",
+    "List open (or closed) issues in a GitHub repo.",
+    "owner='', repo='', state='open'",
+)
+def github_list_issues(owner: str = "", repo: str = "", state: str = "open") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        resp = http_requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/issues",
+            headers=headers,
+            params={"state": state, "per_page": 20},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        issues = [i for i in resp.json() if "pull_request" not in i]
+        if not issues:
+            return f"No {state} issues."
+        lines = [f"#{i['number']} {i['title']} ({i['state']})" for i in issues]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ GitHub list error: {str(e)[:300]}"
+
+
+@tool(
+    "github_create_issue",
+    "Create a new issue in a GitHub repo.",
+    "title, body='', owner='', repo=''",
+)
+def github_create_issue(title: str, body: str = "", owner: str = "", repo: str = "") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        resp = http_requests.post(
+            f"{GITHUB_API}/repos/{owner}/{repo}/issues",
+            headers=headers,
+            json={"title": title, "body": body},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return f"✅ Created issue #{data['number']}: {data['html_url']}"
+    except Exception as e:
+        return f"❌ GitHub create issue error: {str(e)[:300]}"
+
+
+# ── Server Administration Tools ──
+# run_shell already covers most read-only checks. The one gap is safely
+# restarting a service — a blanket `systemctl restart` is blocked in
+# BLOCKED_PATTERNS to prevent the model from taking down anything it wants.
+# restart_service instead only allows a small, explicit whitelist, so the
+# agent can heal its own service (or another approved one) without being
+# able to restart arbitrary units.
+
+_ALLOWED_SERVICES = {
+    s.strip() for s in os.environ.get(
+        "ALLOWED_SERVICES", "my-agent.service"
+    ).split(",") if s.strip()
+}
+
+
+@tool(
+    "server_health",
+    "Get a quick health snapshot of the server: uptime, disk, memory, and status of allow-listed services.",
+    "",
+)
+def server_health() -> str:
+    parts = []
+    for label, cmd in [
+        ("uptime", ["uptime"]),
+        ("disk", ["df", "-h", "/"]),
+        ("memory", ["free", "-h"]),
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            parts.append(f"--- {label} ---\n{(r.stdout or r.stderr).strip()}")
+        except Exception as e:
+            parts.append(f"--- {label} ---\n(unavailable: {str(e)[:120]})")
+    for svc in sorted(_ALLOWED_SERVICES):
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", svc], capture_output=True, text=True, timeout=10
+            )
+            parts.append(f"--- {svc} ---\n{(r.stdout or r.stderr).strip()}")
+        except Exception as e:
+            parts.append(f"--- {svc} ---\n(unavailable: {str(e)[:120]})")
+    return "\n\n".join(parts)[:MAX_SHELL_OUTPUT]
+
+
+@tool(
+    "restart_service",
+    "Restart one allow-listed systemd service (e.g. the agent's own service after a git pull). Any service not on the server's ALLOWED_SERVICES list is refused.",
+    "service",
+)
+def restart_service(service: str) -> str:
+    service = (service or "").strip()
+    if service not in _ALLOWED_SERVICES:
+        return (
+            f"❌ Refused: '{service}' is not on the allow-list "
+            f"({', '.join(sorted(_ALLOWED_SERVICES)) or '(empty)'}). "
+            "Ask a human to restart it manually or add it to ALLOWED_SERVICES."
+        )
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", "systemctl", "restart", service],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return f"❌ Restart failed ({r.returncode}): {(r.stderr or r.stdout).strip()[:300]}"
+        return f"✅ Restarted {service}."
+    except Exception as e:
+        return f"❌ restart_service error: {str(e)[:300]}"
+
+
+# ── Website Building Tools ──
+# scaffold_site writes a small static site (HTML/CSS/JS) as a set of files
+# in the workspace; deploy_static_site then ships that folder to Vercel
+# via its REST API directly (no CLI/Node install needed on the e2-micro VM).
+
+@tool(
+    "scaffold_site",
+    "Create a static website's files (e.g. index.html, style.css, script.js) as a set in a workspace subfolder, ready to preview or deploy. files is a dict of {relative_path: content}.",
+    "site_name, files",
+)
+def scaffold_site(site_name: str, files: dict) -> str:
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "-", site_name).strip("-") or "site"
+    site_dir = os.path.join(WORKSPACE, "sites", safe_name)
+    try:
+        written = []
+        for rel_path, content in files.items():
+            rel_path = rel_path.lstrip("/")
+            full_path = os.path.normpath(os.path.join(site_dir, rel_path))
+            if not full_path.startswith(os.path.normpath(site_dir)):
+                continue  # refuse path traversal out of the site folder
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write(content)
+            written.append(rel_path)
+        return f"✅ Scaffolded '{safe_name}' with {len(written)} files: {', '.join(written)}\nLocation: sites/{safe_name} (in the agent workspace)"
+    except Exception as e:
+        return f"❌ scaffold_site error: {str(e)[:300]}"
+
+
+@tool(
+    "deploy_static_site",
+    "Deploy a scaffolded static site folder (from scaffold_site) to Vercel and return the live URL.",
+    "site_name",
+)
+def deploy_static_site(site_name: str) -> str:
+    token = os.environ.get("VERCEL_TOKEN", "").strip()
+    if not token:
+        return "❌ VERCEL_TOKEN is not configured on the server."
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "-", site_name).strip("-") or "site"
+    site_dir = os.path.join(WORKSPACE, "sites", safe_name)
+    if not os.path.isdir(site_dir):
+        return f"❌ No such site folder: sites/{safe_name}. Run scaffold_site first."
+    try:
+        files_payload = []
+        for root, _dirs, filenames in os.walk(site_dir):
+            for fname in filenames:
+                full_path = os.path.join(root, fname)
+                rel_path = os.path.relpath(full_path, site_dir)
+                with open(full_path, "r", errors="replace") as f:
+                    data = f.read()
+                files_payload.append({"file": rel_path, "data": data})
+        if not files_payload:
+            return f"❌ Site folder sites/{safe_name} is empty."
+
+        resp = http_requests.post(
+            "https://api.vercel.com/v13/deployments",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "name": safe_name,
+                "files": files_payload,
+                "target": "production",
+                "projectSettings": {"framework": None},
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        url = data.get("url", "")
+        return f"✅ Deployed! Live at: https://{url}" if url else f"✅ Deployed. Response: {json.dumps(data)[:300]}"
+    except Exception as e:
+        return f"❌ deploy_static_site error: {str(e)[:300]}"
