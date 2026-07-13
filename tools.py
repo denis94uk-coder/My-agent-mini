@@ -212,19 +212,44 @@ def remember(fact: str, user_id: str = "default") -> str:
 WORKSPACE = os.path.expanduser("~/agent_workspace")
 os.makedirs(WORKSPACE, exist_ok=True)
 
-# Commands that are never allowed (protect the VM)
+# Commands that are never allowed (protect the VM). The agent has no
+# interactive confirmation step, so high-impact commands are denied instead
+# of being guessed at. Read-only checks and normal development commands remain
+# available.
 BLOCKED_PATTERNS = [
-    r"rm\s+-rf\s+/\s*$", r"rm\s+-rf\s+/\s", r"mkfs", r"dd\s+if=", r":\(\)\{",
-    r"shutdown", r"reboot", r"passwd", r">\s*/dev/sd",
+    r"(?<![A-Za-z0-9_])sudo(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_])su(?![A-Za-z0-9_])",
+    r"\b(?:shutdown|reboot|halt|poweroff)\b",
+    r"\bsystemctl\s+(?:stop|restart|disable|mask|poweroff|reboot)\b",
+    r"\b(?:kill|pkill|killall)\b",
+    r"\bmkfs(?:\.|\s)", r"\bfdisk\b", r"\bparted\b", r"\bdd\s+if=", r":\(\)\{",
+    r"\brm\s+(?:-[^\s]*[rf][^\s]*\s+)?/", r"\b(?:rm|shred)\s+[^\n]*(?:\.env|memory\.db)",
+    r">\s*/dev/", r"\b(?:curl|wget)\b[^\n|;]*\|\s*(?:bash|sh)\b",
 ]
 
+# Never return common secret-bearing files if a command manages to read them.
+SECRET_OUTPUT_PATTERNS = (
+    re.compile(r"(?im)^.*(?:SLACK_BOT_TOKEN|SLACK_APP_TOKEN|API_KEY|SECRET|PASSWORD|TOKEN).*=?[^\n]*$"),
+    re.compile(r"(?im)^.*(?:BEGIN (?:RSA|OPENSSH|EC) PRIVATE KEY).*\\n?(?:.*\\n?){0,3}"),
+)
+MAX_SHELL_OUTPUT = 3500
 
-@tool("run_shell", "Run a shell command on the server (Ubuntu). Use for installing packages, managing files, checking system status, git, curl, etc.", "command")
+
+def _redact_shell_output(output: str) -> str:
+    """Redact obvious credential lines before tool output reaches the model."""
+    for pattern in SECRET_OUTPUT_PATTERNS:
+        output = pattern.sub("[redacted sensitive output]", output)
+    return output
+
+
+@tool("run_shell", "Run a safe shell command on the server (Ubuntu). Use for read-only checks, git, curl, and development tasks. High-impact commands are blocked.", "command")
 def run_shell(command: str) -> str:
-    """Execute a shell command with safety checks and timeout."""
+    """Execute a shell command with safety checks, redaction, and timeout."""
+    if not isinstance(command, str) or not command.strip():
+        return "❌ Blocked: command is empty."
     for pattern in BLOCKED_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
-            return "❌ Blocked: this command could damage the server."
+            return "❌ Blocked for safety: high-impact or privileged shell commands are not allowed."
     try:
         result = subprocess.run(
             ["bash", "-c", command],
@@ -240,7 +265,10 @@ def run_shell(command: str) -> str:
             output += f"\n[stderr]: {result.stderr}"
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
-        return output.strip() or "(command ran, no output)"
+        output = _redact_shell_output(output).strip()
+        if len(output) > MAX_SHELL_OUTPUT:
+            output = output[:MAX_SHELL_OUTPUT] + "\n\n... (shell output truncated)"
+        return output or "(command ran, no output)"
     except subprocess.TimeoutExpired:
         return "❌ Command timed out (60s limit)"
     except Exception as e:
