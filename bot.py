@@ -719,13 +719,19 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
             ),
         }] + history
 
-    # Run through agent loop
+    # Run through agent loop — surface plan creation/updates as their own
+    # Slack message so the user actually sees the numbered plan appear,
+    # instead of it only living inside the model's hidden reasoning.
+    def _post_plan_update(tool_name, tool_result):
+        say(text=tool_result, thread_ts=thread_ts)
+
     response = agent.run_agent_loop(
         messages=history,
         call_ai_fn=lambda msgs, prompt: call_ai(msgs, prompt, images=images),
         system_prompt=SYSTEM_PROMPT,
         user_id=user_id,
         conv_key=conv_key,
+        on_tool_call=_post_plan_update,
     )
 
     # Clean up any leftover tool call syntax

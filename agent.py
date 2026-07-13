@@ -143,6 +143,7 @@ def run_agent_loop(
     system_prompt: str,
     user_id: str = "default",
     conv_key: str = "default",
+    on_tool_call=None,
 ) -> str:
     """
     Run the ReAct agent loop.
@@ -153,6 +154,10 @@ def run_agent_loop(
         system_prompt: Base system prompt
         user_id: User ID for memory/facts
         conv_key: Conversation key for the task planner (plan is per-thread)
+        on_tool_call: Optional callback(tool_name, tool_result) fired right after a
+            tool executes. Used so the caller (e.g. Slack bot) can surface the
+            live plan (create_plan/update_task) as its own message instead of
+            only showing it buried inside the final answer.
 
     Returns:
         Final response text
@@ -195,6 +200,14 @@ def run_agent_loop(
         logger.info(f"🔧 Using tool: {tool_name}({json.dumps(tool_args)[:100]})")
         tool_result = tools.run_tool(tool_name, tool_args)
         logger.info(f"📋 Tool result: {tool_result[:200]}...")
+
+        # Let the caller surface plan creation/updates live in Slack instead
+        # of them only being visible inside the model's own reasoning.
+        if on_tool_call and tool_name in ("create_plan", "update_task"):
+            try:
+                on_tool_call(tool_name, tool_result)
+            except Exception:
+                logger.warning("on_tool_call callback failed", exc_info=True)
 
         # Get any text the AI said before/after the tool call
         preamble = extract_final_text(response)
