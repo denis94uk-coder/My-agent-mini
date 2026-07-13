@@ -76,6 +76,13 @@ ONE tool per response. You'll get the result back, then you can use
 another tool or give your final answer. You have up to 10 tool steps
 per task — use them to actually complete work, not just talk about it.
 
+CRITICAL RULE — never narrate an action without taking it: if your
+response contains phrases like "Now I will...", "Let me...", "I'll save/
+run/check...", the [TOOL_CALL] block for that exact action MUST be in
+that same response. Never send a message that only announces what you're
+about to do — either do it (include [TOOL_CALL]) or you're genuinely
+finished (give the real final answer, no "next step" language at all).
+
 TOOL SELECTION GUIDE:
 - run_shell → real actions on the server: install packages, git, curl,
   check disk/memory, cron jobs, move files, run programs
@@ -107,6 +114,30 @@ EXECUTION PRINCIPLES:
 - Be honest about limits: you cannot access private accounts, send emails,
   or act outside this server unless a tool allows it
 """
+
+
+# Phrases that signal the model is *narrating an intended action* rather
+# than giving an actual final answer. If a response matches one of these
+# and contains no parseable [TOOL_CALL], the loop should nudge the model to
+# continue instead of ending the turn — otherwise the bot posts "Now I will
+# save the file." as its final Slack message and just... doesn't.
+_INTENT_ONLY_PATTERNS = [
+    r"\bi will now\b",
+    r"\bnow,? i will\b",
+    r"\bnow i('| a)?m going to\b",
+    r"\blet me now\b",
+    r"\bnext,? i will\b",
+    r"\bi'll (now )?(save|write|create|run|fetch|search|check|update|do)\b",
+    r"\bi am going to (save|write|create|run|fetch|search|check|update)\b",
+]
+_INTENT_ONLY_RE = re.compile("|".join(_INTENT_ONLY_PATTERNS), re.IGNORECASE)
+
+MAX_NARRATION_NUDGES = 3  # cap extra nudges so a stuck model can't burn all iterations
+
+
+def looks_like_unactioned_intent(text: str) -> bool:
+    """True if the text describes an upcoming action but never actually calls a tool."""
+    return bool(_INTENT_ONLY_RE.search(text))
 
 
 def parse_tool_call(text: str) -> dict | None:
@@ -171,6 +202,7 @@ def run_agent_loop(
 
     # Working copy of messages for the loop
     working_messages = list(messages)
+    narration_nudges_used = 0
 
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"🔄 Agent loop iteration {iteration + 1}/{MAX_ITERATIONS}")
@@ -182,6 +214,34 @@ def run_agent_loop(
         tool_call = parse_tool_call(response)
 
         if tool_call is None:
+            # The model didn't include a [TOOL_CALL] block. Usually that means
+            # it's truly done. But sometimes it just *narrates* the next step
+            # ("Now, I will save the file.") without acting — if we return
+            # that as the final answer, the bot looks stuck and the user has
+            # to say "ok" to nudge it along. Catch that case and auto-continue
+            # instead of ending the turn.
+            if (
+                looks_like_unactioned_intent(response)
+                and narration_nudges_used < MAX_NARRATION_NUDGES
+                and iteration < MAX_ITERATIONS - 1
+            ):
+                narration_nudges_used += 1
+                logger.info(
+                    f"⏭️ Detected unactioned intent (nudge {narration_nudges_used}/"
+                    f"{MAX_NARRATION_NUDGES}), auto-continuing instead of stopping"
+                )
+                working_messages.append({"role": "assistant", "content": response})
+                working_messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM NUDGE] You described an action but did not include a "
+                        "[TOOL_CALL] block to actually perform it. Do not repeat the "
+                        "description — immediately output the [TOOL_CALL] block for "
+                        "that exact action now."
+                    ),
+                })
+                continue
+
             # No tool call — this is the final answer
             logger.info("✅ Agent gave final answer")
             return response
