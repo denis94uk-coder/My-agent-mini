@@ -13,6 +13,25 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 - **Zero Cost** — Runs on Oracle Cloud free tier + free AI APIs
 - **Lightweight** — ~50MB RAM, single Python process
 - **Auto-restart** — Systemd service keeps it running 24/7
+- **Domain skills** — GitHub automation, server administration, and static
+  website building/deployment, built in as tools (see below)
+
+## 🛠️ Domain Skills
+
+Beyond general chat, the agent has three built-in "skills" — real tools for
+recurring domains of work, described in its system prompt so it reaches for
+them automatically:
+
+| Skill | Tools | Requires |
+|---|---|---|
+| **GitHub automation** | `github_read_file`, `github_write_file`, `github_list_issues`, `github_create_issue` | `GITHUB_TOKEN` (+ optional `GITHUB_DEFAULT_OWNER`/`GITHUB_DEFAULT_REPO`) |
+| **Server administration** | `server_health`, `restart_service` (allow-listed services only) | `ALLOWED_SERVICES` + passwordless `sudo systemctl restart <service>` for that exact unit |
+| **Website building** | `scaffold_site` (writes static site files), `deploy_static_site` (ships them to Vercel) | `VERCEL_TOKEN` |
+
+All three degrade gracefully with a clear error if their token/config isn't
+set — see `.env.example` for setup steps. `git push` from `run_shell` does
+**not** work on a fresh server (no credential helper); `github_write_file`
+is the reliable path for committing changes.
 
 ## 🧠 Optional AI providers
 
