@@ -207,6 +207,34 @@ def remember(fact: str, user_id: str = "default") -> str:
     return f"✅ Noted: {fact}"
 
 
+# ── Task Planner Tools ──
+# For any multi-step request, create a plan first so the user can see it
+# and so an interrupted task can be resumed instead of restarted from zero.
+
+@tool("create_plan", "Create or replace the task plan for this conversation. Use for any multi-step request BEFORE starting work. steps is a list of short step descriptions.", "steps")
+def create_plan_tool(steps: list, conv_key: str = "default") -> str:
+    plan = memory.create_plan(conv_key, "default", [str(s) for s in steps])
+    lines = [f"{p['step_no']}. [{p['status']}] {p['description']}" for p in plan]
+    return "✅ Plan created:\n" + "\n".join(lines)
+
+
+@tool("update_task", "Mark a plan step as 'in_progress', 'done', or 'blocked' after working on it.", "step_no, status")
+def update_task_tool(step_no: int, status: str, conv_key: str = "default") -> str:
+    ok = memory.update_task_status(conv_key, int(step_no), status)
+    if not ok:
+        return f"❌ No step {step_no} found in the current plan."
+    return f"✅ Step {step_no} marked {status}."
+
+
+@tool("list_tasks", "Show the current task plan and progress for this conversation.", "")
+def list_tasks_tool(conv_key: str = "default") -> str:
+    plan = memory.get_plan(conv_key)
+    if not plan:
+        return "No active plan for this conversation."
+    lines = [f"{p['step_no']}. [{p['status']}] {p['description']}" for p in plan]
+    return "\n".join(lines)
+
+
 # ── v4 "Full Agent" Tools — shell, files, workspace ──
 
 WORKSPACE = os.path.expanduser("~/agent_workspace")

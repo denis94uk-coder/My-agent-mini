@@ -52,11 +52,33 @@ import tools
 import agent
 
 # ── Logging ──
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# Console (for `journalctl`/systemd) + a rotating file so history survives
+# restarts and doesn't grow unbounded on the small VM disk.
+LOG_DIR = Path.home() / "my-agent-mini" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "bot.log"
+
+_log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_formatter)
+
+from logging.handlers import RotatingFileHandler
+_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+_file_handler.setFormatter(_log_formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
 logger = logging.getLogger("my-agent-mini")
+
+# ── Health tracking ──
+START_TIME = time.time()
+ERROR_LOG = []  # list of (timestamp, message), capped below
+MAX_ERROR_LOG = 25
+
+
+def record_error(context: str, error: Exception):
+    """Track recent errors in memory for /health, in addition to full logging."""
+    ERROR_LOG.append((time.time(), f"{context}: {str(error)[:200]}"))
+    del ERROR_LOG[:-MAX_ERROR_LOG]
 
 # ── Slack Config ──
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
@@ -682,12 +704,28 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
     # Get conversation history
     history = memory.get_history(conv_key, limit=MAX_HISTORY)
 
+    # Pull in older messages from this same thread that are topically
+    # relevant to the current message but fell outside the recent window —
+    # cheap keyword-overlap retrieval, no embeddings needed on a 1 GB VM.
+    relevant = memory.search_relevant(conv_key, full_message, exclude_recent=MAX_HISTORY, limit=5)
+    if relevant:
+        context_lines = [f"- ({r['role']}) {r['content']}" for r in relevant]
+        history = [{
+            "role": "user",
+            "content": (
+                "[RELEVANT EARLIER CONTEXT from this same conversation, "
+                "outside the recent window below — use only if actually helpful]\n"
+                + "\n".join(context_lines)
+            ),
+        }] + history
+
     # Run through agent loop
     response = agent.run_agent_loop(
         messages=history,
         call_ai_fn=lambda msgs, prompt: call_ai(msgs, prompt, images=images),
         system_prompt=SYSTEM_PROMPT,
         user_id=user_id,
+        conv_key=conv_key,
     )
 
     # Clean up any leftover tool call syntax
@@ -728,6 +766,7 @@ def handle_message(event, say):
         process_message(user_text, channel, thread_ts, user_id, say, files=files)
     except Exception as e:
         logger.error(f"❌ Error: {traceback.format_exc()}")
+        record_error("process_message", e)
         try:
             slack_client.reactions_remove(channel=channel, timestamp=thread_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
@@ -755,6 +794,7 @@ def handle_mention(event, say):
         process_message(user_text, channel, thread_ts, user_id, say, files=files)
     except Exception as e:
         logger.error(f"❌ Error: {traceback.format_exc()}")
+        record_error("process_message", e)
         try:
             slack_client.reactions_remove(channel=channel, timestamp=thread_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
@@ -847,6 +887,57 @@ def handle_status(ack, command, say):
         f"*Tools:* {', '.join(tools.TOOLS.keys())}\n"
     )
     say(text=status_text, channel=command["channel_id"])
+
+
+@slack_app.command("/health")
+def handle_health(ack, command, say):
+    """Deep operational health check — uptime, provider health, errors, disk."""
+    ack()
+
+    uptime_s = int(time.time() - START_TIME)
+    days, rem = divmod(uptime_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
+
+    healthy = [p["name"] for p in PROVIDERS if _provider_status(p) == "healthy" or _provider_status(p) == "ready"]
+    cooling = [p["name"] for p in PROVIDERS if _provider_status(p).startswith("cooldown")]
+
+    stats = memory.get_stats()
+
+    # Disk space where the DB/logs live
+    try:
+        import shutil
+        disk = shutil.disk_usage(Path.home() / "my-agent-mini")
+        disk_free_mb = round(disk.free / 1024 / 1024)
+        disk_total_mb = round(disk.total / 1024 / 1024)
+        disk_str = f"{disk_free_mb} MB free / {disk_total_mb} MB total"
+    except Exception:
+        disk_str = "unavailable"
+
+    log_size_kb = round(LOG_FILE.stat().st_size / 1024, 1) if LOG_FILE.exists() else 0
+
+    recent_errors = ERROR_LOG[-5:]
+    if recent_errors:
+        err_lines = "\n".join(
+            f"  • {time.strftime('%m-%d %H:%M', time.localtime(ts))} — {msg}"
+            for ts, msg in recent_errors
+        )
+    else:
+        err_lines = "  none 🎉"
+
+    health_text = (
+        f"🩺 *{BOT_NAME} Health*\n\n"
+        f"*Uptime:* {uptime_str}\n"
+        f"*AI routes:* {len(healthy)}/{len(PROVIDERS)} healthy"
+        + (f", cooling down: {', '.join(cooling)}" if cooling else "") + "\n"
+        f"*Memory DB:* {stats['messages']} msgs, {stats['facts']} facts, "
+        f"{stats['open_tasks']} open plan step(s), {stats['db_size_mb']} MB\n"
+        f"*Disk:* {disk_str}\n"
+        f"*Log file:* {log_size_kb} KB (rotates at 5 MB, keeps 3 backups)\n"
+        f"*Errors in this process ({len(ERROR_LOG)} tracked, last 5):*\n{err_lines}\n"
+    )
+    say(text=health_text, channel=command["channel_id"])
 
 
 # ── Start ──

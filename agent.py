@@ -86,6 +86,13 @@ TOOL SELECTION GUIDE:
 - fetch_url → read a specific webpage or API
 - memory_search → recall past conversations
 - remember → store important facts about the user
+- create_plan → break a multi-step task (3+ real steps) into a visible,
+  numbered plan BEFORE you start working. Call this first for anything
+  non-trivial — it lets the user see your plan and lets you resume if the
+  task spans multiple turns.
+- update_task → mark a plan step 'in_progress' or 'done' as you complete it
+- list_tasks → check what's left on the current plan (use this if a task
+  looks like a continuation of earlier work)
 
 EXECUTION PRINCIPLES:
 - DO the task, don't describe how the user could do it themselves
@@ -133,6 +140,7 @@ def run_agent_loop(
     call_ai_fn,
     system_prompt: str,
     user_id: str = "default",
+    conv_key: str = "default",
 ) -> str:
     """
     Run the ReAct agent loop.
@@ -142,6 +150,7 @@ def run_agent_loop(
         call_ai_fn: Function to call the AI (takes messages list, returns string)
         system_prompt: Base system prompt
         user_id: User ID for memory/facts
+        conv_key: Conversation key for the task planner (plan is per-thread)
 
     Returns:
         Final response text
@@ -174,9 +183,12 @@ def run_agent_loop(
         tool_name = tool_call["tool"]
         tool_args = tool_call["args"]
 
-        # Pass user_id to remember tool
+        # Pass user_id / conv_key to memory + planner tools automatically —
+        # the model only needs to specify the task-relevant args.
         if tool_name == "remember":
             tool_args["user_id"] = user_id
+        if tool_name in ("create_plan", "update_task", "list_tasks"):
+            tool_args["conv_key"] = conv_key
 
         logger.info(f"🔧 Using tool: {tool_name}({json.dumps(tool_args)[:100]})")
         tool_result = tools.run_tool(tool_name, tool_args)
