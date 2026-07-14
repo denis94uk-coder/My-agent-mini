@@ -15,6 +15,29 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 - **Auto-restart** — Systemd service keeps it running 24/7
 - **Domain skills** — GitHub automation, server administration, and static
   website building/deployment, built in as tools (see below)
+- **Durable project memory** — decisions and completed-task summaries
+  persist across separate Slack threads/conversations, not just within one
+  thread (see below)
+
+## 🧠 Memory model
+
+Two different things are stored in `memory.db`, and they behave differently:
+
+- **Thread history** — the last ~20 messages of a specific Slack thread,
+  scoped to that thread only (`conv_key`). This is what makes replies in an
+  ongoing thread feel continuous; it's invisible to other threads.
+- **Project memory** (`remember` tool, `category='decision'`, plus
+  auto-generated `task_summary` entries when a plan finishes) — durable
+  facts that get injected into **every** conversation for that user,
+  regardless of which thread it's in. This is what lets the bot recall a
+  stated priority or a past decision even in a brand-new thread, the same
+  way a human coworker would.
+
+Plain `remember` calls (`category='fact'`, the default) are ambient
+preferences and only the most recent ones are kept in context — they're
+not meant to be load-bearing. If something needs to survive long-term
+(a roadmap item, an explicit instruction, an architecture choice), it
+should be stored as a `decision`.
 
 ## 🛠️ Domain Skills
 
