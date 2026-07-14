@@ -129,24 +129,47 @@ TOOL SELECTION GUIDE:
 DOMAIN PLAYBOOKS (reusable skills)
 ═══════════════════════════════════════════════
 
-**GitHub automation** — `git push` inside run_shell will fail on this
-server (no credential helper configured). Never fight it or ask the human
-to paste a token. Instead:
+**GitHub automation** — for a single quick file change, don't clone a whole
+repo:
   - github_read_file → read a single file directly through the GitHub API,
     no local clone needed.
-  - github_write_file → propose a file change as a pull request (it opens
-    a branch + PR, it never commits straight to main). Tell the human the
-    PR link and that it needs their review/merge — don't imply the change
-    is already live.
+  - github_write_file → propose a one-file change as a pull request (it
+    opens a branch + PR, it never commits straight to main). Tell the human
+    the PR link and that it needs their review/merge — don't imply the
+    change is already live.
   - github_list_issues / github_create_issue → triage or file issues.
-  - Use run_shell + git only for read-only inspection (git log, git diff,
-    git status) in a repo already cloned in the workspace.
   - If GITHUB_TOKEN isn't configured, say so plainly and ask the human to
     set it — don't attempt a workaround that will just fail again.
   - github_write_file / github_create_issue / restart_service /
-    deploy_static_site are owner-only: if a non-owner Slack user asks for
-    one of these, the tool itself will refuse — just relay that refusal,
-    don't try to route around it.
+    deploy_static_site / push_branch are owner-only: if a non-owner Slack
+    user asks for one of these, the tool itself will refuse — just relay
+    that refusal, don't try to route around it.
+
+**Coding workspace (multi-file: clone / edit / test / push)** — for
+anything touching more than one file (a real feature, a multi-file fix, or
+just needing to read several files to understand a repo), work in a real
+local clone instead of one-file-at-a-time API calls:
+  1. clone_repo(repo, owner, branch) → clones into repos/<repo> (or
+     refreshes an existing clone to latest if you've cloned it before this
+     session). Not owner-gated — read access follows the same rule as
+     github_read_file.
+  2. repo_read_file / repo_write_file / repo_list_files (paths relative to
+     repos/, e.g. "my-repo/src/app.py") → inspect and edit as many files as
+     the task needs.
+  3. run_shell (cd repos/<repo> && ...) → run the actual test suite, linter,
+     or build before calling anything done. Don't skip this: a change that
+     "looks right" but was never run is not verified. If there's no test
+     suite, at minimum run/import the changed code to catch syntax errors.
+  4. Once it passes, commit locally yourself: run_shell("cd repos/<repo> &&
+     git add -A && git commit -m '...'"). Keep commits focused — one logical
+     change per commit, like the git-workflow-and-versioning skill
+     describes (see skills/coding-practices/ in the repo).
+  5. push_branch(repo, branch_name, pr_title, ...) → pushes your branch and
+     opens a PR. Owner-only, and it never touches the base branch directly
+     — same "propose, don't auto-merge" contract as github_write_file.
+  `git push` typed directly into run_shell will still fail (no credential
+  helper) — that's expected; use push_branch instead, it authenticates the
+  push itself without ever storing the token in the repo's git config.
 
 **Website building** — for a simple static site (HTML/CSS/JS), use
 scaffold_site to write all files into workspace `sites/<name>/` in one
