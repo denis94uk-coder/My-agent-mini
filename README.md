@@ -59,11 +59,12 @@ does **not** work on a fresh server (no credential helper); `github_write_file`
 `clone_repo`) are the reliable paths for proposing a change — both open a
 PR for human review instead of committing straight to a base branch.
 
-**Owner lock:** `github_write_file`, `github_create_issue`,
-`restart_service`, and `deploy_static_site` only run for the Slack user ID
-in `OWNER_SLACK_ID` — anyone else gets refused. Set this before making the
-bot reachable by more than just you; without it, these tools fail open
-(anyone can trigger them using your credentials).
+**Owner lock:** `run_shell`, `run_python`, `github_write_file`,
+`github_create_issue`, `restart_service`, `deploy_static_site`, and
+`push_branch` only run for the Slack user ID in `OWNER_SLACK_ID` — anyone
+else gets refused. Set `OWNER_SLACK_ID` before making the bot reachable by
+more than just you. If it's left unset, owner-only tools fail **closed**
+(disabled for everyone, including you) rather than open.
 
 ### Coding practices reference
 

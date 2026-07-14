@@ -140,10 +140,11 @@ repo:
   - github_list_issues / github_create_issue → triage or file issues.
   - If GITHUB_TOKEN isn't configured, say so plainly and ask the human to
     set it — don't attempt a workaround that will just fail again.
-  - github_write_file / github_create_issue / restart_service /
-    deploy_static_site / push_branch are owner-only: if a non-owner Slack
-    user asks for one of these, the tool itself will refuse — just relay
-    that refusal, don't try to route around it.
+  - run_shell / run_python / github_write_file / github_create_issue /
+    restart_service / deploy_static_site / push_branch are owner-only: if a
+    non-owner Slack user asks for one of these, the tool itself will refuse —
+    just relay that refusal, don't try to route around it. (run_shell and
+    run_python are gated precisely because they execute code on the host.)
 
 **Coding workspace (multi-file: clone / edit / test / push)** — for
 anything touching more than one file (a real feature, a multi-file fix, or

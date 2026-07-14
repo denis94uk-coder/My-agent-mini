@@ -52,7 +52,19 @@ def get_tools_description() -> str:
 # person who set it up — without this, any Slack user could ask the bot
 # to "push this to your repo" or "restart the service" and it would
 # comply using the owner's own credentials.
+#
+# CRITICAL: run_shell and run_python are ALSO owner-only. They execute
+# arbitrary code on the host VM, so any Slack user (or a prompt-injection
+# carried in a webpage/file the agent fetches) would otherwise get remote
+# code execution on the box. There is no denylist strong enough to make
+# shell access safe for untrusted users — the only correct control is to
+# not expose it to them at all.
 OWNER_ONLY_TOOLS = {
+    # Direct code execution on the host VM — must never be reachable by
+    # anyone other than the configured owner.
+    "run_shell",
+    "run_python",
+    # State-changing actions that run with the owner's own credentials.
     "github_write_file",
     "github_create_issue",
     "restart_service",
@@ -61,12 +73,25 @@ OWNER_ONLY_TOOLS = {
 }
 
 
+_OWNER_WARNED = False
+
+
 def _is_owner(user_id: str) -> bool:
     owner_id = os.environ.get("OWNER_SLACK_ID", "").strip()
     if not owner_id:
-        # No owner configured: fail open only for single-user/dev setups.
-        # Set OWNER_SLACK_ID before exposing the bot beyond yourself.
-        return True
+        # Fail CLOSED: with no owner configured, nobody may use the
+        # privileged tools. This is the safe default for a bot that can
+        # run shell/Python on the host — set OWNER_SLACK_ID in .env before
+        # exposing the bot to anyone else. (Previously this failed OPEN,
+        # which meant owner-only tools ran for *any* Slack user.)
+        global _OWNER_WARNED
+        if not _OWNER_WARNED:
+            _OWNER_WARNED = True
+            logger.warning(
+                "OWNER_SLACK_ID is not set — owner-only tools (run_shell, "
+                "run_python, GitHub writes, restart, deploy) are DISABLED."
+            )
+        return False
     return user_id == owner_id
 
 
@@ -145,6 +170,65 @@ def _ddg_html_search(query: str) -> str:
         return f"Search failed: {str(e)[:200]}"
 
 
+# ── SSRF protection for fetch_url ──
+# The agent runs on a cloud VM. Without this guard, fetch_url could be
+# pointed at the cloud metadata service (e.g. 169.254.169.254) or internal
+# services and used to steal credentials / pivot inside the network. We
+# resolve every host to its IP(s) and reject anything private/loopback/
+# link-local/reserved, plus well-known metadata hostnames — and we follow
+# redirects manually so a redirect can't smuggle the request onto a
+# blocked host.
+import ipaddress
+import socket
+from urllib.parse import urlparse, urljoin
+
+_SSRF_BLOCKED_HOSTNAMES = {"localhost", "metadata", "metadata.google.internal"}
+
+
+def _url_host_is_safe(hostname: str) -> bool:
+    if not hostname:
+        return False
+    h = hostname.lower()
+    if h in _SSRF_BLOCKED_HOSTNAMES or h.endswith(".internal") or h.endswith(".local"):
+        return False
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast):
+            return False
+    return True
+
+
+def _safe_http_get(url: str, headers: dict, timeout: int = 15):
+    """GET with SSRF protection. Follows redirects manually, re-validating
+    each hop. Returns (response, None) on success or (None, error_message)."""
+    for _ in range(6):
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return None, "blocked: malformed URL"
+        if parsed.scheme not in ("http", "https"):
+            return None, f"blocked: unsupported scheme '{parsed.scheme}'"
+        if not _url_host_is_safe(parsed.hostname or ""):
+            return None, "blocked: host is private/loopback/link-local or disallowed"
+        try:
+            resp = http_requests.get(url, headers=headers, timeout=timeout, allow_redirects=False)
+        except Exception as e:
+            return None, f"fetch failed: {str(e)[:200]}"
+        if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+            url = urljoin(url, resp.headers["Location"])
+            continue
+        return resp, None
+    return None, "blocked: too many redirects"
+
+
 @tool("fetch_url", "Fetch a webpage and extract its main text content.", "url")
 def fetch_url(url: str) -> str:
     """Fetch a URL and extract readable text."""
@@ -153,7 +237,10 @@ def fetch_url(url: str) -> str:
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
-        resp = http_requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        resp, err = _safe_http_get(url, headers, timeout=15)
+        if err:
+            return err
+        assert resp is not None
         resp.raise_for_status()
 
         content_type = resp.headers.get("Content-Type", "")
@@ -212,7 +299,7 @@ def run_python(code: str) -> str:
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
 
-        return output.strip() or "(no output)"
+        return _redact_shell_output(output).strip() or "(no output)"
 
     except subprocess.TimeoutExpired:
         return "❌ Code execution timed out (30s limit)"
