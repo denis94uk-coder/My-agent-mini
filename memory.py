@@ -36,6 +36,7 @@ def get_db() -> sqlite3.Connection:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
             fact TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'fact',
             timestamp REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_user ON facts(user_id);
@@ -52,6 +53,15 @@ def get_db() -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_task_conv ON tasks(conv_key);
     """)
+    # Migration: older DBs may have a `facts` table from before the
+    # `category` column existed. Add it in place so existing installs
+    # don't need to wipe memory.db to pick up durable project memory.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
+    if "category" not in existing_cols:
+        conn.execute("ALTER TABLE facts ADD COLUMN category TEXT NOT NULL DEFAULT 'fact'")
+        conn.commit()
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON facts(category)")
+    conn.commit()
     return conn
 
 
@@ -156,29 +166,51 @@ def search_relevant(conv_key: str, query: str, exclude_recent: int = 20, limit: 
     ]
 
 
-def add_fact(user_id: str, fact: str):
-    """Store a fact about a user."""
+def add_fact(user_id: str, fact: str, category: str = "fact"):
+    """
+    Store a fact about a user, tagged by category:
+      - 'fact'         casual/ambient info (preferences, small details)
+      - 'decision'     durable project decisions, stated priorities, roadmap
+                       items — things that must survive into future threads
+      - 'task_summary' auto-generated digest of a completed task/plan
+    Category matters for retrieval: decisions and task_summaries are treated
+    as durable project memory and never get crowded out the way plain
+    'fact' entries can (see get_facts).
+    """
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO facts (user_id, fact, timestamp) VALUES (?, ?, ?)",
-            (user_id, fact, time.time()),
+            "INSERT INTO facts (user_id, fact, category, timestamp) VALUES (?, ?, ?, ?)",
+            (user_id, fact, category, time.time()),
         )
         conn.commit()
-        logger.info(f"📝 Stored fact for {user_id}: {fact[:80]}")
+        logger.info(f"📝 Stored {category} for {user_id}: {fact[:80]}")
     finally:
         conn.close()
 
 
-def get_facts(user_id: str) -> list[str]:
-    """Get all stored facts about a user."""
+def get_facts(user_id: str, recent_fact_limit: int = 10, decision_limit: int = 40) -> dict[str, list[str]]:
+    """
+    Get durable project memory for a user, split into two groups so the
+    caller can render them separately and neither crowds the other out:
+      - 'durable': ALL 'decision' and 'task_summary' entries (up to
+        decision_limit), newest first — must persist across threads.
+      - 'recent': the most recent `recent_fact_limit` plain 'fact' entries —
+        ambient preferences, capped so they don't grow the prompt unboundedly.
+    """
     conn = get_db()
     try:
-        rows = conn.execute(
-            "SELECT fact FROM facts WHERE user_id = ? ORDER BY timestamp DESC",
-            (user_id,),
+        durable = conn.execute(
+            "SELECT fact FROM facts WHERE user_id = ? AND category IN ('decision', 'task_summary') "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (user_id, decision_limit),
         ).fetchall()
-        return [r[0] for r in rows]
+        recent = conn.execute(
+            "SELECT fact FROM facts WHERE user_id = ? AND category = 'fact' "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (user_id, recent_fact_limit),
+        ).fetchall()
+        return {"durable": [r[0] for r in durable], "recent": [r[0] for r in recent]}
     finally:
         conn.close()
 
@@ -227,9 +259,39 @@ def update_task_status(conv_key: str, step_no: int, status: str) -> bool:
             (status, time.time(), conv_key, step_no),
         )
         conn.commit()
-        return cur.rowcount > 0
+        updated = cur.rowcount > 0
     finally:
         conn.close()
+
+    if updated and status == "done":
+        _maybe_summarize_completed_plan(conv_key)
+    return updated
+
+
+def _maybe_summarize_completed_plan(conv_key: str):
+    """
+    If every step in this conversation's plan is now 'done', write a durable
+    task_summary fact automatically — so finished work is remembered in
+    future threads even if the model never explicitly calls `remember`.
+    Deterministic digest of the plan's own step descriptions, no extra LLM
+    call needed.
+    """
+    plan = get_plan(conv_key)
+    if not plan or any(p["status"] != "done" for p in plan):
+        return
+    steps_text = "; ".join(p["description"] for p in plan)
+    summary = f"[Completed task in {conv_key}] {steps_text}"
+    # user_id isn't tracked per-task-row for lookup here, so re-derive it
+    # from the tasks table where it was stored at plan-creation time.
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT user_id FROM tasks WHERE conv_key = ? LIMIT 1", (conv_key,)
+        ).fetchone()
+    finally:
+        conn.close()
+    user_id = row[0] if row else "default"
+    add_fact(user_id, summary, category="task_summary")
 
 
 def clear_conversation(conv_key: str):
