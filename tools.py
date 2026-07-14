@@ -45,10 +45,42 @@ def get_tools_description() -> str:
     return "\n".join(lines)
 
 
+# Tools that can change external state on behalf of the whole workspace
+# (write to GitHub, restart the server, deploy a site publicly) are
+# restricted to the bot's owner only. This matters once the bot is
+# reachable by anyone in a Slack workspace/public channel, not just the
+# person who set it up — without this, any Slack user could ask the bot
+# to "push this to your repo" or "restart the service" and it would
+# comply using the owner's own credentials.
+OWNER_ONLY_TOOLS = {
+    "github_write_file",
+    "github_create_issue",
+    "restart_service",
+    "deploy_static_site",
+}
+
+
+def _is_owner(user_id: str) -> bool:
+    owner_id = os.environ.get("OWNER_SLACK_ID", "").strip()
+    if not owner_id:
+        # No owner configured: fail open only for single-user/dev setups.
+        # Set OWNER_SLACK_ID before exposing the bot beyond yourself.
+        return True
+    return user_id == owner_id
+
+
 def run_tool(name: str, args: dict) -> str:
     """Execute a tool by name with given arguments."""
     if name not in TOOLS:
         return f"❌ Unknown tool: {name}. Available: {', '.join(TOOLS.keys())}"
+
+    requesting_user_id = args.pop("_requesting_user_id", None)
+    if name in OWNER_ONLY_TOOLS and not _is_owner(requesting_user_id or ""):
+        return (
+            f"❌ Not authorized: '{name}' can only be used by the bot's owner. "
+            "Ask the workspace owner to run this instead."
+        )
+
     try:
         result = TOOLS[name]["func"](**args)
         # Truncate very long results
@@ -407,8 +439,8 @@ def github_read_file(path: str, owner: str = "", repo: str = "", branch: str = "
 
 @tool(
     "github_write_file",
-    "Create or update a single file in a GitHub repo via the API and commit it directly (bypasses the broken local git push). Overwrites existing content.",
-    "path, content, message, owner='', repo='', branch='main'",
+    "Propose a change to a file in a GitHub repo. Creates a new branch, commits the change there, and opens a pull request against the base branch for human review — it never commits straight to main. Returns the PR URL. Owner-only tool.",
+    "path, content, message, owner='', repo='', base_branch='main'",
 )
 def github_write_file(
     path: str,
@@ -416,7 +448,7 @@ def github_write_file(
     message: str,
     owner: str = "",
     repo: str = "",
-    branch: str = "main",
+    base_branch: str = "main",
 ) -> str:
     headers = _github_headers()
     if not headers:
@@ -426,26 +458,60 @@ def github_write_file(
         return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
     try:
         import base64
-        url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
-        # Look up existing sha (required by the API to update, not to create).
+        repo_url = f"{GITHUB_API}/repos/{owner}/{repo}"
+
+        # 1. Find the base branch's current commit to branch off from.
+        base_ref = http_requests.get(
+            f"{repo_url}/git/ref/heads/{base_branch}", headers=headers, timeout=15
+        )
+        base_ref.raise_for_status()
+        base_sha = base_ref.json()["object"]["sha"]
+
+        # 2. Create a new branch for this change.
+        new_branch = f"agent/{int(time.time())}-{re.sub(r'[^a-zA-Z0-9]+', '-', path)[:40].strip('-')}"
+        create_ref = http_requests.post(
+            f"{repo_url}/git/refs",
+            headers=headers,
+            json={"ref": f"refs/heads/{new_branch}", "sha": base_sha},
+            timeout=15,
+        )
+        create_ref.raise_for_status()
+
+        # 3. Look up the file's existing sha on the new branch (needed to update, not create).
+        contents_url = f"{repo_url}/contents/{path}"
         sha = None
-        existing = http_requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
+        existing = http_requests.get(
+            contents_url, headers=headers, params={"ref": new_branch}, timeout=15
+        )
         if existing.status_code == 200:
             sha = existing.json().get("sha")
 
+        # 4. Commit the file change on the new branch.
         payload = {
             "message": message,
             "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-            "branch": branch,
+            "branch": new_branch,
         }
         if sha:
             payload["sha"] = sha
+        put_resp = http_requests.put(contents_url, headers=headers, json=payload, timeout=20)
+        put_resp.raise_for_status()
 
-        resp = http_requests.put(url, headers=headers, json=payload, timeout=20)
-        resp.raise_for_status()
-        commit_sha = resp.json().get("commit", {}).get("sha", "")[:8]
-        action = "Updated" if sha else "Created"
-        return f"✅ {action} {owner}/{repo}/{path} on {branch} (commit {commit_sha})"
+        # 5. Open a PR from the new branch into the base branch.
+        pr_resp = http_requests.post(
+            f"{repo_url}/pulls",
+            headers=headers,
+            json={
+                "title": message,
+                "head": new_branch,
+                "base": base_branch,
+                "body": f"Proposed by the agent.\n\nFile: `{path}`",
+            },
+            timeout=15,
+        )
+        pr_resp.raise_for_status()
+        pr = pr_resp.json()
+        return f"✅ Opened PR for review (not merged yet): {pr['html_url']}"
     except Exception as e:
         return f"❌ GitHub write error: {str(e)[:300]}"
 
