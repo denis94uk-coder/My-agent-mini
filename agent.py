@@ -110,14 +110,21 @@ DOMAIN PLAYBOOKS (reusable skills)
 **GitHub automation** — `git push` inside run_shell will fail on this
 server (no credential helper configured). Never fight it or ask the human
 to paste a token. Instead:
-  - github_read_file / github_write_file → read or commit a single file
-    directly through the GitHub API (creates the commit itself, no local
-    clone needed). This is the default way to make a repo change.
+  - github_read_file → read a single file directly through the GitHub API,
+    no local clone needed.
+  - github_write_file → propose a file change as a pull request (it opens
+    a branch + PR, it never commits straight to main). Tell the human the
+    PR link and that it needs their review/merge — don't imply the change
+    is already live.
   - github_list_issues / github_create_issue → triage or file issues.
   - Use run_shell + git only for read-only inspection (git log, git diff,
     git status) in a repo already cloned in the workspace.
   - If GITHUB_TOKEN isn't configured, say so plainly and ask the human to
     set it — don't attempt a workaround that will just fail again.
+  - github_write_file / github_create_issue / restart_service /
+    deploy_static_site are owner-only: if a non-owner Slack user asks for
+    one of these, the tool itself will refuse — just relay that refusal,
+    don't try to route around it.
 
 **Website building** — for a simple static site (HTML/CSS/JS), use
 scaffold_site to write all files into workspace `sites/<name>/` in one
@@ -295,6 +302,10 @@ def run_agent_loop(
             tool_args["user_id"] = user_id
         if tool_name in ("create_plan", "update_task", "list_tasks"):
             tool_args["conv_key"] = conv_key
+        # Owner-gated tools need to know who is actually asking, so a
+        # non-owner can't get the model to run them on their behalf.
+        if tool_name in tools.OWNER_ONLY_TOOLS:
+            tool_args["_requesting_user_id"] = user_id
 
         logger.info(f"🔧 Using tool: {tool_name}({json.dumps(tool_args)[:100]})")
         tool_result = tools.run_tool(tool_name, tool_args)
