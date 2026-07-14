@@ -57,6 +57,7 @@ OWNER_ONLY_TOOLS = {
     "github_create_issue",
     "restart_service",
     "deploy_static_site",
+    "push_branch",
 }
 
 
@@ -524,6 +525,223 @@ def github_write_file(
         return f"✅ Opened PR for review (not merged yet): {pr['html_url']}"
     except Exception as e:
         return f"❌ GitHub write error: {str(e)[:300]}"
+
+
+# ── Coding Workspace: clone / edit / test / push ──
+# For real multi-file work (not a single-file PR), the agent clones a repo
+# locally into repos/<repo>, edits/tests it with repo_write_file/
+# repo_read_file/run_shell, then push_branch ships the result as a PR —
+# same "never touch main directly" safety model as github_write_file, just
+# for a whole branch of commits instead of one file. The GITHUB_TOKEN is
+# passed as a one-off `http.extraHeader` on the git subprocess call itself
+# (not baked into the remote URL or git config), so it's never persisted to
+# disk and never shows up in `git remote -v` or repo_list_files output.
+
+REPOS_DIR = os.path.join(WORKSPACE, "repos")
+os.makedirs(REPOS_DIR, exist_ok=True)
+
+
+def _safe_repo_path(relpath: str) -> str | None:
+    """Resolve a path under REPOS_DIR, rejecting any traversal outside it."""
+    relpath = (relpath or "").strip()
+    candidate = os.path.realpath(os.path.join(REPOS_DIR, relpath))
+    repos_real = os.path.realpath(REPOS_DIR)
+    if candidate == repos_real or candidate.startswith(repos_real + os.sep):
+        return candidate
+    return None
+
+
+def _git_extra_header_arg() -> list[str]:
+    """Build a one-off git -c http.extraHeader=... arg carrying the auth
+    token, without ever writing it into the repo's git config or remote."""
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not token:
+        return []
+    return ["-c", f"http.extraHeader=AUTHORIZATION: bearer {token}"]
+
+
+@tool(
+    "clone_repo",
+    "Clone a GitHub repo into the coding workspace (repos/<repo>) so you can read, edit, and test multiple files with repo_read_file/repo_write_file/run_shell. Safe to call again later — refreshes the existing clone to the latest branch instead of re-cloning. Works for private repos via GITHUB_TOKEN.",
+    "repo, owner='', branch='main'",
+)
+def clone_repo(repo: str, owner: str = "", branch: str = "main") -> str:
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    dest = os.path.join(REPOS_DIR, repo)
+    url = f"https://github.com/{owner}/{repo}.git"
+    extra = _git_extra_header_arg()
+    try:
+        if os.path.isdir(os.path.join(dest, ".git")):
+            fetch = subprocess.run(
+                ["git", *extra, "-C", dest, "fetch", "origin", branch, "--quiet"],
+                capture_output=True, text=True, timeout=90,
+            )
+            if fetch.returncode != 0:
+                return f"❌ Fetch failed: {_redact_shell_output(fetch.stderr)[:300]}"
+            reset = subprocess.run(
+                ["git", "-C", dest, "reset", "--hard", f"origin/{branch}", "--quiet"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if reset.returncode != 0:
+                return f"❌ Reset failed: {_redact_shell_output(reset.stderr)[:300]}"
+            return f"✅ Refreshed existing clone at repos/{repo} to latest {branch}."
+        clone = subprocess.run(
+            ["git", *extra, "clone", "--quiet", "--branch", branch, url, dest],
+            capture_output=True, text=True, timeout=120,
+        )
+        if clone.returncode != 0:
+            return f"❌ Clone failed: {_redact_shell_output(clone.stderr)[:300]}"
+        subprocess.run(["git", "-C", dest, "config", "user.email", "agent@my-agent-mini"], timeout=10)
+        subprocess.run(["git", "-C", dest, "config", "user.name", "My Agent"], timeout=10)
+        return (
+            f"✅ Cloned {owner}/{repo}@{branch} into repos/{repo}. "
+            f"Use repo_read_file/repo_write_file/repo_list_files to edit, "
+            f"run_shell (cd repos/{repo} && ...) to test and `git add -A && git commit -m '...'`, "
+            f"then push_branch to open a PR."
+        )
+    except subprocess.TimeoutExpired:
+        return "❌ Clone/fetch timed out."
+    except Exception as e:
+        return f"❌ Clone error: {str(e)[:300]}"
+
+
+@tool(
+    "repo_write_file",
+    "Create or overwrite a file inside a cloned repo. relpath is relative to repos/, e.g. 'my-repo/src/app.py'. Run clone_repo first.",
+    "relpath, content",
+)
+def repo_write_file(relpath: str, content: str) -> str:
+    path = _safe_repo_path(relpath)
+    if path is None:
+        return "❌ Blocked: path escapes the repos/ workspace."
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+        return f"✅ Wrote repos/{relpath.strip('/')} ({len(content)} chars)."
+    except Exception as e:
+        return f"❌ Write error: {str(e)[:300]}"
+
+
+@tool(
+    "repo_read_file",
+    "Read a file inside a cloned repo. relpath is relative to repos/, e.g. 'my-repo/src/app.py'.",
+    "relpath",
+)
+def repo_read_file(relpath: str) -> str:
+    path = _safe_repo_path(relpath)
+    if path is None:
+        return "❌ Blocked: path escapes the repos/ workspace."
+    try:
+        with open(path, "r") as f:
+            content = f.read()
+        return content[:4000] if content else "(empty file)"
+    except FileNotFoundError:
+        return f"❌ File not found: repos/{relpath.strip('/')}. Use repo_list_files or clone_repo first."
+    except IsADirectoryError:
+        return f"❌ That's a directory, not a file: repos/{relpath.strip('/')}. Use repo_list_files."
+    except Exception as e:
+        return f"❌ Read error: {str(e)[:300]}"
+
+
+@tool(
+    "repo_list_files",
+    "List files inside a cloned repo (or a subdirectory of it). relpath is relative to repos/, e.g. 'my-repo' or 'my-repo/src'. Skips .git internals.",
+    "relpath=''",
+)
+def repo_list_files(relpath: str = "") -> str:
+    path = _safe_repo_path(relpath) if relpath else REPOS_DIR
+    if path is None:
+        return "❌ Blocked: path escapes the repos/ workspace."
+    if not os.path.isdir(path):
+        return f"❌ Not a directory: repos/{relpath.strip('/')}. Use clone_repo first."
+    lines = []
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(d for d in dirs if d != ".git")
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, REPOS_DIR)
+            lines.append(f"  {rel} ({os.path.getsize(full)} bytes)")
+            if len(lines) >= 200:
+                lines.append("  ... (truncated — narrow to a subdirectory)")
+                return "\n".join(lines)
+    return "\n".join(lines) if lines else "(empty)"
+
+
+@tool(
+    "push_branch",
+    "Push locally committed changes from a cloned repo (repos/<repo>) as a new branch and open a pull request for human review — never touches the base branch directly. Commit your changes first via run_shell (cd repos/<repo> && git add -A && git commit -m '...'). Owner-only tool.",
+    "repo, branch_name, pr_title, owner='', pr_body='', base_branch='main'",
+)
+def push_branch(
+    repo: str,
+    branch_name: str,
+    pr_title: str,
+    owner: str = "",
+    pr_body: str = "",
+    base_branch: str = "main",
+) -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    dest = os.path.join(REPOS_DIR, repo)
+    if not os.path.isdir(os.path.join(dest, ".git")):
+        return f"❌ No clone found at repos/{repo}. Run clone_repo first."
+
+    branch_name = re.sub(r"[^a-zA-Z0-9/_-]+", "-", branch_name).strip("-") or f"agent-{int(time.time())}"
+    if not branch_name.startswith("agent/"):
+        branch_name = f"agent/{branch_name}"
+
+    try:
+        status = subprocess.run(
+            ["git", "-C", dest, "status", "--porcelain"], capture_output=True, text=True, timeout=15,
+        )
+        if status.stdout.strip():
+            return (
+                "❌ You have uncommitted changes in the clone. Commit them first: "
+                f"run_shell(\"cd repos/{repo} && git add -A && git commit -m '...'\")."
+            )
+
+        checkout = subprocess.run(
+            ["git", "-C", dest, "checkout", "-B", branch_name], capture_output=True, text=True, timeout=15,
+        )
+        if checkout.returncode != 0:
+            return f"❌ Could not create branch: {_redact_shell_output(checkout.stderr)[:300]}"
+
+        extra = _git_extra_header_arg()
+        push = subprocess.run(
+            ["git", *extra, "-C", dest, "push", "--force-with-lease", "origin", f"{branch_name}:{branch_name}"],
+            capture_output=True, text=True, timeout=90,
+        )
+        if push.returncode != 0:
+            return f"❌ Push failed: {_redact_shell_output(push.stderr)[:300]}"
+
+        repo_url = f"{GITHUB_API}/repos/{owner}/{repo}"
+        pr_resp = http_requests.post(
+            f"{repo_url}/pulls",
+            headers=headers,
+            json={
+                "title": pr_title,
+                "head": branch_name,
+                "base": base_branch,
+                "body": pr_body or "Proposed by the agent.",
+            },
+            timeout=15,
+        )
+        if pr_resp.status_code == 422 and "already exists" in pr_resp.text:
+            return f"✅ Pushed to existing branch `{branch_name}` (a PR is already open for it)."
+        pr_resp.raise_for_status()
+        pr = pr_resp.json()
+        return f"✅ Opened PR for review (not merged yet): {pr['html_url']}"
+    except subprocess.TimeoutExpired:
+        return "❌ Push timed out."
+    except Exception as e:
+        return f"❌ Push error: {str(e)[:300]}"
 
 
 @tool(
