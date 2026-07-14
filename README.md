@@ -24,14 +24,20 @@ them automatically:
 
 | Skill | Tools | Requires |
 |---|---|---|
-| **GitHub automation** | `github_read_file`, `github_write_file`, `github_list_issues`, `github_create_issue` | `GITHUB_TOKEN` (+ optional `GITHUB_DEFAULT_OWNER`/`GITHUB_DEFAULT_REPO`) |
+| **GitHub automation** | `github_read_file`, `github_write_file` (opens a PR, never commits to main), `github_list_issues`, `github_create_issue` | `GITHUB_TOKEN` (+ optional `GITHUB_DEFAULT_OWNER`/`GITHUB_DEFAULT_REPO`) |
 | **Server administration** | `server_health`, `restart_service` (allow-listed services only) | `ALLOWED_SERVICES` + passwordless `sudo systemctl restart <service>` for that exact unit |
 | **Website building** | `scaffold_site` (writes static site files), `deploy_static_site` (ships them to Vercel) | `VERCEL_TOKEN` |
 
 All three degrade gracefully with a clear error if their token/config isn't
 set — see `.env.example` for setup steps. `git push` from `run_shell` does
 **not** work on a fresh server (no credential helper); `github_write_file`
-is the reliable path for committing changes.
+is the reliable path for proposing a change.
+
+**Owner lock:** `github_write_file`, `github_create_issue`,
+`restart_service`, and `deploy_static_site` only run for the Slack user ID
+in `OWNER_SLACK_ID` — anyone else gets refused. Set this before making the
+bot reachable by more than just you; without it, these tools fail open
+(anyone can trigger them using your credentials).
 
 ## 🧠 Optional AI providers
 
