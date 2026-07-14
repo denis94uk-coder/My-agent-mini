@@ -195,8 +195,16 @@ _INTENT_ONLY_PATTERNS = [
     r"\bnow i('| a)?m going to\b",
     r"\blet me now\b",
     r"\bnext,? i will\b",
-    r"\bi'll (now )?(save|write|create|run|fetch|search|check|update|do)\b",
-    r"\bi am going to (save|write|create|run|fetch|search|check|update)\b",
+    # NOTE: "remember"/"note" must be in this verb list. Without it, a
+    # response like "I'll remember it's 40 degrees Celsius" reads as a
+    # final answer (no [TOOL_CALL] block ever gets emitted), so nothing
+    # is actually persisted to memory.db — the model just *says* it will
+    # remember something and then doesn't. Confirmed live: user told the
+    # bot a fact, got this exact narration back, and it was gone in a new
+    # thread. Keep any future save-intent verb added here too.
+    r"\bi'll (now )?(save|write|create|run|fetch|search|check|update|do|remember|note)\b",
+    r"\bi(?: will|'ll) (remember|note|keep in mind|store) that\b",
+    r"\bi am going to (save|write|create|run|fetch|search|check|update|remember|note)\b",
 ]
 _INTENT_ONLY_RE = re.compile("|".join(_INTENT_ONLY_PATTERNS), re.IGNORECASE)
 
