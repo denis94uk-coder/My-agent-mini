@@ -41,20 +41,23 @@ should be stored as a `decision`.
 
 ## 🛠️ Domain Skills
 
-Beyond general chat, the agent has three built-in "skills" — real tools for
+Beyond general chat, the agent has built-in "skills" — real tools for
 recurring domains of work, described in its system prompt so it reaches for
 them automatically:
 
 | Skill | Tools | Requires |
 |---|---|---|
-| **GitHub automation** | `github_read_file`, `github_write_file` (opens a PR, never commits to main), `github_list_issues`, `github_create_issue` | `GITHUB_TOKEN` (+ optional `GITHUB_DEFAULT_OWNER`/`GITHUB_DEFAULT_REPO`) |
+| **GitHub automation** (single file) | `github_read_file`, `github_write_file` (opens a PR, never commits to main), `github_list_issues`, `github_create_issue` | `GITHUB_TOKEN` (+ optional `GITHUB_DEFAULT_OWNER`/`GITHUB_DEFAULT_REPO`) |
+| **Coding workspace** (multi-file) | `clone_repo`, `repo_read_file`/`repo_write_file`/`repo_list_files`, `run_shell` (to test), `push_branch` (opens a PR, never commits to main) | `GITHUB_TOKEN` |
 | **Server administration** | `server_health`, `restart_service` (allow-listed services only) | `ALLOWED_SERVICES` + passwordless `sudo systemctl restart <service>` for that exact unit |
 | **Website building** | `scaffold_site` (writes static site files), `deploy_static_site` (ships them to Vercel) | `VERCEL_TOKEN` |
 
-All three degrade gracefully with a clear error if their token/config isn't
-set — see `.env.example` for setup steps. `git push` from `run_shell` does
-**not** work on a fresh server (no credential helper); `github_write_file`
-is the reliable path for proposing a change.
+All degrade gracefully with a clear error if their token/config isn't set —
+see `.env.example` for setup steps. Plain `git push` typed into `run_shell`
+does **not** work on a fresh server (no credential helper); `github_write_file`
+(single file) and `push_branch` (whole branch, after cloning with
+`clone_repo`) are the reliable paths for proposing a change — both open a
+PR for human review instead of committing straight to a base branch.
 
 **Owner lock:** `github_write_file`, `github_create_issue`,
 `restart_service`, and `deploy_static_site` only run for the Slack user ID
