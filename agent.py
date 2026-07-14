@@ -22,18 +22,35 @@ logger = logging.getLogger("my-agent-mini")
 MAX_ITERATIONS = 10  # Safety limit to prevent infinite loops
 
 
-def get_agent_system_prompt(base_prompt: str, user_facts: list[str] = None) -> str:
+def get_agent_system_prompt(base_prompt: str, user_facts: dict[str, list[str]] = None) -> str:
     """Build the full system prompt with tool descriptions."""
     tools_desc = tools.get_tools_description()
 
+    user_facts = user_facts or {"durable": [], "recent": []}
     facts_section = ""
-    if user_facts:
-        facts_list = "\n".join(f"  - {f}" for f in user_facts[:10])
-        facts_section = f"""
-KNOWN FACTS ABOUT THIS USER:
-{facts_list}
-Use these to personalize your responses.
-"""
+    durable, recent = user_facts.get("durable") or [], user_facts.get("recent") or []
+    if durable or recent:
+        parts = []
+        if durable:
+            # Decisions/task summaries: this is durable project memory —
+            # render ALL of it (already capped in memory.get_facts), never
+            # truncated further, so it survives across separate Slack
+            # threads/conversations the way a real project memory should.
+            parts.append(
+                "PROJECT MEMORY (decisions, roadmap, completed work — true "
+                "across ALL conversations, not just this thread):\n"
+                + "\n".join(f"  - {f}" for f in durable)
+            )
+        if recent:
+            parts.append(
+                "RECENT NOTES ABOUT THIS USER:\n" + "\n".join(f"  - {f}" for f in recent)
+            )
+        facts_section = "\n\n" + "\n\n".join(parts) + (
+            "\nTreat PROJECT MEMORY as ground truth: check new requests against it "
+            "(e.g. does this contradict a stated priority or an earlier decision?) "
+            "and say so instead of silently going along with something that conflicts. "
+            "Use these to personalize your responses.\n"
+        )
 
     return f"""{base_prompt}
 
@@ -92,7 +109,12 @@ TOOL SELECTION GUIDE:
 - web_search → current events, facts you're unsure about, research
 - fetch_url → read a specific webpage or API
 - memory_search → recall past conversations
-- remember → store important facts about the user
+- remember → store durable memory. Use category='decision' for anything
+  that must survive into future, separate Slack threads: stated priorities,
+  roadmap/architecture choices, explicit instructions like "don't build X
+  yet". Use category='fact' (default) for casual preferences. When in
+  doubt about something project-level, prefer 'decision' — it's cheap to
+  store and expensive to silently forget.
 - create_plan → break ANY task with 2 or more distinct steps (e.g. "do X
   then Y", "do X, Y and Z") into a visible, numbered plan and call this
   tool FIRST, before doing any other work — even if the task feels small.
@@ -302,6 +324,8 @@ def run_agent_loop(
             tool_args["user_id"] = user_id
         if tool_name in ("create_plan", "update_task", "list_tasks"):
             tool_args["conv_key"] = conv_key
+        if tool_name == "create_plan":
+            tool_args["user_id"] = user_id
         # Owner-gated tools need to know who is actually asking, so a
         # non-owner can't get the model to run them on their behalf.
         if tool_name in tools.OWNER_ONLY_TOOLS:
