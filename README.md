@@ -62,6 +62,16 @@ in `OWNER_SLACK_ID` — anyone else gets refused. Set this before making the
 bot reachable by more than just you; without it, these tools fail open
 (anyone can trigger them using your credentials).
 
+### Coding practices reference
+
+`skills/coding-practices/` holds 24 reference skill files (vendored from
+[addyosmani/agent-skills](https://github.com/addyosmani/agent-skills), MIT)
+covering spec-writing, TDD, debugging, code review, git workflow, and
+shipping checklists. `agent.py`'s system prompt carries a condensed
+one-line-per-skill summary so the model applies these habits on any real
+engineering task; see `skills/coding-practices/README.md` for the full
+index and text.
+
 ## 🧠 Optional AI providers
 
 The built-in router can also use the provider integrations already in the bot, including Gemini, Groq, xAI, Cerebras, SambaNova, Together, Mistral, Cohere, OpenRouter, HuggingFace, Merge, and NVIDIA. Add only the keys you choose to use; the bot never requires all of them.
@@ -150,10 +160,15 @@ sudo systemctl restart my-agent
 ```
 my-agent-mini/
 ├── bot.py              # Main bot (single file, ~300 lines)
+├── agent.py            # ReAct agent loop + system prompt
+├── memory.py           # SQLite-backed durable + recent memory
+├── tools.py            # Tool implementations
 ├── requirements.txt    # Python dependencies (3 packages)
 ├── setup.sh            # One-click server setup
 ├── .env.example        # Template for API keys
 ├── .gitignore          # Protects .env
+├── skills/
+│   └── coding-practices/  # 24 reference skill files (see README above)
 └── README.md           # This file
 ```
 
