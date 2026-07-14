@@ -232,11 +232,21 @@ def memory_search(query: str) -> str:
     return "\n\n".join(lines)
 
 
-@tool("remember", "Store a fact or note about the user for future reference.", "fact")
-def remember(fact: str, user_id: str = "default") -> str:
-    """Store a fact about the user."""
-    memory.add_fact(user_id, fact)
-    return f"✅ Noted: {fact}"
+@tool(
+    "remember",
+    "Store durable memory for future conversations. Use category='decision' for "
+    "things that must survive into future threads — stated priorities, roadmap "
+    "items, architecture/process choices, explicit instructions ('don't do X yet'). "
+    "Use category='fact' (default) for casual preferences/details. Decisions are "
+    "never crowded out of context the way plain facts are.",
+    "fact, category",
+)
+def remember(fact: str, user_id: str = "default", category: str = "fact") -> str:
+    """Store a fact or decision about the user/project."""
+    category = category if category in ("fact", "decision") else "fact"
+    memory.add_fact(user_id, fact, category=category)
+    label = "Decision" if category == "decision" else "Noted"
+    return f"✅ {label}: {fact}"
 
 
 # ── Task Planner Tools ──
@@ -244,8 +254,8 @@ def remember(fact: str, user_id: str = "default") -> str:
 # and so an interrupted task can be resumed instead of restarted from zero.
 
 @tool("create_plan", "Create or replace the task plan for this conversation. Use for any multi-step request BEFORE starting work. steps is a list of short step descriptions.", "steps")
-def create_plan_tool(steps: list, conv_key: str = "default") -> str:
-    plan = memory.create_plan(conv_key, "default", [str(s) for s in steps])
+def create_plan_tool(steps: list, conv_key: str = "default", user_id: str = "default") -> str:
+    plan = memory.create_plan(conv_key, user_id, [str(s) for s in steps])
     lines = [f"{p['step_no']}. [{p['status']}] {p['description']}" for p in plan]
     return "✅ Plan created:\n" + "\n".join(lines)
 
