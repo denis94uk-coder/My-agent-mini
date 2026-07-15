@@ -317,6 +317,19 @@ def build_providers():
             "url": "https://api-inference.huggingface.co/v1/chat/completions",
         })
 
+    # Custom OpenAI-compatible endpoint — point the bot at ANY gateway or
+    # local server: a free-claude-code proxy (http://host:8082/v1/chat/completions),
+    # Ollama, LM Studio, vLLM, LiteLLM, etc. Set CUSTOM_LLM_URL to the full
+    # /chat/completions URL; CUSTOM_LLM_API_KEY optional for local servers.
+    if os.getenv("CUSTOM_LLM_URL"):
+        PROVIDERS.append({
+            "name": os.getenv("CUSTOM_LLM_NAME", "Custom endpoint"),
+            "type": "openai_compat",
+            "api_key": os.getenv("CUSTOM_LLM_API_KEY", ""),
+            "model": os.getenv("CUSTOM_LLM_MODEL", "default"),
+            "url": os.environ["CUSTOM_LLM_URL"],
+        })
+
     # Merge Gateway (OpenAI-compatible paid gateway; one key can route to
     # multiple providers). Prefer the documented variable, while accepting
     # the older MERGE_API_KEY name as a backwards-compatible alias.
