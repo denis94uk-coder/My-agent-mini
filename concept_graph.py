@@ -524,7 +524,7 @@ def get_entity_context(entity_name: str) -> dict:
 
 
 def get_graph_stats() -> dict:
-    """Summary stats for /status and /health."""
+    """Summary stats for /botstatus and /health."""
     conn = _get_db()
     try:
         entities = conn.execute("SELECT COUNT(*) FROM graph_entities").fetchone()[0]

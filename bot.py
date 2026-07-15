@@ -972,7 +972,7 @@ def handle_providers(ack, command, say):
     say(text="\n".join(lines), channel=command["channel_id"])
 
 
-@slack_app.command("/status")
+@slack_app.command("/botstatus")
 def handle_status(ack, command, say):
     ack()
     stats = memory.get_stats()
