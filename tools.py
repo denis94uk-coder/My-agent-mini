@@ -186,6 +186,60 @@ def _ddg_html_search(query: str) -> str:
         return f"Search failed: {str(e)[:200]}"
 
 
+@tool(
+    "get_weather",
+    "Get current weather and today's forecast for any city, via the Open-Meteo "
+    "API (free, no key). Always use this for weather questions instead of "
+    "web_search — it is faster and more reliable.",
+    "location",
+)
+def get_weather(location: str) -> str:
+    """Current weather for a city using Open-Meteo geocoding + forecast."""
+    try:
+        geo = http_requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": location, "count": 1, "language": "en"},
+            timeout=10,
+        ).json()
+        if not geo.get("results"):
+            return f"❌ Could not find a place called '{location}'."
+        place = geo["results"][0]
+        lat, lon = place["latitude"], place["longitude"]
+        name = f"{place['name']}, {place.get('country', '')}".strip(", ")
+
+        wx = http_requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                           "wind_speed_10m,precipitation,weather_code",
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                "timezone": "auto", "forecast_days": 1,
+            },
+            timeout=10,
+        ).json()
+        cur = wx["current"]
+        day = wx["daily"]
+        codes = {
+            0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+            45: "fog", 48: "rime fog", 51: "light drizzle", 53: "drizzle",
+            55: "dense drizzle", 61: "light rain", 63: "rain", 65: "heavy rain",
+            71: "light snow", 73: "snow", 75: "heavy snow", 80: "rain showers",
+            81: "rain showers", 82: "violent rain showers", 95: "thunderstorm",
+            96: "thunderstorm with hail", 99: "thunderstorm with heavy hail",
+        }
+        desc = codes.get(cur.get("weather_code"), "unknown conditions")
+        return (
+            f"Weather in {name} right now: {desc}, {cur['temperature_2m']}°C "
+            f"(feels like {cur['apparent_temperature']}°C), humidity {cur['relative_humidity_2m']}%, "
+            f"wind {cur['wind_speed_10m']} km/h, precipitation {cur['precipitation']} mm.\n"
+            f"Today: {day['temperature_2m_min'][0]}–{day['temperature_2m_max'][0]}°C, "
+            f"max precipitation chance {day['precipitation_probability_max'][0]}%."
+        )
+    except Exception as e:
+        return f"❌ Weather lookup failed: {str(e)[:200]}"
+
+
 @tool("fetch_url", "Fetch a webpage and extract its main text content.", "url")
 def fetch_url(url: str) -> str:
     """Fetch a URL and extract readable text."""
@@ -668,23 +722,166 @@ def repo_write_file(relpath: str, content: str) -> str:
 
 @tool(
     "repo_read_file",
-    "Read a file inside a cloned repo. relpath is relative to repos/, e.g. 'my-repo/src/app.py'.",
-    "relpath",
+    "Read a file inside a cloned repo. relpath is relative to repos/, e.g. "
+    "'my-repo/src/app.py'. Long files are paged: pass start_line to continue "
+    "reading where the previous chunk ended (output says the next start_line).",
+    "relpath, start_line=1",
 )
-def repo_read_file(relpath: str) -> str:
+def repo_read_file(relpath: str, start_line: int = 1) -> str:
     path = _safe_repo_path(relpath)
     if path is None:
         return "❌ Blocked: path escapes the repos/ workspace."
     try:
         with open(path, "r") as f:
-            content = f.read()
-        return content[:4000] if content else "(empty file)"
+            lines = f.readlines()
+        if not lines:
+            return "(empty file)"
+        start = max(1, int(start_line))
+        out, size = [], 0
+        i = start - 1
+        while i < len(lines) and size < 4000:
+            out.append(f"{i + 1}| {lines[i].rstrip()}")
+            size += len(lines[i])
+            i += 1
+        chunk = "\n".join(out)
+        if i < len(lines):
+            chunk += f"\n... ({len(lines)} lines total — continue with start_line={i + 1})"
+        return chunk
     except FileNotFoundError:
         return f"❌ File not found: repos/{relpath.strip('/')}. Use repo_list_files or clone_repo first."
     except IsADirectoryError:
         return f"❌ That's a directory, not a file: repos/{relpath.strip('/')}. Use repo_list_files."
     except Exception as e:
         return f"❌ Read error: {str(e)[:300]}"
+
+
+@tool(
+    "repo_edit_file",
+    "Make a targeted edit to a file inside a cloned repo by replacing an exact "
+    "text snippet. Much safer than repo_write_file for existing files — never "
+    "rewrites the whole file. old_text must appear EXACTLY once (include enough "
+    "surrounding lines to make it unique). Read the file first with repo_read_file.",
+    "relpath, old_text, new_text",
+)
+def repo_edit_file(relpath: str, old_text: str, new_text: str) -> str:
+    path = _safe_repo_path(relpath)
+    if path is None:
+        return "❌ Blocked: path escapes the repos/ workspace."
+    try:
+        with open(path, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return f"❌ File not found: repos/{relpath.strip('/')}. Use repo_write_file to create it."
+    count = content.count(old_text)
+    if count == 0:
+        return ("❌ old_text not found in the file. Re-read the file with repo_read_file — "
+                "the exact text (including whitespace) must match.")
+    if count > 1:
+        return (f"❌ old_text appears {count} times — include more surrounding lines "
+                "so it matches exactly once.")
+    with open(path, "w") as f:
+        f.write(content.replace(old_text, new_text, 1))
+    return f"✅ Edited repos/{relpath.strip('/')} (replaced {len(old_text)} chars with {len(new_text)})."
+
+
+def _run_quality_gate(dest: str) -> tuple[bool, str]:
+    """
+    Quality gate for a cloned repo: compile every changed .py file, run ruff
+    if installed, run pytest if a tests/ dir exists. Returns (ok, report).
+    ok is False only for hard failures (syntax errors, failing tests) —
+    lint warnings are reported but don't block.
+    """
+    report = []
+    ok = True
+
+    # Which .py files changed vs HEAD (staged, unstaged, and untracked)?
+    changed = subprocess.run(
+        ["git", "-C", dest, "status", "--porcelain"], capture_output=True, text=True, timeout=15
+    ).stdout
+    committed = subprocess.run(
+        ["git", "-C", dest, "diff", "--name-only", "@{upstream}...HEAD"],
+        capture_output=True, text=True, timeout=15,
+    ).stdout if subprocess.run(
+        ["git", "-C", dest, "rev-parse", "--abbrev-ref", "@{upstream}"],
+        capture_output=True, text=True, timeout=15,
+    ).returncode == 0 else ""
+    py_files = set()
+    for line in changed.splitlines():
+        name = line[3:].strip()
+        if name.endswith(".py"):
+            py_files.add(name)
+    for name in committed.splitlines():
+        if name.strip().endswith(".py"):
+            py_files.add(name.strip())
+
+    # 1. Syntax check (hard gate).
+    for name in sorted(py_files):
+        full = os.path.join(dest, name)
+        if not os.path.exists(full):
+            continue
+        r = subprocess.run(
+            ["python3", "-m", "py_compile", full], capture_output=True, text=True, timeout=30
+        )
+        if r.returncode != 0:
+            ok = False
+            report.append(f"❌ SYNTAX ERROR in {name}:\n{r.stderr.strip()[:400]}")
+        else:
+            report.append(f"✅ {name} compiles")
+
+    # 2. Ruff lint (soft gate — reported, not blocking).
+    if py_files:
+        ruff = subprocess.run(
+            ["ruff", "check", *sorted(py_files)], capture_output=True, text=True,
+            timeout=60, cwd=dest,
+        ) if _which("ruff") else None
+        if ruff is None:
+            report.append("ℹ️ ruff not installed — lint skipped (pip install ruff)")
+        elif ruff.returncode == 0:
+            report.append("✅ ruff: clean")
+        else:
+            report.append(f"⚠️ ruff findings (not blocking):\n{ruff.stdout.strip()[:600]}")
+
+    # 3. Tests (hard gate when they exist).
+    if os.path.isdir(os.path.join(dest, "tests")) and _which("pytest"):
+        t = subprocess.run(
+            ["pytest", "-x", "-q", "tests"], capture_output=True, text=True,
+            timeout=300, cwd=dest,
+        )
+        tail = (t.stdout + t.stderr).strip()[-600:]
+        if t.returncode != 0:
+            ok = False
+            report.append(f"❌ TESTS FAILED:\n{tail}")
+        else:
+            report.append(f"✅ tests passed:\n{tail.splitlines()[-1] if tail else ''}")
+
+    if not py_files:
+        report.append("ℹ️ no changed .py files detected")
+    return ok, "\n".join(report)
+
+
+def _which(cmd: str) -> bool:
+    import shutil
+    return shutil.which(cmd) is not None
+
+
+@tool(
+    "repo_check",
+    "Run the quality gate on a cloned repo: syntax-check all changed .py files, "
+    "ruff lint, and pytest if a tests/ folder exists. Run this after editing and "
+    "BEFORE committing/pushing. push_branch runs it automatically and refuses to "
+    "push on syntax errors or failing tests.",
+    "repo",
+)
+def repo_check(repo: str) -> str:
+    dest = os.path.join(REPOS_DIR, repo.strip("/").split("/")[-1])
+    if not os.path.isdir(os.path.join(dest, ".git")):
+        return f"❌ No clone found at repos/{repo}. Run clone_repo first."
+    try:
+        ok, report = _run_quality_gate(dest)
+        head = "✅ QUALITY GATE PASSED" if ok else "❌ QUALITY GATE FAILED — fix before pushing"
+        return f"{head}\n{report}"
+    except Exception as e:
+        return f"❌ Quality gate error: {str(e)[:300]}"
 
 
 @tool(
@@ -748,6 +945,11 @@ def push_branch(
                 f"run_shell(\"cd repos/{repo} && git add -A && git commit -m '...'\")."
             )
 
+        # Quality gate: never push code that doesn't compile or fails tests.
+        gate_ok, gate_report = _run_quality_gate(dest)
+        if not gate_ok:
+            return f"❌ Push blocked by quality gate — fix these first:\n{gate_report}"
+
         checkout = subprocess.run(
             ["git", "-C", dest, "checkout", "-B", branch_name], capture_output=True, text=True, timeout=15,
         )
@@ -770,7 +972,8 @@ def push_branch(
                 "title": pr_title,
                 "head": branch_name,
                 "base": base_branch,
-                "body": pr_body or "Proposed by the agent.",
+                "body": (pr_body or "Proposed by the agent.")
+                + f"\n\n---\n**Quality gate:**\n```\n{gate_report[:1500]}\n```",
             },
             timeout=15,
         )
