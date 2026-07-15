@@ -52,7 +52,16 @@ def get_db() -> sqlite3.Connection:
             updated REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_task_conv ON tasks(conv_key);
+
+        CREATE TABLE IF NOT EXISTS thread_summaries (
+            conv_key TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            updated REAL NOT NULL
+        );
     """)
+    _ensure_fts(conn)
     # Migration: older DBs may have a `facts` table from before the
     # `category` column existed. Add it in place so existing installs
     # don't need to wipe memory.db to pick up durable project memory.
@@ -63,6 +72,52 @@ def get_db() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON facts(category)")
     conn.commit()
     return conn
+
+
+# ── Full-text search (FTS5) ──
+# SQLite ships FTS5 on Ubuntu's python3, so we get real ranked full-text
+# search (BM25) over the whole conversation history for free — no
+# embeddings, no extra RAM. If this SQLite build lacks FTS5 we silently
+# fall back to LIKE-based search everywhere.
+
+FTS_AVAILABLE = True
+
+
+def _ensure_fts(conn: sqlite3.Connection) -> None:
+    """Create the FTS index + sync triggers; backfill existing rows once."""
+    global FTS_AVAILABLE
+    try:
+        conn.executescript("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS conv_fts USING fts5(
+                content, content='conversations', content_rowid='id'
+            );
+            CREATE TRIGGER IF NOT EXISTS conv_fts_ai AFTER INSERT ON conversations BEGIN
+                INSERT INTO conv_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS conv_fts_ad AFTER DELETE ON conversations BEGIN
+                INSERT INTO conv_fts(conv_fts, rowid, content) VALUES ('delete', old.id, old.content);
+            END;
+        """)
+        # One-time backfill for rows inserted before the index existed.
+        fts_rows = conn.execute("SELECT COUNT(*) FROM conv_fts").fetchone()[0]
+        conv_rows = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        if fts_rows < conv_rows:
+            conn.execute(
+                "INSERT INTO conv_fts(rowid, content) "
+                "SELECT id, content FROM conversations "
+                "WHERE id NOT IN (SELECT rowid FROM conv_fts)"
+            )
+        conn.commit()
+        FTS_AVAILABLE = True
+    except sqlite3.OperationalError as e:
+        FTS_AVAILABLE = False
+        logger.warning(f"FTS5 unavailable, falling back to LIKE search: {e}")
+
+
+def _fts_query(text: str) -> str:
+    """Turn free text into a safe FTS5 OR-query of quoted terms."""
+    terms = [w for w in re.findall(r"[A-Za-z0-9']{3,}", text) if w.lower() not in _STOPWORDS]
+    return " OR ".join(f'"{t}"' for t in terms[:12])
 
 
 def add_message(conv_key: str, role: str, content: str):
@@ -92,9 +147,25 @@ def get_history(conv_key: str, limit: int = 20) -> list[dict]:
 
 
 def search_history(query: str, limit: int = 10) -> list[dict]:
-    """Search past conversations by keyword."""
+    """Search past conversations. Ranked FTS5 (BM25) when available, LIKE fallback."""
     conn = get_db()
     try:
+        if FTS_AVAILABLE:
+            fts_q = _fts_query(query)
+            if fts_q:
+                try:
+                    rows = conn.execute(
+                        "SELECT c.conv_key, c.role, c.content, c.timestamp "
+                        "FROM conv_fts f JOIN conversations c ON c.id = f.rowid "
+                        "WHERE conv_fts MATCH ? ORDER BY bm25(conv_fts) LIMIT ?",
+                        (fts_q, limit),
+                    ).fetchall()
+                    return [
+                        {"conv_key": r[0], "role": r[1], "content": r[2][:300], "time": r[3]}
+                        for r in rows
+                    ]
+                except sqlite3.OperationalError:
+                    pass  # malformed query → fall through to LIKE
         rows = conn.execute(
             "SELECT conv_key, role, content, timestamp FROM conversations "
             "WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
@@ -104,6 +175,101 @@ def search_history(query: str, limit: int = 10) -> list[dict]:
             {"conv_key": r[0], "role": r[1], "content": r[2][:300], "time": r[3]}
             for r in rows
         ]
+    finally:
+        conn.close()
+
+
+def search_all_relevant(query: str, exclude_conv_key: str = "", limit: int = 4) -> list[dict]:
+    """
+    Cross-thread memory: find messages from OTHER conversations relevant to
+    `query` — this is what lets a brand-new Slack thread recall decisions and
+    discussions from weeks ago. Ranked by BM25 with a mild recency boost.
+    Also searches saved thread summaries so long-dead threads surface as one
+    compact digest instead of raw messages.
+    """
+    results: list[dict] = []
+    conn = get_db()
+    try:
+        # 1. Thread summaries (compact, high-signal) — LIKE on keywords.
+        for kw in list(_keywords(query))[:6]:
+            rows = conn.execute(
+                "SELECT conv_key, summary, updated FROM thread_summaries "
+                "WHERE conv_key != ? AND summary LIKE ? LIMIT 3",
+                (exclude_conv_key, f"%{kw}%"),
+            ).fetchall()
+            for r in rows:
+                if not any(x.get("conv_key") == r[0] and x["kind"] == "summary" for x in results):
+                    results.append({"kind": "summary", "conv_key": r[0], "content": r[1][:500], "time": r[2]})
+
+        # 2. Raw messages from other threads via FTS.
+        if FTS_AVAILABLE:
+            fts_q = _fts_query(query)
+            if fts_q:
+                try:
+                    now = time.time()
+                    rows = conn.execute(
+                        "SELECT c.conv_key, c.role, c.content, c.timestamp, bm25(conv_fts) AS rank "
+                        "FROM conv_fts f JOIN conversations c ON c.id = f.rowid "
+                        "WHERE conv_fts MATCH ? AND c.conv_key != ? "
+                        "ORDER BY rank LIMIT 20",
+                        (fts_q, exclude_conv_key),
+                    ).fetchall()
+                    scored = []
+                    for conv_key, role, content, ts, rank in rows:
+                        age_days = max(0.0, (now - ts) / 86400)
+                        score = -rank - min(age_days * 0.05, 3.0)  # bm25 is negative-better
+                        scored.append((score, conv_key, role, content, ts))
+                    scored.sort(reverse=True)
+                    for _, conv_key, role, content, ts in scored:
+                        if len(results) >= limit + 2:
+                            break
+                        results.append({"kind": "message", "conv_key": conv_key, "role": role,
+                                        "content": content[:350], "time": ts})
+                except sqlite3.OperationalError:
+                    pass
+    finally:
+        conn.close()
+    return results[: limit + 2]
+
+
+# ── Thread summaries (durable cross-thread memory) ──
+
+def get_summary_state(conv_key: str) -> tuple[str, int]:
+    """Return (existing summary, message_count at last summary) for a thread."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT summary, message_count FROM thread_summaries WHERE conv_key = ?",
+            (conv_key,),
+        ).fetchone()
+        return (row[0], row[1]) if row else ("", 0)
+    finally:
+        conn.close()
+
+
+def count_messages(conv_key: str) -> int:
+    conn = get_db()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE conv_key = ?", (conv_key,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def save_thread_summary(conv_key: str, user_id: str, summary: str, message_count: int):
+    """Upsert the rolling summary for a thread."""
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO thread_summaries (conv_key, user_id, summary, message_count, updated) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(conv_key) DO UPDATE SET summary=excluded.summary, "
+            "message_count=excluded.message_count, updated=excluded.updated",
+            (conv_key, user_id, summary.strip()[:2000], message_count, time.time()),
+        )
+        conn.commit()
+        logger.info(f"🧾 Saved thread summary for {conv_key} ({message_count} msgs)")
     finally:
         conn.close()
 
@@ -313,12 +479,15 @@ def get_stats() -> dict:
         fact_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
         conv_count = conn.execute("SELECT COUNT(DISTINCT conv_key) FROM conversations").fetchone()[0]
         open_tasks = conn.execute("SELECT COUNT(*) FROM tasks WHERE status != 'done'").fetchone()[0]
+        summaries = conn.execute("SELECT COUNT(*) FROM thread_summaries").fetchone()[0]
         db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
         return {
             "messages": msg_count,
             "facts": fact_count,
             "conversations": conv_count,
             "open_tasks": open_tasks,
+            "thread_summaries": summaries,
+            "fts_enabled": FTS_AVAILABLE,
             "db_size_mb": round(db_size / 1024 / 1024, 2),
         }
     finally:
