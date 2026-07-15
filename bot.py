@@ -719,6 +719,28 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
             ),
         }] + history
 
+    # Cross-thread memory: pull in relevant snippets and thread summaries
+    # from OTHER conversations, so a brand-new thread can recall decisions
+    # and discussions from weeks ago (durable memory of our whole history).
+    cross = memory.search_all_relevant(full_message, exclude_conv_key=conv_key, limit=4)
+    if cross:
+        cross_lines = []
+        for r in cross:
+            when = time.strftime("%Y-%m-%d", time.localtime(r["time"]))
+            if r["kind"] == "summary":
+                cross_lines.append(f"- [thread summary, {when}] {r['content']}")
+            else:
+                cross_lines.append(f"- [{r['role']}, {when}] {r['content']}")
+        history = [{
+            "role": "user",
+            "content": (
+                "[MEMORY FROM OTHER PAST CONVERSATIONS — possibly relevant "
+                "history from separate threads. Use it to stay consistent with "
+                "past decisions; ignore if not relevant]\n"
+                + "\n".join(cross_lines)
+            ),
+        }] + history
+
     # Run through agent loop — surface plan creation/updates as their own
     # Slack message so the user actually sees the numbered plan appear,
     # instead of it only living inside the model's hidden reasoning.
@@ -745,6 +767,46 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
         say(text=truncate_for_slack(response), thread_ts=thread_ts)
     finally:
         remove_loading_reaction()
+
+    # Rolling thread summary: every SUMMARY_EVERY new messages, condense the
+    # thread into a short digest (one cheap extra AI call, in the background
+    # so it never delays the reply). Summaries feed cross-thread memory.
+    try:
+        _maybe_summarize_thread(conv_key, user_id)
+    except Exception as e:
+        logger.debug(f"Thread summarization skipped: {e}")
+
+
+SUMMARY_EVERY = int(os.getenv("SUMMARY_EVERY", "12"))
+
+
+def _maybe_summarize_thread(conv_key: str, user_id: str):
+    """Kick off a background rolling summary when enough new messages piled up."""
+    total = memory.count_messages(conv_key)
+    old_summary, last_count = memory.get_summary_state(conv_key)
+    if total - last_count < SUMMARY_EVERY:
+        return
+
+    def _worker():
+        try:
+            recent = memory.get_history(conv_key, limit=30)
+            convo_text = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in recent)
+            prompt = (
+                "Summarize this conversation thread into a compact digest (max 150 words). "
+                "Keep: decisions made, priorities stated, tasks completed or planned, "
+                "important facts and preferences, exact wording of key instructions. "
+                "Drop: greetings, filler. Write in terse note form.\n\n"
+                + (f"PREVIOUS SUMMARY (merge into the new one):\n{old_summary}\n\n" if old_summary else "")
+                + f"CONVERSATION:\n{convo_text}"
+            )
+            summary = call_ai([{"role": "user", "content": prompt}],
+                              "You write terse, accurate conversation digests.")
+            if summary and not summary.startswith("❌"):
+                memory.save_thread_summary(conv_key, user_id, summary, total)
+        except Exception as e:
+            logger.warning(f"Thread summary failed for {conv_key}: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 @slack_app.event("message")

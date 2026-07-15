@@ -2,6 +2,7 @@ slack-bolt>=1.18.0
 slack-sdk>=3.27.0
 requests>=2.31.0
 duckduckgo-search>=7.0.0
+scrapling[fetchers]>=0.3.0
 beautifulsoup4>=4.12.0
 PyMuPDF>=1.24.0
 python-dotenv

@@ -97,7 +97,11 @@ def run_tool(name: str, args: dict) -> str:
 
 @tool("web_search", "Search the web using DuckDuckGo. Returns top results.", "query")
 def web_search(query: str) -> str:
-    """Search DuckDuckGo and return results."""
+    """Search the web. Tries Scrapling (browser-impersonated, most reliable on
+    this VM), then the duckduckgo_search library, then plain HTML scraping."""
+    result = _scrapling_search(query)
+    if result:
+        return result
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
@@ -115,6 +119,43 @@ def web_search(query: str) -> str:
         # Fallback on any error
         logger.warning(f"DDG search library failed: {e}, trying HTML fallback")
         return _ddg_html_search(query)
+
+
+def _scrapling_search(query: str) -> str | None:
+    """
+    Search DuckDuckGo's HTML endpoint via Scrapling's Fetcher, which
+    impersonates a real browser's TLS fingerprint — far less likely to get
+    rate-limited/blocked than the plain requests fallback. Returns None if
+    Scrapling isn't installed or anything fails, so callers can fall back.
+    """
+    try:
+        from scrapling.fetchers import Fetcher
+    except ImportError:
+        return None
+    try:
+        page = Fetcher.get(
+            "https://html.duckduckgo.com/html/?q=" + http_requests.utils.quote(query),
+            stealthy_headers=True,
+            timeout=15,
+        )
+        html = getattr(page, "html_content", None) or getattr(page, "body", None) or str(page)
+        soup = BeautifulSoup(html, "html.parser")
+        results = soup.select(".result__body")[:5]
+        if not results:
+            return None  # blocked or layout changed → let fallbacks try
+        lines = []
+        for i, r in enumerate(results, 1):
+            title_el = r.select_one(".result__title")
+            snippet_el = r.select_one(".result__snippet")
+            link_el = r.select_one(".result__url")
+            title = title_el.get_text(strip=True) if title_el else "No title"
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            link = link_el.get_text(strip=True) if link_el else ""
+            lines.append(f"{i}. **{title}**\n   {link}\n   {snippet[:200]}")
+        return "\n\n".join(lines)
+    except Exception as e:
+        logger.warning(f"Scrapling search failed: {e}, falling back")
+        return None
 
 
 def _ddg_html_search(query: str) -> str:
