@@ -50,6 +50,7 @@ from slack_sdk import WebClient
 import memory
 import tools
 import agent
+import concept_graph
 
 # ── Logging ──
 # Console (for `journalctl`/systemd) + a rotating file so history survives
@@ -714,6 +715,12 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
     # Store in persistent memory (text only, not image data)
     memory.add_message(conv_key, "user", full_message[:2000])
 
+    # Extract entities/relationships into the concept graph (fast, inline)
+    try:
+        concept_graph.extract_and_store(full_message, conv_key)
+    except Exception as e:
+        logger.debug(f"Concept graph extraction skipped: {e}")
+
     # Get conversation history
     history = memory.get_history(conv_key, limit=MAX_HISTORY)
 
@@ -754,6 +761,17 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
             ),
         }] + history
 
+    # Concept graph recall: surface related entities and connections that
+    # keyword search might miss (e.g. "what tools does this project use?"
+    # finds the project node and walks its edges to technology nodes).
+    try:
+        graph_context = concept_graph.recall(full_message, limit=5)
+        graph_text = concept_graph.format_recall_for_prompt(graph_context)
+        if graph_text:
+            history = [{"role": "user", "content": graph_text}] + history
+    except Exception as e:
+        logger.debug(f"Concept graph recall skipped: {e}")
+
     # Run through agent loop — surface plan creation/updates as their own
     # Slack message so the user actually sees the numbered plan appear,
     # instead of it only living inside the model's hidden reasoning.
@@ -774,6 +792,12 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
 
     # Store response in memory
     memory.add_message(conv_key, "assistant", response[:2000])
+
+    # Extract entities from the bot's own response too
+    try:
+        concept_graph.extract_and_store(response, conv_key)
+    except Exception:
+        pass
 
     # Send to Slack, then remove the temporary thinking indicator.
     try:
@@ -816,6 +840,11 @@ def _maybe_summarize_thread(conv_key: str, user_id: str):
                               "You write terse, accurate conversation digests.")
             if summary and not summary.startswith("❌"):
                 memory.save_thread_summary(conv_key, user_id, summary, total)
+                # Deeper LLM-assisted graph extraction from the summary
+                concept_graph.extract_from_summary_async(
+                    summary, conv_key,
+                    call_ai_fn=lambda msgs, prompt: call_ai(msgs, prompt),
+                )
         except Exception as e:
             logger.warning(f"Thread summary failed for {conv_key}: {e}")
 
@@ -955,6 +984,7 @@ def handle_status(ack, command, say):
     except ImportError:
         has_pdf = False
 
+    graph_stats = concept_graph.get_graph_stats()
     status_text = (
         f"🤖 *{BOT_NAME} v3.0*\n\n"
         f"*AI routes:* {len(PROVIDERS)} active (automatic fallback + cooldowns)\n"
@@ -964,7 +994,9 @@ def handle_status(ack, command, say):
         f"  • {stats['messages']} messages stored\n"
         f"  • {stats['facts']} facts remembered\n"
         f"  • {stats['conversations']} conversations\n"
-        f"  • Database: {stats['db_size_mb']} MB\n\n"
+        f"  • Database: {stats['db_size_mb']} MB\n"
+        f"*Concept graph:* {graph_stats['entities']} entities, "
+        f"{graph_stats['edges']} connections\n\n"
         f"*Tools:* {', '.join(tools.TOOLS.keys())}\n"
     )
     say(text=status_text, channel=command["channel_id"])
@@ -1014,6 +1046,8 @@ def handle_health(ack, command, say):
         + (f", cooling down: {', '.join(cooling)}" if cooling else "") + "\n"
         f"*Memory DB:* {stats['messages']} msgs, {stats['facts']} facts, "
         f"{stats['open_tasks']} open plan step(s), {stats['db_size_mb']} MB\n"
+        f"*Concept graph:* {concept_graph.get_graph_stats()['entities']} entities, "
+        f"{concept_graph.get_graph_stats()['edges']} connections\n"
         f"*Disk:* {disk_str}\n"
         f"*Log file:* {log_size_kb} KB (rotates at 5 MB, keeps 3 backups)\n"
         f"*Errors in this process ({len(ERROR_LOG)} tracked, last 5):*\n{err_lines}\n"
