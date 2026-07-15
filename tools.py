@@ -15,6 +15,7 @@ import requests as http_requests
 from bs4 import BeautifulSoup
 
 import memory
+import concept_graph
 
 logger = logging.getLogger("my-agent-mini")
 
@@ -343,6 +344,59 @@ def remember(fact: str, user_id: str = "default", category: str = "fact") -> str
     memory.add_fact(user_id, fact, category=category)
     label = "Decision" if category == "decision" else "Noted"
     return f"✅ {label}: {fact}"
+
+
+# ── Concept Graph Tools ──
+# Let the agent explicitly query the entity-relationship graph for
+# structured knowledge that keyword search might miss.
+
+@tool(
+    "graph_recall",
+    "Search the concept graph for entities and their connections. "
+    "Use when you need to understand how concepts, technologies, projects, "
+    "or decisions relate to each other — complements memory_search which "
+    "finds raw text. Returns entities with types, relationships, and context.",
+    "query",
+)
+def graph_recall_tool(query: str) -> str:
+    """Query the concept graph for related entities."""
+    results = concept_graph.recall(query, limit=8)
+    if not results:
+        return "No matching entities in the concept graph yet."
+    lines = []
+    for r in results:
+        conn_str = f" ({r['relation']} → {r['connected_to']})" if r["connected_to"] else ""
+        lines.append(f"• {r['entity']} [{r['type']}]{conn_str} — {r['mentions']} mentions")
+        if r.get("snippet"):
+            lines.append(f"  context: {r['snippet'][:150]}")
+    return "\n".join(lines)
+
+
+@tool(
+    "graph_inspect",
+    "Deep-dive on a single entity in the concept graph: see all its "
+    "relationships, connection count, and when it was first/last mentioned. "
+    "Use after graph_recall to explore a specific node.",
+    "entity_name",
+)
+def graph_inspect_tool(entity_name: str) -> str:
+    """Get detailed info about one entity in the concept graph."""
+    ctx = concept_graph.get_entity_context(entity_name)
+    if "error" in ctx:
+        return ctx["error"]
+    lines = [
+        f"*{ctx['name']}* [{ctx['type']}]",
+        f"  Mentions: {ctx['mentions']} | First seen: {ctx['first_seen']} | Last seen: {ctx['last_seen']}",
+    ]
+    if ctx["outgoing"]:
+        lines.append("  Outgoing:")
+        for e in ctx["outgoing"]:
+            lines.append(f"    → {e['target']} ({e['relation']}, weight {e['weight']})")
+    if ctx["incoming"]:
+        lines.append("  Incoming:")
+        for e in ctx["incoming"]:
+            lines.append(f"    ← {e['source']} ({e['relation']}, weight {e['weight']})")
+    return "\n".join(lines)
 
 
 # ── Task Planner Tools ──
