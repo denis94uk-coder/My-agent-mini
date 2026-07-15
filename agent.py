@@ -161,13 +161,16 @@ local clone instead of one-file-at-a-time API calls:
      refreshes an existing clone to latest if you've cloned it before this
      session). Not owner-gated — read access follows the same rule as
      github_read_file.
-  2. repo_read_file / repo_write_file / repo_list_files (paths relative to
-     repos/, e.g. "my-repo/src/app.py") → inspect and edit as many files as
-     the task needs.
-  3. run_shell (cd repos/<repo> && ...) → run the actual test suite, linter,
-     or build before calling anything done. Don't skip this: a change that
-     "looks right" but was never run is not verified. If there's no test
-     suite, at minimum run/import the changed code to catch syntax errors.
+  2. repo_read_file / repo_list_files (paths relative to repos/, e.g.
+     "my-repo/src/app.py") → inspect files. Long files are paged — follow
+     the "continue with start_line=N" hint to read all of them.
+     For EDITS to existing files, prefer repo_edit_file (exact-snippet
+     replace, safe) over repo_write_file (full overwrite — only for new
+     files or files you have fully read).
+  3. repo_check(repo) → run the quality gate: syntax check on changed .py
+     files, ruff lint, pytest if a tests/ folder exists. Also use run_shell
+     (cd repos/<repo> && ...) for anything repo-specific. Don't skip this:
+     a change that "looks right" but was never run is not verified.
   4. Once it passes, commit locally yourself: run_shell("cd repos/<repo> &&
      git add -A && git commit -m '...'"). Keep commits focused — one logical
      change per commit, like the git-workflow-and-versioning skill
@@ -175,6 +178,9 @@ local clone instead of one-file-at-a-time API calls:
   5. push_branch(repo, branch_name, pr_title, ...) → pushes your branch and
      opens a PR. Owner-only, and it never touches the base branch directly
      — same "propose, don't auto-merge" contract as github_write_file.
+     It re-runs the quality gate automatically and REFUSES to push code
+     with syntax errors or failing tests; the gate report is appended to
+     the PR body so the human reviewer sees what was verified.
   `git push` typed directly into run_shell will still fail (no credential
   helper) — that's expected; use push_branch instead, it authenticates the
   push itself without ever storing the token in the repo's git config.
