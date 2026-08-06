@@ -168,3 +168,28 @@ def test_compaction_counts_against_the_step_budget(monkeypatch):
     # One summariser call + one agent step, both real AI calls.
     assert final["steps_used"] == 2
     assert len(ai_calls) == 2
+
+
+# ── Context budget ──
+
+def test_system_prompt_stays_within_a_sane_size():
+    """
+    The system prompt is sent on every call and silently grows every time a
+    tool or playbook is added — it is already ~35k chars (~8.8k tokens), which
+    is larger than the whole transcript budget. Past ~45k the default config
+    stops fitting a 16k-context route, so this fails before a user discovers
+    it as a mid-run provider rejection.
+    """
+    prompt = agent.get_agent_system_prompt("You are a test bot.")
+    assert len(prompt) < 45_000, (
+        f"system prompt has grown to {len(prompt):,} chars "
+        f"(~{len(prompt) // 4:,} tokens) — re-check the context budget"
+    )
+
+
+def test_worst_case_context_is_documented_accurately():
+    """Pins the arithmetic the .env.example and runner docstring state."""
+    prompt = agent.get_agent_system_prompt("You are a test bot.")
+    worst_case_tokens = (len(prompt) + runner.context_limit_chars()) // 4
+    # The docs claim >= 16k context is required at the default budget.
+    assert 8_000 < worst_case_tokens < 16_000

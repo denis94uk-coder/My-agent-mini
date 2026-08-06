@@ -1233,6 +1233,18 @@ def start_autonomy() -> tuple[int, bool]:
     )
     workers = runner.start_workers()
     scheduler_on = triggers.start_scheduler()
+
+    # Context budgeting is invisible until a model rejects the request, so
+    # state it at boot. The system prompt is sent on every call and dwarfs the
+    # transcript budget; a route with too small a window fails on step one.
+    prompt_chars = len(agent.get_agent_system_prompt(SYSTEM_PROMPT))
+    worst_case = prompt_chars + runner.context_limit_chars()
+    logger.info(
+        f"   Context: system prompt {prompt_chars:,} chars (~{prompt_chars // 4:,} tok) "
+        f"+ transcript budget {runner.context_limit_chars():,} chars "
+        f"→ worst case ~{worst_case // 4:,} tokens/call; routes need "
+        f"~{((worst_case // 4) // 1000) + 2}k context"
+    )
     return workers, scheduler_on
 
 
