@@ -40,10 +40,11 @@ backup — so AI calls are not free: prefer deterministic paths where they work.
 | `runner.py` | Durable run engine: queue, workers, resume-after-crash, budgets |
 | `triggers.py` | Schedules + stalled-plan sweeper |
 | `critic.py` | Critic gate: re-reads goal + transcript, ACCEPT or REVISE |
+| `governor.py` | Tool risk tiers, approval queue, per-provider cost accounting |
 | `memory.py` | Conversations, facts, plans, thread summaries, FTS5 |
 | `concept_graph.py` | NetworkX entity/relation layer over `memory.db` |
 | `tools.py` | All tool impls + registry + owner lock |
-| `tests/` | 120 tests, no Slack/keys/network needed |
+| `tests/` | 153 tests, no Slack/keys/network needed |
 
 Key invariant: **both** the interactive loop and the run engine drive
 `agent.execute_step`. One implementation of the tool protocol. Don't fork it.
@@ -78,6 +79,15 @@ response — works on any provider, no native function calling required.
 - **Retry ≠ resume.** `attempts`/`next_attempt_at` = the run errored (backoff,
   capped). `resume_count` = the process died mid-run. Config errors
   (`_PERMANENT_ERROR_MARKERS`) never retry.
+- **Three levels unattended, not two.** Flat-blocked (`UNATTENDED_BLOCKED_TOOLS`,
+  spawns more runs) → ask (EXTERNAL tier, parks the run) → allowed. `allow_risky`
+  = pre-authorised, skips the queue. Approvals off = EXTERNAL back to flat no.
+- **Expiry is a deny.** Unanswered approvals time out and unpark the run with a
+  refusal. Silence never becomes consent.
+- **A parked run holds no worker.** Status `awaiting_approval`, not claimable,
+  and `recover_interrupted_runs` must leave it alone (it only touches `running`).
+- **New tool ⇒ new tier.** `test_every_registered_tool_has_a_tier` fails the
+  build otherwise. Unclassified defaults to EXTERNAL by design.
 - `git push` in `run_shell` fails on the server (no credential helper). Use
   `push_branch` / `github_write_file` — both open a PR, never commit to main.
 
@@ -99,6 +109,6 @@ keep new modules free of Slack imports so this stays possible.
 4. ✅ Critic gate (`critic.py`) — after "done", a critic pass re-reads goal +
    tool transcript, ACCEPTs or returns "not done because X". On for runs,
    opt-in for chat (`CRITIC_INTERACTIVE`), capped rounds
-5. ⬜ Governor — tool risk tiers, Slack approve/deny queue for irreversible
-   actions, cost/step accounting, full audit trail
+5. ✅ Governor (`governor.py`) — risk tiers, durable approve/deny queue with
+   expiry-as-deny, per-provider cost accounting + paid daily cap
 6. ⬜ Optional: sub-agent delegation, native function calling where supported

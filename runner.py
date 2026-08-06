@@ -34,6 +34,7 @@ import logging
 
 import agent
 import critic
+import governor
 import memory
 import tools
 
@@ -88,6 +89,9 @@ CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, seq);
 # Statuses a run can be in. Only 'queued' is claimable by a worker.
 ACTIVE_STATUSES = ("queued", "running")
 TERMINAL_STATUSES = ("done", "failed", "cancelled")
+# Parked waiting on a human. Not claimable by a worker, but very much not
+# finished — /runs shows it, and a decision puts it back in the queue.
+AWAITING_APPROVAL = "awaiting_approval"
 
 # Sources that were not directly requested by a human right now. These are
 # the ones the daily cap applies to.
@@ -365,6 +369,8 @@ def rebuild_messages(run: dict) -> list[dict]:
             })
         elif event["kind"] == "nudge":
             messages.append({"role": "user", "content": agent.NUDGE_MESSAGE})
+        elif event["kind"] == "approval_requested":
+            continue  # the decision's tool_result carries the outcome
         elif event["kind"] == "critic":
             # A rejected final answer: the agent's attempt, then the critique
             # it was sent back with. Both have to replay or a resumed run
@@ -560,13 +566,26 @@ def _claim_next_run(worker: str) -> dict | None:
 
 
 def _blocked_tools_for(run: dict) -> set:
-    """Which tools this run may not use."""
+    """
+    Tools this run may not use at all — a flat no, with no way to ask.
+
+    Since the governor, an unattended run has three levels rather than two:
+
+      • blocked here      — never, not even with a human present. These spawn
+                            more autonomous work; a run that can queue runs
+                            can run away, and "ask a human" doesn't fix that.
+      • approval required — EXTERNAL tier, gated by `_approval_gate`. The run
+                            parks and asks instead of failing.
+      • allowed           — everything else, plus EXTERNAL when the schedule
+                            was explicitly marked `allow_risky`.
+
+    With approvals switched off there is nobody to ask, so owner-only tools
+    fall back to the original hard block rather than silently running.
+    """
     if not run["unattended"]:
         return set()
-    # Never available unattended, opt-in or not: these spawn more autonomous
-    # work, and a run that can queue runs can run away.
     blocked = set(tools.UNATTENDED_BLOCKED_TOOLS)
-    if not run["allow_risky"]:
+    if not run["allow_risky"] and not governor.approvals_enabled():
         blocked |= set(tools.OWNER_ONLY_TOOLS)
     return blocked
 
@@ -629,6 +648,74 @@ def _fail_or_retry(run: dict, error: str) -> bool:
     return True
 
 
+def _approval_gate(run: dict):
+    """
+    The predicate execute_step consults before running a tool.
+
+    Only unattended runs are gated: if a human is in the conversation they are
+    already the approval. Read and local-write tools go straight through —
+    asking permission to run `ls` teaches people to approve without reading,
+    which is how an approval queue stops being a safety mechanism.
+    """
+    if not run["unattended"] or not governor.approvals_enabled():
+        return None
+
+    blocked = _blocked_tools_for(run)
+
+    def gate(tool_name: str, args: dict) -> bool:
+        if tool_name in blocked:
+            # A flat no. Let the block list answer it immediately rather than
+            # parking the run on a request that could never be granted.
+            return True
+        if run["allow_risky"]:
+            # The owner pre-authorised this schedule for external actions.
+            return True
+        return governor.tier_of(tool_name) != governor.EXTERNAL
+
+    return gate
+
+
+def _apply_pending_decision(run: dict, messages: list[dict]):
+    """
+    Carry out a decision made while the run was parked.
+
+    Approved: the tool runs now, exactly as requested, and its result enters
+    the transcript as if it had never paused. Denied or expired: a refusal
+    goes in instead, and the agent has to finish without it.
+    """
+    decision = governor.undecided_action_for_run(run["id"])
+    if not decision:
+        return
+
+    if decision["status"] == governor.APPROVED:
+        args = dict(decision["args"])
+        if decision["tool"] in tools.OWNER_ONLY_TOOLS:
+            # The owner lock still applies; approval says *this* action is
+            # sanctioned, not that the run has become the owner.
+            args["_requesting_user_id"] = decision["decided_by"] or run["owner_user_id"]
+        result = tools.run_tool(decision["tool"], args)
+        logger.info(f"✅ Run #{run['id']} ran approved tool {decision['tool']}")
+    else:
+        result = governor.refusal_text(decision)
+
+    add_event(run["id"], "tool_result", result, name=decision["tool"])
+    messages.append({
+        "role": "user",
+        "content": agent.tool_result_message(decision["tool"], result),
+    })
+    governor.mark_executed(decision["id"])
+
+
+def resume_after_decision(approval: dict) -> bool:
+    """Put a decided run back in the queue. Called by the Slack commands."""
+    run = get_run(approval["run_id"])
+    if not run or run["status"] != AWAITING_APPROVAL:
+        return False
+    _update_run(run["id"], status="queued", next_attempt_at=None)
+    logger.info(f"▶️ Run #{run['id']} re-queued after approval #{approval['id']}")
+    return True
+
+
 def execute_run(run: dict) -> dict:
     """
     Drive one run to completion (or to a budget limit), persisting every step.
@@ -667,6 +754,7 @@ def execute_run(run: dict) -> dict:
         )
 
     messages = rebuild_messages(run)
+    _apply_pending_decision(run, messages)
     steps_used = run["steps_used"]
     critic_rounds = critic_rounds_used(run_id)
     # Large so the first fold can happen immediately; reset on every fold.
@@ -685,6 +773,8 @@ def execute_run(run: dict) -> dict:
             logger.info(f"🛑 Run #{run_id} cancelled")
             return get_run(run_id)
         if status not in ACTIVE_STATUSES:
+            # Includes AWAITING_APPROVAL: the run parks and a decision
+            # re-queues it, so a worker must let go of it here.
             return get_run(run_id)
 
         if steps_used >= run["max_steps"]:
@@ -719,6 +809,7 @@ def execute_run(run: dict) -> dict:
                 conv_key=run["conv_key"] or f"run:{run_id}",
                 allow_nudge=True,
                 blocked_tools=blocked,
+                approval_fn=_approval_gate(run),
             )
         except Exception as e:
             logger.warning(f"Run #{run_id} step failed: {e}", exc_info=True)
@@ -732,6 +823,25 @@ def execute_run(run: dict) -> dict:
         steps_used += 1
         steps_since_fold += 1
         _update_run(run_id, steps_used=steps_used, heartbeat=time.time())
+
+        if outcome.kind == "paused":
+            # Park durably. The assistant turn is persisted so the replayed
+            # transcript still contains the request; the tool result arrives
+            # only once a human decides.
+            add_event(run_id, "assistant", outcome.response)
+            approval = governor.request_approval(
+                run_id, outcome.tool_name, outcome.tool_args,
+                requested_for=run["owner_user_id"],
+            )
+            add_event(
+                run_id, "approval_requested",
+                f"{outcome.tool_name} (approval #{approval['id']})",
+                name=outcome.tool_name,
+            )
+            _update_run(run_id, status=AWAITING_APPROVAL, worker="", heartbeat=time.time())
+            _notify(run, governor.format_approval_request(approval, run))
+            logger.info(f"⏸️ Run #{run_id} parked awaiting approval #{approval['id']}")
+            return get_run(run_id)
 
         if outcome.kind == "tool":
             add_event(run_id, "assistant", outcome.response)
@@ -912,7 +1022,8 @@ def format_runs(limit: int = 8) -> str:
     runs = list_runs(limit=limit)
     if not runs:
         return "No runs yet."
-    icons = {"queued": "⏳", "running": "▶️", "done": "✅", "failed": "❌", "cancelled": "🛑"}
+    icons = {"queued": "⏳", "running": "▶️", "done": "✅", "failed": "❌",
+             "cancelled": "🛑", AWAITING_APPROVAL: "🖐️"}
     lines = []
     for r in runs:
         when = time.strftime("%m-%d %H:%M", time.localtime(r["created"]))

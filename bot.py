@@ -50,6 +50,7 @@ from slack_sdk import WebClient
 import memory
 import tools
 import agent
+import governor
 import runner
 import triggers
 import concept_graph
@@ -629,6 +630,20 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
         providers_order = vision + others
 
     available = [p for p in providers_order if _provider_is_available(p)]
+
+    # Paid routes are a real monthly budget, and an agent that starts its own
+    # work can spend it while nobody is looking. Past the daily cap they drop
+    # out of rotation — free routes still serve, so the bot degrades rather
+    # than stopping.
+    if governor.paid_budget_exhausted():
+        affordable = [p for p in available if not governor.is_paid(p["name"])]
+        if affordable and len(affordable) < len(available):
+            logger.info(
+                f"💳 Paid daily cap reached ({governor.paid_calls_today()} calls) — "
+                "using free routes only"
+            )
+            available = affordable
+
     if not available:
         return "❌ All AI routes are temporarily cooling down after errors or rate limits. Try again shortly."
 
@@ -647,6 +662,11 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
                 result = call_openai_compat(provider, messages, system_prompt, provider_images)
 
             _record_provider_success(provider)
+            governor.record_ai_call(
+                provider["name"],
+                input_chars=sum(len(m.get("content") or "") for m in messages) + len(system_prompt),
+                output_chars=len(result or ""),
+            )
             logger.info(f"✅ {provider['name']} responded in {round(time.time() - start, 1)}s")
             return result
 
@@ -1027,6 +1047,69 @@ def handle_schedules(ack, command, say):
     )
 
 
+@slack_app.command("/approvals")
+def handle_approvals(ack, command, say):
+    """Show what the agent is waiting on a human to authorise."""
+    ack()
+    say(text="🖐️ *Waiting for approval*\n\n" + governor.format_approvals(),
+        channel=command["channel_id"])
+
+
+def _decide_approval(command, say, approved: bool):
+    channel = command["channel_id"]
+    parts = command.get("text", "").strip().split(maxsplit=1)
+    verb = "approve" if approved else "deny"
+    if not parts or not parts[0].isdigit():
+        say(text=f"Usage: `/{verb} <approval id>`" + ("" if approved else " `<optional reason>`"),
+            channel=channel)
+        return
+
+    approval_id = int(parts[0])
+    note = parts[1] if len(parts) > 1 else ""
+    user_id = command.get("user_id", "")
+
+    # Only the owner decides. An approval queue anyone can answer is not a
+    # control, and the runs behind it act with the owner's credentials.
+    if not tools._is_owner(user_id):
+        say(text="❌ Only the bot's owner can approve or deny.", channel=channel)
+        return
+
+    decided = governor.decide(approval_id, approved, decided_by=user_id, note=note)
+    if not decided:
+        say(text=f"❌ Approval #{approval_id} isn't pending (already decided, or no such id).",
+            channel=channel)
+        return
+
+    resumed = runner.resume_after_decision(decided)
+    word = "Approved" if approved else "Denied"
+    say(
+        text=f"{'✅' if approved else '🚫'} {word} `{decided['tool']}` for run "
+             f"#{decided['run_id']}."
+             + (" The run is back in the queue." if resumed
+                else " (The run was no longer waiting.)"),
+        channel=channel,
+    )
+
+
+@slack_app.command("/approve")
+def handle_approve(ack, command, say):
+    ack()
+    _decide_approval(command, say, True)
+
+
+@slack_app.command("/deny")
+def handle_deny(ack, command, say):
+    ack()
+    _decide_approval(command, say, False)
+
+
+@slack_app.command("/costs")
+def handle_costs(ack, command, say):
+    """AI call accounting, with paid routes tracked separately."""
+    ack()
+    say(text=governor.format_usage(), channel=command["channel_id"])
+
+
 @slack_app.command("/status")
 def handle_status(ack, command, say):
     ack()
@@ -1105,7 +1188,11 @@ def handle_health(ack, command, say):
         f"{concept_graph.get_graph_stats()['edges']} connections\n"
         f"*Autonomy:* {len(runner.list_runs(limit=99, status='running'))} run(s) executing, "
         f"{len(runner.list_runs(limit=99, status='queued'))} queued, "
+        f"{len(runner.list_runs(limit=99, status=runner.AWAITING_APPROVAL))} awaiting approval, "
         f"{len(triggers.list_schedules(include_disabled=False))} active schedule(s)\n"
+        f"*Paid AI calls today:* {governor.paid_calls_today()}"
+        + (f"/{governor.paid_daily_limit()}" if governor.paid_daily_limit() else " (uncapped)")
+        + "\n"
         f"*Disk:* {disk_str}\n"
         f"*Log file:* {log_size_kb} KB (rotates at 5 MB, keeps 3 backups)\n"
         f"*Errors in this process ({len(ERROR_LOG)} tracked, last 5):*\n{err_lines}\n"

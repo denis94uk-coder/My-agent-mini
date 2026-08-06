@@ -25,6 +25,7 @@ import time
 import logging
 import threading
 
+import governor
 import memory
 import runner
 
@@ -541,6 +542,7 @@ def tick(now: float | None = None) -> dict:
     now = time.time() if now is None else now
     fired = []
     swept = []
+    expired = []
     try:
         fired = fire_due_schedules(now)
     except Exception:
@@ -549,7 +551,16 @@ def tick(now: float | None = None) -> dict:
         swept = sweep_stale_plans(now)
     except Exception:
         logger.exception("Plan sweep failed")
-    return {"schedules_fired": fired, "plans_resumed": swept}
+    try:
+        # Silence is a deny. Expired requests unpark their run so it can
+        # report that it never got an answer instead of sitting forever.
+        for approval in governor.expire_stale_approvals(now):
+            expired.append(approval["id"])
+            runner.resume_after_decision(approval)
+    except Exception:
+        logger.exception("Approval expiry sweep failed")
+    return {"schedules_fired": fired, "plans_resumed": swept,
+            "approvals_expired": expired}
 
 
 def _ticker_loop():

@@ -246,7 +246,8 @@ def test_claim_is_exclusive():
 
 # ── Unattended safety envelope ──
 
-def test_unattended_runs_block_state_changing_tools():
+def test_unattended_runs_block_state_changing_tools(monkeypatch):
+    monkeypatch.setenv("APPROVALS_ENABLED", "false")
     run = {"unattended": 1, "allow_risky": 0}
     blocked = runner._blocked_tools_for(run)
     assert "deploy_static_site" in blocked
@@ -254,7 +255,8 @@ def test_unattended_runs_block_state_changing_tools():
     assert "start_background_run" in blocked
 
 
-def test_allow_risky_unlocks_owner_tools_but_never_run_spawning():
+def test_allow_risky_unlocks_owner_tools_but_never_run_spawning(monkeypatch):
+    monkeypatch.setenv("APPROVALS_ENABLED", "false")
     run = {"unattended": 1, "allow_risky": 1}
     blocked = runner._blocked_tools_for(run)
     assert "deploy_static_site" not in blocked
@@ -266,7 +268,9 @@ def test_attended_runs_block_nothing():
     assert runner._blocked_tools_for({"unattended": 0, "allow_risky": 0}) == set()
 
 
-def test_blocked_tool_is_refused_but_the_run_continues():
+def test_blocked_tool_is_refused_but_the_run_continues(monkeypatch):
+    """With no approver reachable, an external tool is a flat no, not a pause."""
+    monkeypatch.setenv("APPROVALS_ENABLED", "false")
     ai = ScriptedAI(
         tool_call("deploy_static_site", site_name="demo"),
         "I couldn't deploy — that needs a human.",

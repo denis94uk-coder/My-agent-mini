@@ -120,15 +120,53 @@ On for background runs, off for live chat by default (`CRITIC_INTERACTIVE`)
 — a human reading a reply can push back themselves; nobody is reading an
 unattended run. Each critic call counts against the run's step budget.
 
-### Safety envelope for unattended work
+### Governor: risk tiers and human approval
 
 The `OWNER_SLACK_ID` lock answers *"is the human asking right now the
-owner?"* — which means nothing once a cron job is the caller. So unattended
-runs (schedules, plan resumes) add their own limits:
+owner?"* — which means nothing once a cron job is the caller. The governor
+adds the middle option between "allowed" and "refused": **ask**.
 
-- **Owner-only tools are refused** — no deploys, pushes, or service
-  restarts with nobody watching. The run does everything up to that line
-  and reports what a human needs to run. A schedule must opt in explicitly.
+Every tool has a risk tier — `read`, `write_local`, `external`. In an
+unattended run:
+
+| Tier | What happens |
+|---|---|
+| `read`, `write_local` | Runs. Asking permission to run `ls` just teaches people to approve without reading. |
+| `external` (deploy, push, restart, schedule) | The run **pauses on disk** and asks in Slack. |
+| Run-spawning tools | Always refused. Asking can't make a fork bomb safe. |
+
+```
+/approvals          what's waiting
+/approve 3          run it, exactly as requested
+/deny 3 wrong week  refuse it; the agent finishes without it and says so
+```
+
+Only the owner can decide. A schedule marked `allow_risky` skips the queue —
+pre-authorised, so a nightly deploy doesn't ask every night.
+
+Three properties are deliberate:
+
+- **Expiry is a deny.** An unanswered request times out (24h default) and the
+  run resumes with a refusal. Silence must never become consent.
+- **Pausing is durable.** The request is a row in SQLite and the run's status
+  is `awaiting_approval`. Restart the service and it's still waiting; approve
+  it a day later and the *exact* call it asked for runs, not a re-derived one.
+- **Unclassified tools are EXTERNAL.** Forgetting to classify a new deploy
+  tool is far worse than one unnecessary approval. A test asserts every
+  registered tool has a tier, so the default never fires in practice.
+
+### Cost accounting
+
+`/costs` shows AI calls per provider. Free routes are best-effort; a paid
+backup is a real monthly budget, and an agent that starts its own work can
+spend it unattended. Name the paid routes (`PAID_PROVIDERS`) and cap them per
+day (`PAID_DAILY_LIMIT`) — past the cap they drop out of rotation while free
+routes keep serving, so the bot degrades instead of stopping.
+
+### Other limits on unattended work
+
+- **Approvals off?** Then external tools are a flat no again — there is
+  nobody to ask, so the run does everything up to that line and reports it.
 - **Creating more autonomous work is always refused**, opt-in or not: a run
   that can queue runs is one bad reasoning step from a fork bomb of them.
 - **Budgets** — per-run step and time caps (`RUN_MAX_STEPS`,
@@ -143,7 +181,7 @@ See `.env.example` for all the knobs.
 ### Tests
 
 ```bash
-pytest tests/ -q     # 103 tests, no Slack workspace or API keys needed
+pytest tests/ -q     # 153 tests, no Slack workspace or API keys needed
 ```
 
 ## 🛠️ Domain Skills
@@ -246,6 +284,9 @@ sudo journalctl -u my-agent -f  # live logs
 | `/providers` | Show routes, keyless/key-backed status, and cooldown health |
 | `/runs` | List background runs (`/runs <id>`, `/runs cancel <id>`) |
 | `/schedules` | List scheduled tasks (`/schedules cancel <name>`) |
+| `/approvals` | What the agent is waiting on a human to authorise |
+| `/approve <id>` / `/deny <id> <why>` | Decide a pending request (owner only) |
+| `/costs` | AI calls per provider, paid routes tracked separately |
 | `/status`, `/health` | Capabilities snapshot / deep operational health |
 
 ## 🔧 Management Commands
@@ -280,7 +321,8 @@ my-agent-mini/
 ├── concept_graph.py    # NetworkX entity/relationship layer over memory.db
 ├── tools.py            # Tool implementations
 ├── critic.py           # Critic gate: is "done" actually done?
-├── tests/              # 103 tests — no Slack or API keys needed
+├── governor.py         # Risk tiers, approval queue, cost accounting
+├── tests/              # 153 tests — no Slack or API keys needed
 ├── requirements.txt    # Python dependencies
 ├── setup.sh            # One-click server setup
 ├── .env.example        # Template for API keys + autonomy settings

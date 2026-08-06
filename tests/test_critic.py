@@ -212,6 +212,7 @@ def test_blocked_tool_report_is_not_sent_back_forever(monkeypatch):
     backstop if a critic ever disagrees anyway.
     """
     monkeypatch.setenv("CRITIC_MAX_ROUNDS", "2")
+    monkeypatch.setenv("APPROVALS_ENABLED", "false")
     ai = ScriptedAI(
         tool_call("deploy_static_site", site_name="x"),
         "Could not deploy — the tool is blocked for unattended runs. Needs a human.",

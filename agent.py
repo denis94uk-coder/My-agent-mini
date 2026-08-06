@@ -362,10 +362,13 @@ class StepOutcome:
     What happened in one agent iteration.
 
     kind:
-      "tool"  — a tool ran; `tool_name`/`tool_args`/`tool_result` are set
-      "nudge" — the model narrated an action without calling a tool, and we
-                pushed it to actually act instead of ending the turn
-      "final" — no tool call and no unactioned intent: this is the answer
+      "tool"   — a tool ran; `tool_name`/`tool_args`/`tool_result` are set
+      "nudge"  — the model narrated an action without calling a tool, and we
+                 pushed it to actually act instead of ending the turn
+      "final"  — no tool call and no unactioned intent: this is the answer
+      "paused" — the tool needs human approval. It has NOT run and nothing was
+                 appended to the transcript; the caller parks the run and
+                 replays this exact call once a human decides.
     """
 
     __slots__ = ("kind", "response", "tool_args", "tool_name", "tool_result")
@@ -386,6 +389,7 @@ def execute_step(
     conv_key: str = "default",
     allow_nudge: bool = True,
     blocked_tools: set | None = None,
+    approval_fn=None,
     on_tool_call=None,
 ) -> StepOutcome:
     """
@@ -398,6 +402,10 @@ def execute_step(
     blocked_tools: names refused before execution, with the refusal fed back as
         the tool result. Used for unattended runs, where nobody is watching to
         approve a deploy or a service restart.
+    approval_fn: optional (tool_name, args) -> bool. False means the tool needs
+        a human decision first: nothing runs, nothing is appended, and the
+        caller gets a "paused" outcome to park on. Distinct from blocked_tools,
+        which is a flat no the agent works around immediately.
     """
     response = call_ai_fn(working_messages, full_prompt)
     tool_call = parse_tool_call(response)
@@ -432,6 +440,12 @@ def execute_step(
     # non-owner can't get the model to run them on their behalf.
     if tool_name in tools.OWNER_ONLY_TOOLS:
         tool_args["_requesting_user_id"] = user_id
+
+    # Approval is checked before the block list: "ask a human" is a better
+    # answer than "refused" when a human is reachable.
+    if approval_fn is not None and not approval_fn(tool_name, tool_args):
+        logger.info(f"🖐️ Tool {tool_name} needs approval — pausing instead of running it")
+        return StepOutcome("paused", response, tool_name, tool_args)
 
     logger.info(f"🔧 Using tool: {tool_name}({json.dumps(tool_args, default=str)[:100]})")
     if blocked_tools and tool_name in blocked_tools:
