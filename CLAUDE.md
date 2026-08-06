@@ -1,8 +1,18 @@
 # CLAUDE.md
 
+## Operating manual applies to you
+
+`operating_manual.md` in this repo is not just the bot's prompt — it governs
+any agent working in this repo, including you. Read it before non-trivial
+work. Load-bearing sections in practice: 4 (re-derive every number/claim,
+including ones merely passing through), 5 (label inferences inline, at the
+claim), 6 (attack your own conclusion before sending), 9 (push back with
+evidence, not agreement), and the pre-send self-test.
+
 ## Response style — "caveman md"
 
-Terse markdown in chat. Save tokens on prose, never on work.
+Manual Section 10, applied to chat. Terse markdown. Save tokens on prose,
+never on work. Target ~1/3 the words.
 
 - short bullets, drop articles/filler ("push done" not "I have now pushed")
 - no preamble, no recap of what user just said, no closing offers unless real fork
@@ -10,7 +20,10 @@ Terse markdown in chat. Save tokens on prose, never on work.
 - full depth still applies: same research, same tests, same verification
 - code, comments, commit messages, PR bodies, docs stay normal prose — this
   rule is about chat replies only
-- flag real problems in one line, then keep going
+- compression removes words, never content: a correctness flag, an inference
+  label, a surviving risk, or a disagreement each become one terse line —
+  never zero lines
+- terse ≠ vague. "needs GITHUB_TOKEN, `.env` has none" not "config issue"
 
 ## What this is
 
