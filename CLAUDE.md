@@ -27,9 +27,20 @@ never on work. Target ~1/3 the words.
 
 ## What this is
 
-Slack bot → autonomous agent. Single Python process, systemd, Google e2-micro
-free tier (1 GB RAM). Keyless Pollinations route first, small paid route as
-backup — so AI calls are not free: prefer deterministic paths where they work. No Docker, no gateway service. SQLite for everything.
+Slack bot → autonomous agent. Single Python process, systemd, Ubuntu.
+
+Deployment today: Google e2-micro free tier, 1 GB RAM. **Planned move to
+self-hosted hardware.** Treat the 1 GB tuning (`RUN_WORKERS=2`,
+`RUN_CONTEXT_LIMIT_CHARS`, the sub-agent deferral in the roadmap) as current
+constraints, not permanent architecture — but don't pre-build for hardware
+that doesn't exist yet either.
+
+AI routes: keyless Pollinations first, merge.dev gateway as the paid backup
+(sorted last, daily-capped). AI calls are not free — prefer deterministic
+paths where they work. `CUSTOM_LLM_URL` already accepts any OpenAI-compatible
+endpoint, which is the migration path to a local model when self-hosted.
+
+No Docker, no gateway service. SQLite for everything.
 
 ## Architecture
 

@@ -245,6 +245,10 @@ The 1 GB ceiling is a real design constraint, not a footnote: it's why there
 is no Docker, no gateway service, no vector database, and why background runs
 default to 2 workers.
 
+Moving to self-hosted hardware later needs no different install: `setup.sh`
+only assumes Ubuntu/Debian, systemd, and outbound HTTPS. What *does* change
+is the tuning — see "Self-hosting" below.
+
 ### 2. SSH into your server
 
 ```bash
@@ -343,6 +347,27 @@ my-agent-mini/
 │   └── coding-practices/  # 24 reference skill files (see README above)
 └── README.md           # This file
 ```
+
+## 🏠 Self-hosting (more than 1 GB)
+
+The defaults are sized for a 1 GB always-free VM. On self-hosted hardware
+with real memory, three things are worth revisiting — none of them require
+code changes:
+
+| Setting | Why it changes |
+|---|---|
+| `RUN_WORKERS=2` | Sized for 1 GB. More RAM means more concurrent runs. |
+| `RUN_CONTEXT_LIMIT_CHARS=24000` | Sized for an 8k-context free route. A larger local model folds later and loses less detail. |
+| `PAID_DAILY_LIMIT` | Largely moot if a local model becomes the fallback. |
+
+`CUSTOM_LLM_URL` already points the router at any OpenAI-compatible endpoint,
+so a locally hosted model (llama.cpp, Ollama, vLLM) slots in as a route with
+no code change — and unlike the paid gateway, it costs nothing per call, so
+`PAID_PROVIDERS` can simply stop naming anything.
+
+The one architectural decision tied to the small box is the deferral of
+sub-agent delegation (see `CLAUDE.md`). That was declined on RAM and AI-call
+cost, both of which self-hosting changes — worth re-opening then, not now.
 
 ## 🔗 Related
 
