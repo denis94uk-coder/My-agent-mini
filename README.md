@@ -175,14 +175,19 @@ routes keep serving, so the bot degrades instead of stopping.
   rather than vanishing. Plus a daily cap on self-started runs
   (`RUN_DAILY_LIMIT`) so a misfiring schedule can't spin. Runs *you* ask
   for are never blocked by that cap.
-- **Every step is auditable** in `run_events`, including refusals.
+- **Every step is auditable** in `run_events`, including refusals and
+  approval decisions.
+- **A hung run can't hide.** Each step writes a heartbeat; the scheduler fails
+  any run that stops heartbeating (`RUN_STUCK_SECONDS`). Without it a run hung
+  inside a tool stays `running` forever — and `running` counts as active, so
+  its schedule would never fire again.
 
 See `.env.example` for all the knobs.
 
 ### Tests
 
 ```bash
-pytest tests/ -q     # 153 tests, no Slack workspace or API keys needed
+pytest tests/ -q     # 162 tests, no Slack workspace or API keys needed
 ```
 
 ## 🛠️ Domain Skills
@@ -329,7 +334,7 @@ my-agent-mini/
 ├── tools.py            # Tool implementations
 ├── critic.py           # Critic gate: is "done" actually done?
 ├── governor.py         # Risk tiers, approval queue, cost accounting
-├── tests/              # 153 tests — no Slack or API keys needed
+├── tests/              # 162 tests — no Slack or API keys needed
 ├── requirements.txt    # Python dependencies
 ├── setup.sh            # One-click server setup
 ├── .env.example        # Template for API keys + autonomy settings

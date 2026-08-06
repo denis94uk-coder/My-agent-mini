@@ -165,6 +165,15 @@ def retry_backoff_seconds() -> int:
     return max(5, _int_env("RUN_RETRY_BACKOFF_SECONDS", 60))
 
 
+def stuck_seconds() -> int:
+    """
+    How long a `running` run may go without a heartbeat before it's declared
+    stuck. Generous by default: a single tool call can legitimately take
+    minutes (a pytest quality gate, a slow clone).
+    """
+    return max(120, _int_env("RUN_STUCK_SECONDS", 1800))
+
+
 def poll_seconds() -> float:
     return max(0.5, float(_int_env("RUN_POLL_SECONDS", 3)))
 
@@ -974,6 +983,50 @@ def recover_interrupted_runs() -> int:
         return recovered
     finally:
         conn.close()
+
+
+def sweep_stuck_runs(now: float | None = None) -> list[int]:
+    """
+    Fail runs whose worker stopped heartbeating.
+
+    The wall-clock budget is only checked *between* steps, so a run hung
+    inside a tool call never reaches it — it stays `running` forever. That is
+    not just an untidy row: `running` counts as active, so the schedule
+    overlap guard would refuse to ever fire that schedule again.
+
+    This does NOT re-queue the run. The worker thread may still be alive
+    inside that tool, and Python cannot safely kill it; re-queueing would let
+    a second worker execute the same steps concurrently. So the run is failed
+    (with retries still available if the error is transient), the leaked
+    worker is logged loudly, and the schedule behind it is unblocked.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - stuck_seconds()
+    conn = _db()
+    try:
+        rows = conn.execute(
+            f"SELECT {_RUN_COLUMNS} FROM runs WHERE status = 'running' "
+            "AND heartbeat IS NOT NULL AND heartbeat < ?",
+            (cutoff,),
+        ).fetchall()
+        stuck = [_row_to_run(r) for r in rows]
+    finally:
+        conn.close()
+
+    for run in stuck:
+        silent_for = int(now - (run["heartbeat"] or now))
+        error = (
+            f"No progress for {silent_for}s (worker '{run['worker']}' stopped "
+            "heartbeating, most likely hung inside a tool call)."
+        )
+        logger.error(
+            f"💀 Run #{run['id']} declared stuck after {silent_for}s — failing it. "
+            f"Worker '{run['worker']}' may be leaked; restart the service to reclaim it."
+        )
+        add_event(run["id"], "error", error)
+        if not _fail_or_retry(run, error):
+            _notify(run, f"💀 Run #{run['id']} was stuck and has been stopped. {error}")
+    return [r["id"] for r in stuck]
 
 
 def _worker_loop(name: str):

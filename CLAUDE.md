@@ -44,7 +44,7 @@ backup — so AI calls are not free: prefer deterministic paths where they work.
 | `memory.py` | Conversations, facts, plans, thread summaries, FTS5 |
 | `concept_graph.py` | NetworkX entity/relation layer over `memory.db` |
 | `tools.py` | All tool impls + registry + owner lock |
-| `tests/` | 153 tests, no Slack/keys/network needed |
+| `tests/` | 162 tests, no Slack/keys/network needed |
 
 Key invariant: **both** the interactive loop and the run engine drive
 `agent.execute_step`. One implementation of the tool protocol. Don't fork it.
@@ -88,6 +88,13 @@ response — works on any provider, no native function calling required.
   and `recover_interrupted_runs` must leave it alone (it only touches `running`).
 - **New tool ⇒ new tier.** `test_every_registered_tool_has_a_tier` fails the
   build otherwise. Unclassified defaults to EXTERNAL by design.
+- **A hung run needs the watchdog.** Wall-clock budget is only checked between
+  steps, so a run stuck inside a tool stays `running` forever and blocks its
+  schedule. `sweep_stuck_runs` fails it on a stale heartbeat — it must never
+  re-queue it, since the worker thread may still be live inside that tool.
+- **Paid routes sort last.** Registration order in `build_providers` is just
+  block order; the sort in `governor.is_paid` terms is what stops a free route
+  being skipped for a paid one.
 - `git push` in `run_shell` fails on the server (no credential helper). Use
   `push_branch` / `github_write_file` — both open a PR, never commit to main.
 
@@ -111,4 +118,14 @@ keep new modules free of Slack imports so this stays possible.
    opt-in for chat (`CRITIC_INTERACTIVE`), capped rounds
 5. ✅ Governor (`governor.py`) — risk tiers, durable approve/deny queue with
    expiry-as-deny, per-provider cost accounting + paid daily cap
-6. ⬜ Optional: sub-agent delegation, native function calling where supported
+6. ⛔ Sub-agents / native function calling — assessed and declined, not
+   deferred. Native tool-calling only works on the OpenAI-compatible routes,
+   not keyless Pollinations, so it would fork the one tool protocol (see the
+   key invariant above) to fix parse failures that aren't actually occurring.
+   Sub-agents multiply AI calls and RAM on a 1 GB box with 2 workers, and cut
+   against `UNATTENDED_BLOCKED_TOOLS`. Revisit only if the constraints change.
+
+Still open, in rough value order: critic/summariser on a stronger route than
+the agent itself; interactive loop handing off to a background run when it
+hits `MAX_ITERATIONS`; vision (`images=`) in runs, currently interactive-only;
+embeddings for memory retrieval (deliberately deferred — FTS5 fits 1 GB).

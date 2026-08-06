@@ -340,3 +340,85 @@ def test_unattended_prompt_tells_the_model_nobody_is_watching():
     _, prompt = ai.calls[0]
     assert "UNATTENDED RUN" in prompt
     assert "do not ask clarifying questions" in prompt.lower()
+
+
+# ── Stuck-run watchdog ──
+
+def test_a_run_that_stops_heartbeating_is_declared_stuck():
+    """
+    The wall-clock budget is only checked between steps, so a run hung inside
+    a tool never reaches it — it stays `running` forever, and `running` counts
+    as active, which would block its schedule from ever firing again.
+    """
+    run_id = runner.enqueue_run("hangs in a tool")
+    runner._update_run(run_id, status="running", worker="w1",
+                       heartbeat=time.time() - 10_000)
+
+    assert runner.sweep_stuck_runs() == [run_id]
+    run = runner.get_run(run_id)
+    # Transient by default, so it gets its retries before staying failed.
+    assert run["status"] == "queued"
+    assert run["attempts"] == 1
+    assert "stopped heartbeating" in run["error"]
+
+
+def test_a_healthy_running_run_is_left_alone():
+    run_id = runner.enqueue_run("working fine")
+    runner._update_run(run_id, status="running", worker="w1", heartbeat=time.time())
+    assert runner.sweep_stuck_runs() == []
+    assert runner.get_run(run_id)["status"] == "running"
+
+
+def test_stuck_threshold_is_configurable(monkeypatch):
+    monkeypatch.setenv("RUN_STUCK_SECONDS", "300")
+    run_id = runner.enqueue_run("slow but alive")
+    runner._update_run(run_id, status="running", heartbeat=time.time() - 200)
+    assert runner.sweep_stuck_runs() == []          # 200s < 300s
+
+    runner._update_run(run_id, heartbeat=time.time() - 400)
+    assert runner.sweep_stuck_runs() == [run_id]    # 400s > 300s
+
+
+def test_stuck_sweep_ignores_queued_and_parked_runs():
+    queued = runner.enqueue_run("just queued")
+    parked = runner.enqueue_run("waiting on a human")
+    runner._update_run(parked, status=runner.AWAITING_APPROVAL,
+                       heartbeat=time.time() - 10_000)
+
+    assert runner.sweep_stuck_runs() == []
+    assert runner.get_run(queued)["status"] == "queued"
+    assert runner.get_run(parked)["status"] == runner.AWAITING_APPROVAL
+
+
+def test_stuck_run_is_reported_once_retries_run_out(monkeypatch):
+    monkeypatch.setenv("RUN_MAX_RETRIES", "0")
+    notices = []
+    runner.configure(post_message=lambda c, t, x: notices.append(x))
+
+    run_id = runner.enqueue_run("terminally stuck", channel="C1")
+    runner._update_run(run_id, status="running", worker="w1",
+                       heartbeat=time.time() - 10_000)
+    runner.sweep_stuck_runs()
+
+    assert runner.get_run(run_id)["status"] == "failed"
+    assert notices and "stuck" in notices[0]
+
+
+def test_stuck_run_unblocks_its_schedule():
+    """The concrete harm: a permanently `running` row freezes that schedule."""
+    import triggers
+
+    triggers.add_schedule("nightly", "every 1h", "goal", channel="C1")
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    run_id = triggers.fire_due_schedules()[0]
+    runner._update_run(run_id, status="running", worker="w1",
+                       heartbeat=time.time() - 10_000)
+
+    # While it looks active, the overlap guard refuses to fire again.
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    assert triggers.fire_due_schedules() == []
+
+    runner.sweep_stuck_runs()
+    runner._update_run(run_id, status="failed")
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    assert len(triggers.fire_due_schedules()) == 1

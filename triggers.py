@@ -543,6 +543,7 @@ def tick(now: float | None = None) -> dict:
     fired = []
     swept = []
     expired = []
+    stuck = []
     try:
         fired = fire_due_schedules(now)
     except Exception:
@@ -559,8 +560,12 @@ def tick(now: float | None = None) -> dict:
             runner.resume_after_decision(approval)
     except Exception:
         logger.exception("Approval expiry sweep failed")
+    try:
+        stuck = runner.sweep_stuck_runs(now)
+    except Exception:
+        logger.exception("Stuck-run sweep failed")
     return {"schedules_fired": fired, "plans_resumed": swept,
-            "approvals_expired": expired}
+            "approvals_expired": expired, "runs_unstuck": stuck}
 
 
 def _ticker_loop():
@@ -568,7 +573,7 @@ def _ticker_loop():
     logger.info(f"⏰ Scheduler started (tick every {interval}s)")
     while not _STOP.is_set():
         result = tick()
-        if result["schedules_fired"] or result["plans_resumed"]:
+        if any(result.values()):
             logger.info(
                 f"⏰ Tick queued {len(result['schedules_fired'])} scheduled run(s), "
                 f"{len(result['plans_resumed'])} plan continuation(s)"
