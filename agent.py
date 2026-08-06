@@ -20,6 +20,7 @@ import re
 import json
 import logging
 
+import critic
 import tools
 
 logger = logging.getLogger("my-agent-mini")
@@ -494,6 +495,15 @@ def run_agent_loop(
     working_messages = list(messages)
     narration_nudges_used = 0
 
+    # For the critic gate: the goal it grades against, and the tool evidence
+    # it grades with.
+    goal_text = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
+    )
+    tool_trail = []
+    critic_rounds = 0
+    unresolved = ""
+
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"🔄 Agent loop iteration {iteration + 1}/{MAX_ITERATIONS}")
 
@@ -511,8 +521,35 @@ def run_agent_loop(
         )
 
         if outcome.kind == "final":
+            # Critic gate (off by default here — see critic.interactive_enabled;
+            # a human is reading this reply and can push back themselves).
+            if (
+                critic.interactive_enabled()
+                and critic_rounds < critic.max_rounds()
+                and iteration < MAX_ITERATIONS - 1
+            ):
+                verdict = critic.review(
+                    goal_text, tool_trail, extract_final_text(outcome.response), call_ai_fn
+                )
+                if not verdict.accepted:
+                    critic_rounds += 1
+                    unresolved = verdict.reason
+                    logger.info(f"🔁 Critic sent the answer back (round {critic_rounds})")
+                    working_messages.append({"role": "assistant", "content": outcome.response})
+                    working_messages.append({
+                        "role": "user",
+                        "content": critic.revision_message(verdict.reason),
+                    })
+                    continue
+                unresolved = ""
+
             logger.info("✅ Agent gave final answer")
+            if unresolved:
+                return outcome.response + critic.unresolved_note(unresolved)
             return outcome.response
+
+        if outcome.kind == "tool":
+            tool_trail.append({"tool": outcome.tool_name, "result": outcome.tool_result})
 
         if outcome.kind == "nudge":
             narration_nudges_used += 1

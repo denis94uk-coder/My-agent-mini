@@ -38,10 +38,11 @@ tier (1 GB RAM). No Docker, no gateway service. SQLite for everything.
 | `agent.py` | `execute_step` (1 AI call + ≤1 tool) + `run_agent_loop` + system prompt |
 | `runner.py` | Durable run engine: queue, workers, resume-after-crash, budgets |
 | `triggers.py` | Schedules + stalled-plan sweeper |
+| `critic.py` | Critic gate: re-reads goal + transcript, ACCEPT or REVISE |
 | `memory.py` | Conversations, facts, plans, thread summaries, FTS5 |
 | `concept_graph.py` | NetworkX entity/relation layer over `memory.db` |
 | `tools.py` | All tool impls + registry + owner lock |
-| `tests/` | 78 tests, no Slack/keys/network needed |
+| `tests/` | 103 tests, no Slack/keys/network needed |
 
 Key invariant: **both** the interactive loop and the run engine drive
 `agent.execute_step`. One implementation of the tool protocol. Don't fork it.
@@ -62,6 +63,10 @@ response — works on any provider, no native function calling required.
   Slack thread both idle ≥ `PLAN_STALE_SECONDS`. Don't drop that check.
 - **Durability boundary is the step, never mid-tool.** Persist to `run_events`
   after a step completes; cancel/budget checks happen between steps.
+- **Critic gate fails open, and a blocker is a valid outcome.** Unparseable
+  verdict → ACCEPT. Honestly-reported blocked tool / missing token → ACCEPT.
+  Drop either rule and the gate loops demanding impossible work. Round cap
+  ships the result with the critique attached; it never eats the work.
 - `git push` in `run_shell` fails on the server (no credential helper). Use
   `push_branch` / `github_write_file` — both open a PR, never commit to main.
 
@@ -80,9 +85,9 @@ keep new modules free of Slack imports so this stays possible.
 1. ✅ Durable run engine
 2. ✅ Triggers / scheduler
 3. ✅ Plan executor (sweeper)
-4. ⬜ Critic gate — generalize `_run_quality_gate` pattern: after the agent
-   says "done", a critic pass re-reads goal + transcript and accepts or
-   returns "not done because X" (capped rounds)
+4. ✅ Critic gate (`critic.py`) — after "done", a critic pass re-reads goal +
+   tool transcript, ACCEPTs or returns "not done because X". On for runs,
+   opt-in for chat (`CRITIC_INTERACTIVE`), capped rounds
 5. ⬜ Governor — tool risk tiers, Slack approve/deny queue for irreversible
    actions, cost/step accounting, full audit trail
 6. ⬜ Optional: sub-agent delegation, native function calling where supported

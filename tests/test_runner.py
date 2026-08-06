@@ -22,6 +22,9 @@ import tools
 def temp_db(tmp_path, monkeypatch):
     """Point every module's storage at a throwaway database."""
     monkeypatch.setattr(memory, "DB_PATH", tmp_path / "memory.db")
+    # The critic gate is exercised in test_critic.py. Off here so these tests
+    # measure the run engine's own steps and events, not the extra AI call.
+    monkeypatch.setenv("CRITIC_ENABLED", "false")
     monkeypatch.setattr(runner, "_CALL_AI", None)
     monkeypatch.setattr(runner, "_POST_MESSAGE", None)
     yield

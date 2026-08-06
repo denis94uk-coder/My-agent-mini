@@ -32,6 +32,7 @@ import threading
 import logging
 
 import agent
+import critic
 import memory
 import tools
 
@@ -329,7 +330,26 @@ def rebuild_messages(run: dict) -> list[dict]:
             })
         elif event["kind"] == "nudge":
             messages.append({"role": "user", "content": agent.NUDGE_MESSAGE})
+        elif event["kind"] == "critic":
+            # A rejected final answer: the agent's attempt, then the critique
+            # it was sent back with. Both have to replay or a resumed run
+            # would re-deliver the answer the critic already turned down.
+            messages.append({"role": "user", "content": event["content"]})
     return messages
+
+
+def tool_steps(run_id: int) -> list[dict]:
+    """The tool trail, as evidence for the critic gate."""
+    return [
+        {"tool": e["name"], "result": e["content"]}
+        for e in get_events(run_id)
+        if e["kind"] == "tool_result"
+    ]
+
+
+def critic_rounds_used(run_id: int) -> int:
+    """How many times this run's final answer has already been sent back."""
+    return sum(1 for e in get_events(run_id) if e["kind"] == "critic")
 
 
 # ── Execution ──
@@ -453,8 +473,12 @@ def execute_run(run: dict) -> dict:
 
     messages = rebuild_messages(run)
     steps_used = run["steps_used"]
+    critic_rounds = critic_rounds_used(run_id)
     final_text = ""
     stop_reason = ""
+    # The critique still outstanding if the round cap lands before the critic
+    # is satisfied. It ships attached to the result rather than disappearing.
+    unresolved = ""
 
     while True:
         # Between-step checks: a cancel or a budget limit lands here, which is
@@ -501,6 +525,30 @@ def execute_run(run: dict) -> dict:
             add_event(run_id, "nudge", agent.NUDGE_MESSAGE)
         else:
             final_text = agent.extract_final_text(outcome.response)
+
+            # Critic gate: the agent decided it's done. Check that against
+            # what the transcript actually shows before believing it.
+            if critic.enabled() and critic_rounds < critic.max_rounds():
+                verdict = critic.review(
+                    run["goal"], tool_steps(run_id), final_text, _CALL_AI
+                )
+                steps_used += 1  # the critic is a real AI call; budget sees it
+                _update_run(run_id, steps_used=steps_used, heartbeat=time.time())
+
+                if not verdict.accepted:
+                    critic_rounds += 1
+                    revision = critic.revision_message(verdict.reason)
+                    unresolved = verdict.reason
+                    add_event(run_id, "assistant", outcome.response)
+                    add_event(run_id, "critic", revision, name=f"round {critic_rounds}")
+                    messages.append({"role": "assistant", "content": outcome.response})
+                    messages.append({"role": "user", "content": revision})
+                    logger.info(f"🔁 Run #{run_id} sent back by critic (round {critic_rounds})")
+                    continue
+
+                unresolved = ""
+                add_event(run_id, "critic_ok", verdict.raw[:1000])
+
             add_event(run_id, "final", final_text)
             break
 
@@ -526,6 +574,9 @@ def execute_run(run: dict) -> dict:
             final_text = f"(Run stopped at its {stop_reason}; no summary available: {e})"
         add_event(run_id, "final", final_text)
         final_text = f"{final_text}\n\n_(stopped at this run's {stop_reason})_"
+
+    if unresolved:
+        final_text += critic.unresolved_note(unresolved)
 
     _finish(run, "done", result=final_text)
     _record_completion(run, final_text)

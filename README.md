@@ -92,6 +92,34 @@ talks over someone who is mid-conversation or interrupts a plan that's
 genuinely waiting on a human answer. Capped at `PLAN_MAX_RESUMES` per
 conversation per day.
 
+### Critic gate
+
+The agent decides for itself when it's finished — which is exactly where
+this bot has failed before (announcing it saved something it never saved).
+So after a final answer, a separate AI pass re-reads the goal, the **tool
+transcript**, and the proposed answer, and returns `ACCEPT` or `REVISE` +
+a specific reason. A `REVISE` goes back into the loop as another turn.
+
+It generalizes what `_run_quality_gate` already does for code — run an
+independent check before accepting, refuse to ship what fails it — to tasks
+with no test suite to run. The critic grades against tool results only; the
+agent's own prose is never evidence for itself.
+
+Three behaviours worth knowing, each deliberate:
+
+- **Fails open.** An unparseable or erroring critic ACCEPTs (logged). A
+  broken grader must not become a broken agent.
+- **A reported blocker counts as done.** An unattended run that stopped at a
+  blocked deploy and said so is finished — otherwise the gate would demand
+  the impossible thing every round until the cap.
+- **The cap ships the work.** After `CRITIC_MAX_ROUNDS`, the result is
+  delivered with the unresolved critique appended, so the concern reaches
+  the human instead of being silently dropped.
+
+On for background runs, off for live chat by default (`CRITIC_INTERACTIVE`)
+— a human reading a reply can push back themselves; nobody is reading an
+unattended run. Each critic call counts against the run's step budget.
+
 ### Safety envelope for unattended work
 
 The `OWNER_SLACK_ID` lock answers *"is the human asking right now the
@@ -115,7 +143,7 @@ See `.env.example` for all the knobs.
 ### Tests
 
 ```bash
-pytest tests/ -q     # 78 tests, no Slack workspace or API keys needed
+pytest tests/ -q     # 103 tests, no Slack workspace or API keys needed
 ```
 
 ## 🛠️ Domain Skills
@@ -251,7 +279,8 @@ my-agent-mini/
 ├── memory.py           # SQLite-backed durable + recent memory
 ├── concept_graph.py    # NetworkX entity/relationship layer over memory.db
 ├── tools.py            # Tool implementations
-├── tests/              # 78 tests — no Slack or API keys needed
+├── critic.py           # Critic gate: is "done" actually done?
+├── tests/              # 103 tests — no Slack or API keys needed
 ├── requirements.txt    # Python dependencies
 ├── setup.sh            # One-click server setup
 ├── .env.example        # Template for API keys + autonomy settings
