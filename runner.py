@@ -27,6 +27,7 @@ Safety envelope (deliberately small — this is not the full policy layer):
 """
 
 import os
+import re
 import time
 import threading
 import logging
@@ -57,6 +58,8 @@ CREATE TABLE IF NOT EXISTS runs (
     max_seconds INTEGER NOT NULL DEFAULT 900,
     steps_used INTEGER NOT NULL DEFAULT 0,
     resume_count INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL,
     label TEXT NOT NULL DEFAULT '',
     worker TEXT NOT NULL DEFAULT '',
     heartbeat REAL,
@@ -102,10 +105,24 @@ def conv_target(conv_key: str) -> tuple[str, str]:
     return channel, ("" if thread in ("", "main") else thread)
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS will not
+# add them to a database that already has a `runs` table, so an install that
+# has been running since before retries existed needs them patched in.
+_MIGRATIONS = (
+    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("next_attempt_at", "REAL"),
+)
+
+
 def _db():
     """Connection with both the core memory schema and the run tables present."""
     conn = memory.get_db()
     conn.executescript(_SCHEMA)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    for column, spec in _MIGRATIONS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {spec}")
+            logger.info(f"Migrated runs table: added {column}")
     conn.commit()
     return conn
 
@@ -133,6 +150,15 @@ def daily_limit() -> int:
 
 def worker_count() -> int:
     return max(1, _int_env("RUN_WORKERS", 2))
+
+
+def max_retries() -> int:
+    """How many times a *failed* run is retried before it stays failed."""
+    return max(0, _int_env("RUN_MAX_RETRIES", 2))
+
+
+def retry_backoff_seconds() -> int:
+    return max(5, _int_env("RUN_RETRY_BACKOFF_SECONDS", 60))
 
 
 def poll_seconds() -> float:
@@ -171,7 +197,8 @@ class RunRejected(Exception):
 _RUN_COLUMNS = (
     "id, goal, source, status, owner_user_id, conv_key, channel, thread_ts, "
     "unattended, allow_risky, max_steps, max_seconds, steps_used, resume_count, "
-    "label, worker, heartbeat, result, error, created, updated, started, finished"
+    "attempts, next_attempt_at, label, worker, heartbeat, result, error, "
+    "created, updated, started, finished"
 )
 
 
@@ -321,7 +348,15 @@ def rebuild_messages(run: dict) -> list[dict]:
     """
     messages = [{"role": "user", "content": run["goal"]}]
     for event in get_events(run["id"]):
-        if event["kind"] == "assistant":
+        if event["kind"] == "compaction":
+            # Everything before this point was folded into one note. Drop the
+            # replayed history and continue from the fold — otherwise a resumed
+            # run rebuilds the very context the fold existed to shrink.
+            messages = [
+                {"role": "user", "content": run["goal"]},
+                {"role": "user", "content": event["content"]},
+            ]
+        elif event["kind"] == "assistant":
             messages.append({"role": "assistant", "content": event["content"]})
         elif event["kind"] == "tool_result":
             messages.append({
@@ -336,6 +371,119 @@ def rebuild_messages(run: dict) -> list[dict]:
             # would re-deliver the answer the critic already turned down.
             messages.append({"role": "user", "content": event["content"]})
     return messages
+
+
+# ── Context compaction ──
+#
+# Durability created a problem it didn't solve: a resumed run replays its
+# whole transcript, and a 25-step run with 4 KB tool results is ~25k tokens
+# before the system prompt (operating manual + tool descriptions) is even
+# added. On the free routes this repo targets, that overflows the context
+# window and the run dies late, having done most of the work.
+#
+# So: past a threshold, fold the older turns into one progress note and keep
+# only the recent ones verbatim. The fold is persisted, so a resume rebuilds
+# the *compacted* history rather than the original — the saving survives a
+# restart instead of being paid again every time.
+
+COMPACTION_KEEP_RECENT = 6  # ~3 exchanges kept verbatim after a fold
+
+# Minimum steps between folds. Without it, a run whose kept tail alone
+# exceeds the limit would fold on every single step — each fold costing an AI
+# call and a step, while freeing almost nothing.
+COMPACTION_MIN_GAP_STEPS = 3
+
+
+def context_limit_chars() -> int:
+    """
+    Fold when the working messages exceed this many characters.
+
+    Chars, not tokens, because no provider here exposes a tokenizer. ~4 chars
+    per token is the usual English approximation, so the 24000 default is
+    roughly 6k tokens of transcript — leaving room for the system prompt on an
+    8k-context model.
+    """
+    return max(2000, _int_env("RUN_CONTEXT_LIMIT_CHARS", 24000))
+
+
+def _messages_size(messages: list[dict]) -> int:
+    return sum(len(m.get("content") or "") for m in messages)
+
+
+def _deterministic_digest(messages: list[dict]) -> str:
+    """
+    Fallback fold that needs no AI call.
+
+    Used when the summarizer errors or the router is down. Cruder than a real
+    summary, but it always works and it never costs a request — which matters
+    when the paid route is the backup and the free one is what just failed.
+    """
+    lines = []
+    for message in messages:
+        content = (message.get("content") or "").strip().replace("\n", " ")
+        if message.get("role") == "assistant":
+            continue  # the model's own narration is the least useful part
+        match = re.match(r"\[TOOL_RESULT for (\w+)\]\s*(.*)", content, re.DOTALL)
+        if match:
+            lines.append(f"- {match.group(1)} → {match.group(2)[:200]}")
+        elif content.startswith("[CRITIC"):
+            lines.append(f"- critic sent the answer back: {content[:200]}")
+    if not lines:
+        return "(earlier steps produced no tool results)"
+    return "\n".join(lines[-25:])
+
+
+def compact_messages(messages: list[dict], call_ai_fn=None) -> tuple[list[dict], str] | None:
+    """
+    Fold old turns into a progress note. Returns (new_messages, note) or None
+    if there is nothing worth folding.
+
+    The goal (message 0) and the last COMPACTION_KEEP_RECENT turns always
+    survive verbatim: the goal because the run is judged against it, the tail
+    because that's the work in flight.
+    """
+    if len(messages) <= COMPACTION_KEEP_RECENT + 1:
+        return None
+
+    goal = messages[0]
+    older, recent = messages[1:-COMPACTION_KEEP_RECENT], messages[-COMPACTION_KEEP_RECENT:]
+    if not older:
+        return None
+
+    digest = ""
+    if call_ai_fn is not None:
+        transcript = "\n".join(
+            f"{m.get('role')}: {(m.get('content') or '')[:800]}" for m in older
+        )
+        try:
+            digest = call_ai_fn(
+                [{
+                    "role": "user",
+                    "content": (
+                        "Summarize this agent's progress so far into a compact "
+                        "handover note (max 250 words). Keep: what was actually done "
+                        "and the real results, exact file paths, names, numbers, and "
+                        "URLs, what failed and why, and what is still open. Drop: "
+                        "narration, restatements, politeness. Terse note form.\n\n"
+                        + transcript
+                    ),
+                }],
+                "You write terse, accurate progress notes for an agent resuming work.",
+            )
+        except Exception as e:
+            logger.warning(f"Compaction summary failed, using deterministic digest: {e}")
+            digest = ""
+        if isinstance(digest, str) and digest.startswith("❌"):
+            digest = ""
+
+    if not (digest or "").strip():
+        digest = _deterministic_digest(older)
+
+    note = (
+        "[PROGRESS SO FAR — earlier steps of this same run, folded to save "
+        "context. Treat as things you already did; do not repeat them]\n" + digest.strip()
+    )
+    return [goal, {"role": "user", "content": note}, *recent], note
 
 
 def tool_steps(run_id: int) -> list[dict]:
@@ -389,7 +537,10 @@ def _claim_next_run(worker: str) -> dict | None:
         conn = _db()
         try:
             row = conn.execute(
-                "SELECT id FROM runs WHERE status = 'queued' ORDER BY created, id LIMIT 1"
+                "SELECT id FROM runs WHERE status = 'queued' "
+                "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+                "ORDER BY created, id LIMIT 1",
+                (time.time(),),
             ).fetchone()
             if not row:
                 return None
@@ -435,6 +586,49 @@ def _finish(run: dict, status: str, result: str = "", error: str = ""):
     logger.info(f"🏁 Run #{run['id']} {status}")
 
 
+# Failures worth retrying are the ones a later attempt could plausibly survive:
+# a provider blip, a rate limit, a socket timeout. A misconfiguration will fail
+# identically forever, so retrying it just burns quota against the same wall.
+_PERMANENT_ERROR_MARKERS = (
+    "no ai backend",
+    "not authorized",
+    "unknown tool",
+)
+
+
+def _is_retryable(error: str) -> bool:
+    lowered = (error or "").lower()
+    return not any(marker in lowered for marker in _PERMANENT_ERROR_MARKERS)
+
+
+def _fail_or_retry(run: dict, error: str) -> bool:
+    """
+    Fail the run, or queue another attempt with backoff. True if it will retry.
+
+    Distinct from `recover_interrupted_runs`, which handles the process dying
+    mid-run. This handles the run itself erroring — the common cause on free
+    routes being every provider cooling down at once.
+    """
+    run_id = run["id"]
+    attempts = (run.get("attempts") or 0) + 1
+    limit = max_retries()
+
+    if attempts > limit or not _is_retryable(error):
+        _update_run(run_id, attempts=attempts)
+        _finish(run, "failed", error=error)
+        return False
+
+    delay = retry_backoff_seconds() * (2 ** (attempts - 1))
+    _update_run(
+        run_id, status="queued", attempts=attempts, worker="",
+        next_attempt_at=time.time() + delay, error=error[:1000],
+    )
+    logger.warning(
+        f"↻ Run #{run_id} failed ({error[:120]}) — retry {attempts}/{limit} in {delay}s"
+    )
+    return True
+
+
 def execute_run(run: dict) -> dict:
     """
     Drive one run to completion (or to a budget limit), persisting every step.
@@ -443,7 +637,8 @@ def execute_run(run: dict) -> dict:
     it resumes from them rather than restarting the task.
     """
     if _CALL_AI is None:
-        _finish(run, "failed", error="No AI backend configured for the run engine.")
+        # Permanent by definition — retrying a missing backend just re-fails.
+        _fail_or_retry(run, "No AI backend configured for the run engine.")
         return get_run(run["id"])
 
     run_id = run["id"]
@@ -474,6 +669,8 @@ def execute_run(run: dict) -> dict:
     messages = rebuild_messages(run)
     steps_used = run["steps_used"]
     critic_rounds = critic_rounds_used(run_id)
+    # Large so the first fold can happen immediately; reset on every fold.
+    steps_since_fold = COMPACTION_MIN_GAP_STEPS
     final_text = ""
     stop_reason = ""
     # The critique still outstanding if the round cap lands before the critic
@@ -497,6 +694,22 @@ def execute_run(run: dict) -> dict:
             stop_reason = f"time budget ({run['max_seconds']}s)"
             break
 
+        if (
+            _messages_size(messages) > context_limit_chars()
+            and steps_since_fold >= COMPACTION_MIN_GAP_STEPS
+        ):
+            folded = compact_messages(messages, _CALL_AI)
+            if folded:
+                messages, note = folded
+                steps_used += 1  # the summarizer is a real AI call
+                steps_since_fold = 0
+                add_event(run_id, "compaction", note)
+                _update_run(run_id, steps_used=steps_used, heartbeat=time.time())
+                logger.info(
+                    f"🗜️ Run #{run_id} folded its context to "
+                    f"{_messages_size(messages)} chars"
+                )
+
         try:
             outcome = agent.execute_step(
                 messages,
@@ -510,11 +723,14 @@ def execute_run(run: dict) -> dict:
         except Exception as e:
             logger.warning(f"Run #{run_id} step failed: {e}", exc_info=True)
             add_event(run_id, "error", str(e)[:2000])
-            _finish(run, "failed", error=str(e)[:1000])
-            _notify(run, f"❌ Run #{run_id} failed: {str(e)[:300]}")
+            if not _fail_or_retry(run, str(e)[:1000]):
+                _notify(run, f"❌ Run #{run_id} failed: {str(e)[:300]}")
+            # A retry keeps the transcript, so the next attempt resumes here
+            # rather than redoing the work that already succeeded.
             return get_run(run_id)
 
         steps_used += 1
+        steps_since_fold += 1
         _update_run(run_id, steps_used=steps_used, heartbeat=time.time())
 
         if outcome.kind == "tool":

@@ -6,7 +6,7 @@ suite needs no Slack workspace, no API keys, and no network.
 """
 
 import sys
-
+import time
 from pathlib import Path
 
 import pytest
@@ -145,16 +145,7 @@ def test_cancelled_run_stops_before_calling_the_ai():
     assert ai.calls == []
 
 
-def test_run_without_ai_backend_fails_cleanly():
-    runner.configure(system_prompt="Test bot.")
-    runner._CALL_AI = None
-    run_id = runner.enqueue_run("no backend")
-    final = runner.execute_run(runner.get_run(run_id))
-    assert final["status"] == "failed"
-    assert "No AI backend" in final["error"]
-
-
-def test_ai_exception_marks_run_failed():
+def test_ai_exception_queues_a_retry_with_backoff():
     def explode(messages, prompt):
         raise RuntimeError("provider on fire")
 
@@ -162,8 +153,53 @@ def test_ai_exception_marks_run_failed():
     run_id = runner.enqueue_run("boom")
     final = runner.execute_run(runner.get_run(run_id))
 
-    assert final["status"] == "failed"
+    # A provider blip is transient — the run waits and tries again rather
+    # than dying on the first error.
+    assert final["status"] == "queued"
+    assert final["attempts"] == 1
+    assert final["next_attempt_at"] > time.time()
     assert "provider on fire" in final["error"]
+
+
+def test_retries_are_not_claimable_until_their_backoff_expires():
+    def explode(messages, prompt):
+        raise RuntimeError("provider on fire")
+
+    runner.configure(call_ai_fn=explode, system_prompt="Test bot.")
+    run_id = runner.enqueue_run("boom")
+    runner.execute_run(runner.get_run(run_id))
+
+    assert runner._claim_next_run("w1") is None  # still backing off
+    runner._update_run(run_id, next_attempt_at=time.time() - 1)
+    assert runner._claim_next_run("w1")["id"] == run_id
+
+
+def test_run_fails_for_good_once_retries_are_exhausted(monkeypatch):
+    monkeypatch.setenv("RUN_MAX_RETRIES", "2")
+
+    def explode(messages, prompt):
+        raise RuntimeError("provider on fire")
+
+    runner.configure(call_ai_fn=explode, system_prompt="Test bot.")
+    run_id = runner.enqueue_run("boom")
+
+    for _ in range(3):
+        runner._update_run(run_id, status="running", next_attempt_at=None)
+        final = runner.execute_run(runner.get_run(run_id))
+
+    assert final["status"] == "failed"
+    assert final["attempts"] == 3
+
+
+def test_permanent_errors_are_not_retried():
+    """A misconfiguration fails identically forever — retrying just burns quota."""
+    runner.configure(system_prompt="Test bot.")
+    runner._CALL_AI = None
+    run_id = runner.enqueue_run("no backend")
+    final = runner.execute_run(runner.get_run(run_id))
+
+    assert final["status"] == "failed"
+    assert final["attempts"] == 1
 
 
 # ── Durability: the whole point of the engine ──

@@ -27,8 +27,9 @@ never on work. Target ~1/3 the words.
 
 ## What this is
 
-Slack bot → autonomous agent. Single Python process, systemd, Oracle free
-tier (1 GB RAM). No Docker, no gateway service. SQLite for everything.
+Slack bot → autonomous agent. Single Python process, systemd, Google e2-micro
+free tier (1 GB RAM). Keyless Pollinations route first, small paid route as
+backup — so AI calls are not free: prefer deterministic paths where they work. No Docker, no gateway service. SQLite for everything.
 
 ## Architecture
 
@@ -42,7 +43,7 @@ tier (1 GB RAM). No Docker, no gateway service. SQLite for everything.
 | `memory.py` | Conversations, facts, plans, thread summaries, FTS5 |
 | `concept_graph.py` | NetworkX entity/relation layer over `memory.db` |
 | `tools.py` | All tool impls + registry + owner lock |
-| `tests/` | 103 tests, no Slack/keys/network needed |
+| `tests/` | 120 tests, no Slack/keys/network needed |
 
 Key invariant: **both** the interactive loop and the run engine drive
 `agent.execute_step`. One implementation of the tool protocol. Don't fork it.
@@ -67,6 +68,16 @@ response — works on any provider, no native function calling required.
   verdict → ACCEPT. Honestly-reported blocked tool / missing token → ACCEPT.
   Drop either rule and the gate loops demanding impossible work. Round cap
   ships the result with the critique attached; it never eats the work.
+- **Long runs need the fold.** `rebuild_messages` replays the whole
+  transcript; past `RUN_CONTEXT_LIMIT_CHARS` it gets compacted to a progress
+  note. The fold is persisted as a `compaction` event and resume rebuilds
+  *from* it — otherwise recovery re-inflates the context the fold shrank.
+  Summariser failure falls back to a deterministic digest, no AI call.
+- **Schedules don't stack.** A schedule won't fire while its own previous run
+  is active; `next_run` still advances so it can't get stuck due.
+- **Retry ≠ resume.** `attempts`/`next_attempt_at` = the run errored (backoff,
+  capped). `resume_count` = the process died mid-run. Config errors
+  (`_PERMANENT_ERROR_MARKERS`) never retry.
 - `git push` in `run_shell` fails on the server (no credential helper). Use
   `push_branch` / `github_write_file` — both open a PR, never commit to main.
 

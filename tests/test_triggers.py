@@ -181,6 +181,47 @@ def test_schedule_still_advances_when_the_run_budget_refuses(monkeypatch):
     assert triggers.list_schedules()[0]["next_run"] > time.time()
 
 
+def test_schedule_does_not_stack_runs_on_top_of_itself():
+    """A slow run must delay the next fire, not queue a backlog behind it."""
+    triggers.add_schedule("slow", "every 1h", "goal", channel="C1")
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    assert len(triggers.fire_due_schedules()) == 1
+
+    # Its run is still going; the next due tick must not queue a second one.
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    assert triggers.fire_due_schedules() == []
+    assert len([r for r in runner.list_runs(limit=10) if r["source"] == "schedule"]) == 1
+    # …and the schedule still advanced, so it isn't stuck due forever.
+    assert triggers.list_schedules()[0]["next_run"] > time.time()
+
+
+def test_schedule_fires_again_once_its_previous_run_finished():
+    triggers.add_schedule("slow", "every 1h", "goal", channel="C1")
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    first = triggers.fire_due_schedules()[0]
+
+    runner._update_run(first, status="done")
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    assert len(triggers.fire_due_schedules()) == 1
+
+
+def test_overlap_can_be_allowed_explicitly(monkeypatch):
+    monkeypatch.setenv("SCHEDULE_ALLOW_OVERLAP", "true")
+    triggers.add_schedule("parallel", "every 1h", "goal", channel="C1")
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    triggers.fire_due_schedules()
+    triggers._set_schedule_fields(1, next_run=time.time() - 5)
+    assert len(triggers.fire_due_schedules()) == 1
+
+
+def test_a_different_schedule_is_not_blocked_by_someone_elses_run():
+    triggers.add_schedule("one", "every 1h", "goal a", channel="C1")
+    triggers.add_schedule("two", "every 1h", "goal b", channel="C1")
+    for sid in (1, 2):
+        triggers._set_schedule_fields(sid, next_run=time.time() - 5)
+    assert len(triggers.fire_due_schedules()) == 2
+
+
 # ── Plan sweeper ──
 
 def make_stale_plan(conv_key="C1:main", user_id="U1", age_seconds=3600, steps=None):

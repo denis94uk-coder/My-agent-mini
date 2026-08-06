@@ -316,6 +316,24 @@ def fire_due_schedules(now: float | None = None) -> list[int]:
     run_ids = []
     for row in rows:
         sched = _row_to_schedule(row)
+
+        # Overlap guard: a schedule firing faster than its runs finish would
+        # otherwise stack them up — on a 1 GB box that is how you lose the
+        # process. The plan sweeper has always had this check; schedules
+        # needed it too. next_run still advances below, so a slow run delays
+        # the next fire instead of queueing a backlog to run all at once.
+        if not _bool_env("SCHEDULE_ALLOW_OVERLAP", False) and _schedule_run_active(sched["name"]):
+            logger.info(
+                f"⏭️ Schedule '{sched['name']}' skipped: its previous run is still going"
+            )
+            try:
+                _set_schedule_fields(
+                    sched["id"], last_run=now, next_run=next_run_after(sched["spec"], now)
+                )
+            except ValueError:
+                _set_schedule_fields(sched["id"], enabled=0)
+            continue
+
         try:
             run_id = runner.enqueue_run(
                 goal=sched["goal"],
@@ -345,6 +363,19 @@ def fire_due_schedules(now: float | None = None) -> list[int]:
             sched["id"], last_run=now, next_run=upcoming, run_count=sched["run_count"] + 1
         )
     return run_ids
+
+
+def _schedule_run_active(name: str) -> bool:
+    """Is a run from this schedule still going?"""
+    conn = _db()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE source = 'schedule' AND label = ? "
+            "AND status IN (?, ?)",
+            (name, *runner.ACTIVE_STATUSES),
+        ).fetchone()[0] > 0
+    finally:
+        conn.close()
 
 
 def _set_schedule_fields(schedule_id: int, **fields):
