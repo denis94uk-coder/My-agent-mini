@@ -50,6 +50,8 @@ from slack_sdk import WebClient
 import memory
 import tools
 import agent
+import runner
+import triggers
 import concept_graph
 
 # ── Logging ──
@@ -972,6 +974,59 @@ def handle_providers(ack, command, say):
     say(text="\n".join(lines), channel=command["channel_id"])
 
 
+@slack_app.command("/runs")
+def handle_runs(ack, command, say):
+    """Show background runs, or cancel one with `/runs cancel <id>`."""
+    ack()
+    channel = command["channel_id"]
+    text = command.get("text", "").strip().split()
+
+    if text and text[0] == "cancel":
+        if len(text) < 2 or not text[1].isdigit():
+            say(text="Usage: `/runs cancel <run id>`", channel=channel)
+            return
+        run_id = int(text[1])
+        if runner.cancel_run(run_id):
+            say(text=f"🛑 Run #{run_id} cancelled (it stops at its next step).", channel=channel)
+        else:
+            say(text=f"Run #{run_id} isn't queued or running.", channel=channel)
+        return
+
+    if text and text[0].isdigit():
+        say(text=tools.run_tool("run_status", {"run_id": int(text[0])}), channel=channel)
+        return
+
+    say(
+        text="🏃 *Background runs*\n\n" + runner.format_runs()
+        + "\n\n_`/runs <id>` for detail, `/runs cancel <id>` to stop one._",
+        channel=channel,
+    )
+
+
+@slack_app.command("/schedules")
+def handle_schedules(ack, command, say):
+    """Show scheduled tasks, or cancel one with `/schedules cancel <name>`."""
+    ack()
+    channel = command["channel_id"]
+    text = command.get("text", "").strip().split(maxsplit=1)
+
+    if text and text[0] == "cancel":
+        if len(text) < 2:
+            say(text="Usage: `/schedules cancel <name>`", channel=channel)
+            return
+        if triggers.cancel_schedule(text[1].strip()):
+            say(text=f"✅ Schedule '{text[1].strip()}' cancelled.", channel=channel)
+        else:
+            say(text=f"❌ No schedule named '{text[1].strip()}'.", channel=channel)
+        return
+
+    say(
+        text="⏰ *Scheduled tasks*\n\n" + triggers.format_schedules()
+        + "\n\n_`/schedules cancel <name>` to remove one._",
+        channel=channel,
+    )
+
+
 @slack_app.command("/status")
 def handle_status(ack, command, say):
     ack()
@@ -1048,11 +1103,40 @@ def handle_health(ack, command, say):
         f"{stats['open_tasks']} open plan step(s), {stats['db_size_mb']} MB\n"
         f"*Concept graph:* {concept_graph.get_graph_stats()['entities']} entities, "
         f"{concept_graph.get_graph_stats()['edges']} connections\n"
+        f"*Autonomy:* {len(runner.list_runs(limit=99, status='running'))} run(s) executing, "
+        f"{len(runner.list_runs(limit=99, status='queued'))} queued, "
+        f"{len(triggers.list_schedules(include_disabled=False))} active schedule(s)\n"
         f"*Disk:* {disk_str}\n"
         f"*Log file:* {log_size_kb} KB (rotates at 5 MB, keeps 3 backups)\n"
         f"*Errors in this process ({len(ERROR_LOG)} tracked, last 5):*\n{err_lines}\n"
     )
     say(text=health_text, channel=command["channel_id"])
+
+
+# ── Autonomy wiring ──
+# The run engine and scheduler are deliberately Slack-agnostic: they get an
+# AI backend and a "post this somewhere" callback injected here, which is
+# what keeps them testable without a Slack workspace.
+
+def post_run_message(channel: str, thread_ts: str, text: str):
+    """Where a background run reports back to."""
+    slack_client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts or None,
+        text=truncate_for_slack(text),
+    )
+
+
+def start_autonomy() -> tuple[int, bool]:
+    """Bring up background workers + the scheduler. Returns (workers, scheduler_on)."""
+    runner.configure(
+        call_ai_fn=lambda msgs, prompt: call_ai(msgs, prompt),
+        system_prompt=SYSTEM_PROMPT,
+        post_message=post_run_message,
+    )
+    workers = runner.start_workers()
+    scheduler_on = triggers.start_scheduler()
+    return workers, scheduler_on
 
 
 # ── Start ──
@@ -1074,6 +1158,12 @@ if __name__ == "__main__":
         logger.info(f"   Operating manual: ✅ loaded ({len(OPERATING_MANUAL)} chars)")
     else:
         logger.info("   Operating manual: none (add operating_manual.md to enable)")
+
+    workers, scheduler_on = start_autonomy()
+    logger.info(f"   Run workers: {workers} (max {runner.max_steps_default()} steps, "
+                f"{runner.max_seconds_default()}s per run)")
+    logger.info(f"   Scheduler: {'✅ on' if scheduler_on else '❌ off'}, "
+                f"{len(triggers.list_schedules(include_disabled=False))} active schedule(s)")
 
     handler = SocketModeHandler(slack_app, SLACK_APP_TOKEN)
     handler.start()

@@ -59,6 +59,17 @@ OWNER_ONLY_TOOLS = {
     "restart_service",
     "deploy_static_site",
     "push_branch",
+    # Scheduling is owner-only for the same reason: it commits the bot to
+    # acting later, on its own, using the owner's credentials.
+    "schedule_task",
+    "cancel_schedule",
+}
+
+# Tools that need to know which conversation they were called from — the
+# agent loop fills these in so the model never has to pass them.
+CONTEXT_TOOLS = {
+    "start_background_run": ("_user_id", "_conv_key"),
+    "schedule_task": ("_user_id", "_conv_key"),
 }
 
 
@@ -425,6 +436,116 @@ def list_tasks_tool(conv_key: str = "default") -> str:
         return "No active plan for this conversation."
     lines = [f"{p['step_no']}. [{p['status']}] {p['description']}" for p in plan]
     return "\n".join(lines)
+
+
+# ── Autonomy Tools — background runs and schedules ──
+# These reach into runner.py / triggers.py, which import agent.py, which
+# imports this module — so the imports live inside the functions to keep the
+# cycle from biting at import time.
+
+@tool(
+    "start_background_run",
+    "Start a long task as a background run that survives restarts and doesn't block chat. "
+    "Use for work that needs many steps or a long wait; you get a run id back immediately "
+    "and the result is posted when it finishes. Not for quick answers.",
+    "goal",
+)
+def start_background_run(goal: str, _user_id: str = "default", _conv_key: str = "") -> str:
+    import runner
+    channel, thread_ts = runner.conv_target(_conv_key)
+    try:
+        run_id = runner.enqueue_run(
+            goal=goal,
+            source="manual",
+            owner_user_id=_user_id,
+            conv_key=_conv_key,
+            channel=channel,
+            thread_ts=thread_ts,
+            unattended=True,
+        )
+    except runner.RunRejected as e:
+        return f"❌ {e}"
+    return (
+        f"✅ Queued background run #{run_id}. It runs on its own and posts the result here "
+        f"when done. Tell the user the run id; check progress with run_status({run_id}). "
+        "Do not wait for it — finish your reply now."
+    )
+
+
+@tool(
+    "schedule_task",
+    "Schedule work to run automatically, with no human present. when: 'every 30m', 'hourly', "
+    "'daily 09:00', 'weekly mon 09:00', or a 5-field cron line. name is a short label used to "
+    "cancel it later. Owner only.",
+    "name, when, goal",
+)
+def schedule_task(name: str, when: str, goal: str,
+                  _user_id: str = "default", _conv_key: str = "") -> str:
+    import runner
+    import triggers
+    channel, thread_ts = runner.conv_target(_conv_key)
+    try:
+        sched = triggers.add_schedule(
+            name=name, spec=when, goal=goal, owner_user_id=_user_id,
+            channel=channel, thread_ts=thread_ts,
+        )
+    except ValueError as e:
+        return f"❌ {e}"
+    next_at = time.strftime("%a %Y-%m-%d %H:%M", time.localtime(sched["next_run"]))
+    return (
+        f"✅ Scheduled '{sched['name']}' ({sched['spec']}) — first run {next_at} (server time).\n"
+        "Note: scheduled runs are unattended, so deploys, pushes and service restarts are "
+        "blocked in them; they'll report what needs a human instead."
+    )
+
+
+@tool("list_schedules", "Show all scheduled tasks and when they next run.", "")
+def list_schedules_tool() -> str:
+    import triggers
+    return triggers.format_schedules()
+
+
+@tool("cancel_schedule", "Cancel a scheduled task by its name (or id). Owner only.", "name")
+def cancel_schedule_tool(name: str) -> str:
+    import triggers
+    if triggers.cancel_schedule(name):
+        return f"✅ Schedule '{name}' cancelled."
+    return f"❌ No schedule named '{name}'. Use list_schedules to see what exists."
+
+
+@tool(
+    "run_status",
+    "Check a background run: status, steps used, and its result if it finished. "
+    "Omit run_id to list recent runs.",
+    "run_id",
+)
+def run_status(run_id: int = 0) -> str:
+    import runner
+    if not run_id:
+        return runner.format_runs()
+    run = runner.get_run(int(run_id))
+    if not run:
+        return f"❌ No run #{run_id}."
+    lines = [
+        f"Run #{run['id']} — *{run['status']}* ({run['source']})",
+        f"Goal: {run['goal'][:300]}",
+        f"Steps: {run['steps_used']}/{run['max_steps']}",
+    ]
+    if run["error"]:
+        lines.append(f"Error: {run['error'][:400]}")
+    if run["result"]:
+        lines.append(f"Result:\n{run['result'][:1500]}")
+    return "\n".join(lines)
+
+
+# Tools an unattended run may never call, even one with allow_risky set:
+# each of them creates *more* autonomous work. A run that can queue runs is
+# one bad reasoning step away from a fork bomb of them.
+UNATTENDED_BLOCKED_TOOLS = {
+    "start_background_run",
+    "schedule_task",
+    "cancel_schedule",
+}
 
 
 # ── v4 "Full Agent" Tools — shell, files, workspace ──

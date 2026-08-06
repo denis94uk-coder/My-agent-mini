@@ -18,6 +18,9 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 - **Durable project memory** — decisions and completed-task summaries
   persist across separate Slack threads/conversations, not just within one
   thread (see below)
+- **Autonomous execution** — background runs that survive restarts,
+  schedules that start work with nobody present, and automatic resumption
+  of unfinished plans (see below)
 
 ## 🧠 Memory model
 
@@ -38,6 +41,82 @@ preferences and only the most recent ones are kept in context — they're
 not meant to be load-bearing. If something needs to survive long-term
 (a roadmap item, an explicit instruction, an architecture choice), it
 should be stored as a `decision`.
+
+## 🤖 Autonomy: runs, schedules, and self-resuming plans
+
+Everything else in the bot starts with a human typing. These three
+mechanisms let it work without that.
+
+### Background runs
+
+A **run** is a durable task. Every step is written to SQLite (`runs` and
+`run_events`) *before* the next one starts, so a run can be cancelled,
+inspected, and — after a crash or a `systemctl restart` — resumed exactly
+where it stopped, with its context intact, instead of starting the task
+over. Runs execute on background worker threads, so long work never blocks
+the chat.
+
+```
+/runs              list recent runs
+/runs 12           detail + result for run #12
+/runs cancel 12    stop it at its next step boundary
+```
+
+The agent starts one itself via `start_background_run` when work won't fit
+in a single reply.
+
+### Schedules
+
+`schedule_task` (owner only) makes something happen later, repeatedly, with
+nobody present — this is what turns the bot from reactive to self-starting.
+
+| Spec | Meaning |
+|---|---|
+| `every 15m`, `every 2h`, `every 1d` | fixed interval (minimum 1 minute) |
+| `hourly` | on the hour |
+| `daily 09:00` | every day at 09:00 |
+| `weekly mon 08:15` | Mondays at 08:15 |
+| `0 9 * * 1-5` | raw 5-field cron — weekdays at 09:00 |
+
+Times are the **server's** local timezone. `/schedules` lists them,
+`/schedules cancel <name>` removes one.
+
+### Self-resuming plans
+
+`create_plan` already stored multi-step plans, but nothing drove them
+forward: if the agent stopped at step 3 of 7, those steps sat there until
+someone spoke. Now a sweeper picks them up — but only once **both** the
+plan and its Slack thread have been idle for `PLAN_STALE_SECONDS`
+(default 10 min). That idle check is deliberate: it means the bot never
+talks over someone who is mid-conversation or interrupts a plan that's
+genuinely waiting on a human answer. Capped at `PLAN_MAX_RESUMES` per
+conversation per day.
+
+### Safety envelope for unattended work
+
+The `OWNER_SLACK_ID` lock answers *"is the human asking right now the
+owner?"* — which means nothing once a cron job is the caller. So unattended
+runs (schedules, plan resumes) add their own limits:
+
+- **Owner-only tools are refused** — no deploys, pushes, or service
+  restarts with nobody watching. The run does everything up to that line
+  and reports what a human needs to run. A schedule must opt in explicitly.
+- **Creating more autonomous work is always refused**, opt-in or not: a run
+  that can queue runs is one bad reasoning step from a fork bomb of them.
+- **Budgets** — per-run step and time caps (`RUN_MAX_STEPS`,
+  `RUN_MAX_SECONDS`); on hitting one the run reports what it finished
+  rather than vanishing. Plus a daily cap on self-started runs
+  (`RUN_DAILY_LIMIT`) so a misfiring schedule can't spin. Runs *you* ask
+  for are never blocked by that cap.
+- **Every step is auditable** in `run_events`, including refusals.
+
+See `.env.example` for all the knobs.
+
+### Tests
+
+```bash
+pytest tests/ -q     # 78 tests, no Slack workspace or API keys needed
+```
 
 ## 🛠️ Domain Skills
 
@@ -137,6 +216,9 @@ sudo journalctl -u my-agent -f  # live logs
 | `/ask <question>` | Quick one-shot question |
 | `/clear` | Reset conversation memory |
 | `/providers` | Show routes, keyless/key-backed status, and cooldown health |
+| `/runs` | List background runs (`/runs <id>`, `/runs cancel <id>`) |
+| `/schedules` | List scheduled tasks (`/schedules cancel <name>`) |
+| `/status`, `/health` | Capabilities snapshot / deep operational health |
 
 ## 🔧 Management Commands
 
@@ -162,13 +244,17 @@ sudo systemctl restart my-agent
 
 ```
 my-agent-mini/
-├── bot.py              # Main bot (single file, ~300 lines)
-├── agent.py            # ReAct agent loop + system prompt
+├── bot.py              # Slack app: events, slash commands, provider router
+├── agent.py            # ReAct loop + the execute_step primitive + prompt
+├── runner.py           # Durable run engine (queue, workers, resume, budgets)
+├── triggers.py         # Schedules + the stalled-plan sweeper
 ├── memory.py           # SQLite-backed durable + recent memory
+├── concept_graph.py    # NetworkX entity/relationship layer over memory.db
 ├── tools.py            # Tool implementations
-├── requirements.txt    # Python dependencies (3 packages)
+├── tests/              # 78 tests — no Slack or API keys needed
+├── requirements.txt    # Python dependencies
 ├── setup.sh            # One-click server setup
-├── .env.example        # Template for API keys
+├── .env.example        # Template for API keys + autonomy settings
 ├── .gitignore          # Protects .env
 ├── skills/
 │   └── coding-practices/  # 24 reference skill files (see README above)
