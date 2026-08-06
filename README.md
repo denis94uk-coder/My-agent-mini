@@ -10,7 +10,8 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 - **Automatic fallback** — skips rate-limited/unhealthy routes with cooldowns
 - **Slack Integration** — DMs, @mentions, slash commands (`/ask`, `/clear`, `/providers`)
 - **Threaded Conversations** — Maintains context within Slack threads
-- **Zero Cost** — Runs on Oracle Cloud free tier + free AI APIs
+- **Near-zero cost** — runs on a Google Cloud e2-micro (or any 1 GB always-free
+  VM) with a keyless AI route; an optional paid route is tried last and capped
 - **Lightweight** — ~50MB RAM, single Python process
 - **Auto-restart** — Systemd service keeps it running 24/7
 - **Domain skills** — GitHub automation, server administration, and static
@@ -228,16 +229,22 @@ The built-in router can also use the provider integrations already in the bot, i
 
 ## 🚀 Quick Start
 
-### 1. Create Oracle Cloud Free Instance
+### 1. Create a free VM
 
-- Shape: `VM.Standard.E2.1.Micro` (1 OCPU, 1 GB) — Always Free
-- Or: `VM.Standard.A1.Flex` (up to 4 OCPU, 24 GB) — Always Free (if available)
-- OS: Ubuntu 22.04
+Reference deployment is a **Google Cloud e2-micro** (2 vCPU burst, 1 GB RAM,
+always-free tier in `us-west1`, `us-central1`, or `us-east1`), Ubuntu 22.04.
+Anything comparable works — Oracle's `VM.Standard.E2.1.Micro` is the same
+class of box, and the setup below is identical on both.
+
+The 1 GB ceiling is a real design constraint, not a footnote: it's why there
+is no Docker, no gateway service, no vector database, and why background runs
+default to 2 workers.
 
 ### 2. SSH into your server
 
 ```bash
-ssh -i your-key.key ubuntu@YOUR-SERVER-IP
+gcloud compute ssh your-instance-name        # GCP
+ssh -i your-key.key ubuntu@YOUR-SERVER-IP    # or plain SSH anywhere else
 ```
 
 ### 3. Run setup script
@@ -334,7 +341,7 @@ my-agent-mini/
 
 ## 🔗 Related
 
-- **[My-Agent](https://github.com/denis94uk-coder/My-agent)** — Full version with Docker, LiteLLM, web dashboard, and 12 AI providers. Needs 4 OCPU / 24 GB (Oracle A1.Flex).
+- **[My-Agent](https://github.com/denis94uk-coder/My-agent)** — Full version with Docker, LiteLLM, web dashboard, and 12 AI providers. Needs a much larger box (4 vCPU / 24 GB).
 
 ## 💡 How Hybrid Failover Works
 
@@ -348,6 +355,10 @@ User sends message in Slack
  Send response back to Slack
 ```
 
+Paid routes are always sorted **last**, whatever order they were registered
+in, and drop out entirely once `PAID_DAILY_LIMIT` is reached — so a free route
+is never skipped in favour of one that costs money.
+
 If a route is rate-limited, returns an error, or times out, the bot automatically cools it down and tries the next healthy route. The router is best-effort: it cannot guarantee unlimited free access, bypass authentication, or make an unavailable service work.
 
 ## 📊 Resource Usage
@@ -357,4 +368,6 @@ If a route is rate-limited, returns an error, or times out, the bot automaticall
 - **Disk:** < 100 MB total
 - **Network:** Minimal (API calls only)
 
-Perfect for Oracle's E2.1.Micro (1 GB RAM) free instance!
+Comfortable on a 1 GB always-free instance (Google e2-micro, Oracle
+E2.1.Micro). Background runs add roughly 10-20 MB per active worker while
+they're executing; `RUN_WORKERS=2` is the default for that reason.

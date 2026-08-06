@@ -351,3 +351,40 @@ def test_usage_summary_renders_for_slack(monkeypatch):
     text = governor.format_usage()
     assert "Merge Gateway" in text
     assert "paid" in text
+
+
+# ── Router ordering (cost protection) ──
+
+def test_paid_routes_sort_last(monkeypatch):
+    """
+    Registration order is just the order the provider blocks are written, which
+    had NVIDIA's free tier sitting behind the paid gateway — a Pollinations
+    failure would have spent credit while a free route went untried.
+    """
+    monkeypatch.setenv("PAID_PROVIDERS", "merge")
+    providers = [
+        {"name": "Pollinations (keyless)"},
+        {"name": "Groq"},
+        {"name": "Merge Gateway"},
+        {"name": "NVIDIA"},
+    ]
+    providers.sort(key=lambda p: 1 if governor.is_paid(p["name"]) else 0)
+
+    names = [p["name"] for p in providers]
+    assert names[-1] == "Merge Gateway"
+    assert names.index("NVIDIA") < names.index("Merge Gateway")
+    # A stable sort must leave the free ordering (keyless first) untouched.
+    assert names[:3] == ["Pollinations (keyless)", "Groq", "NVIDIA"]
+
+
+def test_multiple_paid_routes_can_be_named(monkeypatch):
+    monkeypatch.setenv("PAID_PROVIDERS", "merge,openrouter")
+    assert governor.is_paid("Merge Gateway")
+    assert governor.is_paid("OpenRouter")
+    assert not governor.is_paid("Groq")
+
+
+def test_no_paid_providers_configured_means_nothing_is_paid(monkeypatch):
+    monkeypatch.setenv("PAID_PROVIDERS", "")
+    assert not governor.is_paid("Merge Gateway")
+    assert governor.paid_budget_exhausted() is False

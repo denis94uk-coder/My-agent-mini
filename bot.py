@@ -363,7 +363,17 @@ def build_providers():
         else:
             PROVIDERS.append(keyless_provider)
 
+    # Paid routes go last, whatever order they were registered in. Registration
+    # order is just the order the blocks are written above — which had NVIDIA's
+    # free tier sitting *behind* the paid gateway, so a Pollinations failure
+    # would spend credit while a free route went untried. A stable sort keeps
+    # every other preference (keyless first, then the free keys in order) intact.
+    PROVIDERS.sort(key=lambda p: 1 if governor.is_paid(p["name"]) else 0)
+
+    paid = [p["name"] for p in PROVIDERS if governor.is_paid(p["name"])]
     logger.info(f"🧠 Loaded {len(PROVIDERS)} AI routes: {[p['name'] for p in PROVIDERS]}")
+    if paid:
+        logger.info(f"💳 Paid routes (tried last, capped daily): {paid}")
 
 
 # ── File Handling ──
