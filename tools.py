@@ -443,11 +443,7 @@ def memory_search(query: str) -> str:
 
 @tool(
     "remember",
-    "Store durable memory for future conversations. Use category='decision' for "
-    "things that must survive into future threads — stated priorities, roadmap "
-    "items, architecture/process choices, explicit instructions ('don't do X yet'). "
-    "Use category='fact' (default) for casual preferences/details. Decisions are "
-    "never crowded out of context the way plain facts are.",
+    'Store durable memory. category=\'decision\' for anything that must survive into future threads (priorities, roadmap, architecture/process choices, "don\'t do X yet") — decisions are never crowded out of context. category=\'fact\' (default) for casual preferences.',
     "fact, category",
 )
 def remember(fact: str, user_id: str = "default", category: str = "fact") -> str:
@@ -464,10 +460,7 @@ def remember(fact: str, user_id: str = "default", category: str = "fact") -> str
 
 @tool(
     "graph_recall",
-    "Search the concept graph for entities and their connections. "
-    "Use when you need to understand how concepts, technologies, projects, "
-    "or decisions relate to each other — complements memory_search which "
-    "finds raw text. Returns entities with types, relationships, and context.",
+    'Search the concept graph for entities and how they connect — complements memory_search, which finds raw text. Returns entities, types, relationships, context.',
     "query",
 )
 def graph_recall_tool(query: str) -> str:
@@ -546,9 +539,7 @@ def list_tasks_tool(conv_key: str = "default") -> str:
 
 @tool(
     "start_background_run",
-    "Start a long task as a background run that survives restarts and doesn't block chat. "
-    "Use for work that needs many steps or a long wait; you get a run id back immediately "
-    "and the result is posted when it finishes. Not for quick answers. Owner only.",
+    "Start a long task as a background run that survives restarts and doesn't block chat. Returns a run id immediately; the result is posted when it finishes. Not for quick answers. Owner only.",
     "goal",
 )
 def start_background_run(goal: str, _user_id: str = "default", _conv_key: str = "") -> str:
@@ -831,7 +822,7 @@ def github_read_file(path: str, owner: str = "", repo: str = "", branch: str = "
 
 @tool(
     "github_write_file",
-    "Propose a change to a file in a GitHub repo. Creates a new branch, commits the change there, and opens a pull request against the base branch for human review — it never commits straight to main. Returns the PR URL. Owner-only tool.",
+    'Propose a one-file change to a GitHub repo: creates a branch, commits there, opens a PR — never commits to main. Returns the PR URL. Owner-only.',
     "path, content, message, owner='', repo='', base_branch='main'",
 )
 def github_write_file(
@@ -943,7 +934,7 @@ def _git_extra_header_arg() -> list[str]:
 
 @tool(
     "clone_repo",
-    "Clone a GitHub repo into the coding workspace (repos/<repo>) so you can read, edit, and test multiple files with repo_read_file/repo_write_file/run_shell. Safe to call again later — refreshes the existing clone to the latest branch instead of re-cloning. Works for private repos via GITHUB_TOKEN.",
+    'Clone a GitHub repo into repos/<repo> for multi-file work. Safe to call again — refreshes the existing clone instead of re-cloning. Private repos via GITHUB_TOKEN.',
     "repo, owner='', branch='main'",
 )
 def clone_repo(repo: str, owner: str = "", branch: str = "main") -> str:
@@ -1043,10 +1034,7 @@ def repo_read_file(relpath: str, start_line: int = 1) -> str:
 
 @tool(
     "repo_edit_file",
-    "Make a targeted edit to a file inside a cloned repo by replacing an exact "
-    "text snippet. Much safer than repo_write_file for existing files — never "
-    "rewrites the whole file. old_text must appear EXACTLY once (include enough "
-    "surrounding lines to make it unique). Read the file first with repo_read_file.",
+    'Edit a file in a cloned repo by replacing an exact snippet; never rewrites the whole file. old_text must appear EXACTLY once — include enough surrounding lines to make it unique. Read the file first with repo_read_file.',
     "relpath, old_text, new_text",
 )
 def repo_edit_file(relpath: str, old_text: str, new_text: str) -> str:
@@ -1152,10 +1140,7 @@ def _which(cmd: str) -> bool:
 
 @tool(
     "repo_check",
-    "Run the quality gate on a cloned repo: syntax-check all changed .py files, "
-    "ruff lint, and pytest if a tests/ folder exists. Run this after editing and "
-    "BEFORE committing/pushing. push_branch runs it automatically and refuses to "
-    "push on syntax errors or failing tests.",
+    'Run the quality gate on a cloned repo: syntax-check changed .py files, ruff lint, pytest if tests/ exists. Run after editing, before committing.',
     "repo",
 )
 def repo_check(repo: str) -> str:
@@ -1196,7 +1181,7 @@ def repo_list_files(relpath: str = "") -> str:
 
 @tool(
     "push_branch",
-    "Push locally committed changes from a cloned repo (repos/<repo>) as a new branch and open a pull request for human review — never touches the base branch directly. Commit your changes first via run_shell (cd repos/<repo> && git add -A && git commit -m '...'). Owner-only tool.",
+    'Push committed changes from repos/<repo> as a new branch and open a PR — never touches the base branch. Commit first via run_shell. Owner-only.',
     "repo, branch_name, pr_title, owner='', pr_body='', base_branch='main'",
 )
 def push_branch(
