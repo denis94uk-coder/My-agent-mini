@@ -177,10 +177,13 @@ def test_compaction_counts_against_the_step_budget(monkeypatch):
 def test_system_prompt_stays_within_a_sane_size():
     """
     The system prompt is sent on every call and silently grows every time a
-    tool or playbook is added — it is already ~35k chars (~8.8k tokens), which
-    is larger than the whole transcript budget. Past ~45k the default config
-    stops fitting a 16k-context route, so this fails before a user discovers
-    it as a mid-run provider rejection.
+    tool or playbook is added — with the operating manual attached it is
+    ~26k chars (~6.4k tokens), still larger than the whole transcript budget.
+    Past ~45k the default config stops fitting a 16k-context route, so this
+    fails before a user discovers it as a mid-run provider rejection.
+
+    It got there once: a free-tier route rejected the assembled payload with
+    HTTP 413, and since it was the only route configured, the bot had none.
     """
     prompt = agent.get_agent_system_prompt("You are a test bot.")
     assert len(prompt) < 45_000, (
