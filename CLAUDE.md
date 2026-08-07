@@ -55,7 +55,7 @@ No Docker, no gateway service. SQLite for everything.
 | `memory.py` | Conversations, facts, plans, thread summaries, FTS5 |
 | `concept_graph.py` | NetworkX entity/relation layer over `memory.db` |
 | `tools.py` | All tool impls + registry + owner lock |
-| `tests/` | 162 tests, no Slack/keys/network needed |
+| `tests/` | 207 tests, no Slack/keys/network needed |
 
 Key invariant: **both** the interactive loop and the run engine drive
 `agent.execute_step`. One implementation of the tool protocol. Don't fork it.
@@ -68,6 +68,13 @@ response — works on any provider, no native function calling required.
 - **Never narrate an action without taking it.** `_INTENT_ONLY_PATTERNS` in
   `agent.py` catches "I'll remember that" with no tool call. Live bug: bot said
   it remembered, didn't. Add any new save-intent verb to that list.
+- **Owner lock fails CLOSED.** No `OWNER_SLACK_ID` ⇒ every owner-only tool
+  refuses, for everyone. It used to fail open, which handed shell access to any
+  Slack user on a fresh install. `run_shell`/`run_python` are owner-only.
+- **Owner-only and tier are different axes.** Owner-only = who may invoke.
+  Tier = how far the effect reaches. Only one direction is an invariant:
+  EXTERNAL ⇒ owner-only. `run_shell` is owner-only but WRITE_LOCAL, because
+  gating `ls` behind Slack approval trains people to approve blind.
 - **Unattended ≠ owner-approved.** `OWNER_SLACK_ID` asks "is the human asking
   right now the owner?" — meaningless when cron is the caller. Unattended runs
   block `OWNER_ONLY_TOOLS` (opt-in via schedule `allow_risky`) and always block

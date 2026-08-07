@@ -93,6 +93,21 @@ TOOL_TIERS = {
 }
 
 
+# Owner-only and risk tier are two different axes, and conflating them is a
+# mistake worth naming. OWNER_ONLY_TOOLS answers "which human may invoke
+# this" — run_shell is owner-only because it is remote code execution on the
+# host. The tier answers "how far does the effect reach" — run_shell is
+# WRITE_LOCAL because it stays on this box.
+#
+# The invariant that actually matters runs one way only: anything EXTERNAL
+# must also be owner-only. The converse is false, and asserting it would force
+# `ls` in a scheduled task to raise a Slack approval — which is precisely how
+# an approval queue degrades into a button people press without reading.
+def external_tools() -> set:
+    """Tools whose effects leave this server. These need per-call approval."""
+    return {name for name, tier in TOOL_TIERS.items() if tier == EXTERNAL}
+
+
 def tier_of(tool_name: str) -> str:
     """
     Risk tier for a tool. Unknown tools are EXTERNAL — fail safe, not silent.

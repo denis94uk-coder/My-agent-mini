@@ -705,21 +705,26 @@ def get_conv_key(channel: str, thread_ts: str | None) -> str:
     return f"{channel}:{thread_ts or 'main'}"
 
 
-def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, say, files: list[dict] = None):
+def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, say,
+                    files: list[dict] = None, message_ts: str = None):
     """Process a message through the agent loop, with optional file attachments."""
     conv_key = get_conv_key(channel, thread_ts)
+    # React to the specific message, not the thread root: for a threaded reply
+    # thread_ts points at the root, which would put the hourglass on the wrong
+    # message entirely.
+    react_ts = message_ts or thread_ts
     # Slack reaction gives immediate visual feedback without cluttering the chat.
     loading_reaction = os.getenv("LOADING_REACTION", "hourglass_flowing_sand").strip()
     try:
         if loading_reaction:
-            slack_client.reactions_add(channel=channel, timestamp=thread_ts, name=loading_reaction)
+            slack_client.reactions_add(channel=channel, timestamp=react_ts, name=loading_reaction)
     except Exception as e:
         logger.debug(f"Could not add loading reaction: {e}")
 
     def remove_loading_reaction():
         try:
             if loading_reaction:
-                slack_client.reactions_remove(channel=channel, timestamp=thread_ts, name=loading_reaction)
+                slack_client.reactions_remove(channel=channel, timestamp=react_ts, name=loading_reaction)
         except Exception as e:
             logger.debug(f"Could not remove loading reaction: {e}")
 
@@ -891,6 +896,7 @@ def handle_message(event, say):
 
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event.get("ts")
+    msg_ts = event.get("ts")
     user_text = event.get("text", "").strip()
     user_id = event.get("user", "unknown")
     channel_type = event.get("channel_type", "")
@@ -905,12 +911,12 @@ def handle_message(event, say):
     logger.info(f"💬 DM from {user_id}: {user_text[:80]}...{file_info}")
 
     try:
-        process_message(user_text, channel, thread_ts, user_id, say, files=files)
+        process_message(user_text, channel, thread_ts, user_id, say, files=files, message_ts=msg_ts)
     except Exception as e:
         logger.error(f"❌ Error: {traceback.format_exc()}")
         record_error("process_message", e)
         try:
-            slack_client.reactions_remove(channel=channel, timestamp=thread_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
+            slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
             pass
         say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
@@ -921,6 +927,7 @@ def handle_mention(event, say):
     """Handle @mentions in channels — now with file support."""
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event["ts"]
+    msg_ts = event.get("ts")
     user_id = event.get("user", "unknown")
     user_text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
     files = event.get("files", [])
@@ -933,12 +940,12 @@ def handle_mention(event, say):
     logger.info(f"📢 Mention from {user_id}: {user_text[:80]}...{file_info}")
 
     try:
-        process_message(user_text, channel, thread_ts, user_id, say, files=files)
+        process_message(user_text, channel, thread_ts, user_id, say, files=files, message_ts=msg_ts)
     except Exception as e:
         logger.error(f"❌ Error: {traceback.format_exc()}")
         record_error("process_message", e)
         try:
-            slack_client.reactions_remove(channel=channel, timestamp=thread_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
+            slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
             pass
         say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
@@ -979,6 +986,9 @@ def handle_search(ack, command, say):
 @slack_app.command("/clear")
 def handle_clear(ack, command, say):
     ack()
+    if not tools._is_owner(command.get("user_id", "")):
+        say(text="❌ Only the bot's owner can clear memory.", channel=command["channel_id"])
+        return
     channel = command["channel_id"]
     conn = memory.get_db()
     try:
@@ -1267,6 +1277,14 @@ if __name__ == "__main__":
         logger.info(f"   Operating manual: ✅ loaded ({len(OPERATING_MANUAL)} chars)")
     else:
         logger.info("   Operating manual: none (add operating_manual.md to enable)")
+
+    if not os.getenv("OWNER_SLACK_ID", "").strip():
+        logger.warning(
+            "⚠️  OWNER_SLACK_ID is not set — owner-only tools (run_shell, run_python, "
+            "GitHub writes, restart, deploy, scheduling, background runs) are DISABLED "
+            "for everyone, and /approve will refuse. Set it in .env to your Slack "
+            "member ID (profile → More → Copy member ID)."
+        )
 
     workers, scheduler_on = start_autonomy()
     logger.info(f"   Run workers: {workers} (max {runner.max_steps_default()} steps, "

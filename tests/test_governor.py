@@ -22,6 +22,8 @@ import tools
 @pytest.fixture(autouse=True)
 def temp_db(tmp_path, monkeypatch):
     monkeypatch.setattr(memory, "DB_PATH", tmp_path / "memory.db")
+    # The owner lock fails closed; these tests exercise execution, not auth.
+    monkeypatch.setenv("OWNER_SLACK_ID", "default")
     monkeypatch.setattr(runner, "_CALL_AI", None)
     monkeypatch.setattr(runner, "_POST_MESSAGE", None)
     monkeypatch.setenv("CRITIC_ENABLED", "false")
@@ -77,10 +79,24 @@ def test_representative_tiers(tool_name, tier):
     assert governor.tier_of(tool_name) == tier
 
 
-def test_every_owner_only_tool_is_external():
-    """Owner-only and externally-visible must not drift apart."""
-    for name in tools.OWNER_ONLY_TOOLS:
-        assert governor.tier_of(name) == governor.EXTERNAL, name
+def test_every_external_tool_is_owner_only():
+    """
+    The invariant runs one way. Anything whose effects leave this server must
+    also be owner-gated, or the approval queue guards a door with no lock.
+
+    The converse is deliberately NOT asserted: run_shell and run_python are
+    owner-only (they are code execution on the host) but WRITE_LOCAL (the
+    effect stays on this box). Requiring a Slack approval for every `ls` in a
+    scheduled task is how an approval queue becomes a reflex.
+    """
+    for name in governor.external_tools():
+        assert name in tools.OWNER_ONLY_TOOLS, f"{name} is EXTERNAL but not owner-only"
+
+
+def test_code_execution_is_owner_only_without_being_external():
+    for name in ("run_shell", "run_python"):
+        assert name in tools.OWNER_ONLY_TOOLS, name
+        assert governor.tier_of(name) == governor.WRITE_LOCAL, name
 
 
 # ── Approval queue ──
