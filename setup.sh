@@ -1,14 +1,17 @@
 #!/bin/bash
 ###############################################################################
-#  My-Agent-Mini v2 — One-Command Setup
-#  Tested on: Ubuntu 22.04 / 24.04, Debian 12, Google Cloud e2-micro
+#  My-Agent-Mini — One-Command Setup
+#  Tested on: Ubuntu 22.04 / 24.04, Debian 12
+#  Runs on: Google Cloud e2-micro (reference deployment), any comparable
+#           1 GB VM, or self-hosted hardware. Nothing here is cloud-specific
+#           — it needs Ubuntu/Debian, systemd, and outbound HTTPS.
 #  Usage: curl -sSL https://raw.githubusercontent.com/denis94uk-coder/my-agent-mini/main/setup.sh | bash
 ###############################################################################
 
 set -e
 
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║       🤖 My-Agent-Mini v2 — Smart Agent Setup           ║"
+echo "║       🤖 My-Agent-Mini — Autonomous Agent Setup          ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -55,7 +58,7 @@ SERVICE_FILE="/etc/systemd/system/my-agent.service"
 
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=My Agent Mini v2 — AI Slack Bot
+Description=My Agent Mini — autonomous AI Slack agent
 After=network-online.target
 Wants=network-online.target
 
@@ -80,7 +83,7 @@ echo "   ✅ Service configured (auto-starts on boot)"
 # ── Done ──
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  ✅ My-Agent-Mini v2 installed successfully!             ║"
+echo "║  ✅ My-Agent-Mini installed successfully!                ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║                                                          ║"
 echo "║  Next steps:                                             ║"
@@ -96,6 +99,7 @@ echo "║                                                          ║"
 echo "║  4. Watch logs:                                          ║"
 echo "║     sudo journalctl -u my-agent -f                       ║"
 echo "║                                                          ║"
-echo "║  New in v2: 🔍 Web search • 🧠 Persistent memory        ║"
-echo "║             🐍 Python exec • 🔄 Agent loop               ║"
+echo "║  Autonomy: ⏰ Schedules • 🏃 Durable background runs     ║"
+echo "║            🔍 Critic gate • 🖐️  Approval queue           ║"
+echo "║  Slack: /runs /schedules /approvals /costs /health       ║"
 echo "╚══════════════════════════════════════════════════════════╝"

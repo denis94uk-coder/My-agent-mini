@@ -9,12 +9,18 @@ Flow:
 
 Works with ANY LLM provider (Gemini, Groq, xAI, etc.) — no native function
 calling required. Uses a simple text-based protocol.
+
+The loop is built from `execute_step`, one AI call + at most one tool run.
+`run_agent_loop` drives it synchronously for interactive Slack replies;
+`runner.py` drives the same primitive one step at a time, persisting each
+step to SQLite so an autonomous run can survive a restart and resume.
 """
 
 import re
 import json
 import logging
 
+import critic
 import tools
 
 logger = logging.getLogger("my-agent-mini")
@@ -22,7 +28,7 @@ logger = logging.getLogger("my-agent-mini")
 MAX_ITERATIONS = 10  # Safety limit to prevent infinite loops
 
 
-def get_agent_system_prompt(base_prompt: str, user_facts: dict[str, list[str]] = None) -> str:
+def get_agent_system_prompt(base_prompt: str, user_facts: dict[str, list[str]] | None = None) -> str:
     """Build the full system prompt with tool descriptions."""
     tools_desc = tools.get_tools_description()
 
@@ -132,6 +138,12 @@ TOOL SELECTION GUIDE:
 - update_task → mark a plan step 'in_progress' or 'done' as you complete it
 - list_tasks → check what's left on the current plan (use this if a task
   looks like a continuation of earlier work)
+- start_background_run → hand off work that won't fit in this reply (long
+  research, a big multi-file change, anything with waiting in it). You get a
+  run id back immediately; the result is posted to this thread when it's done
+- schedule_task / list_schedules / cancel_schedule → make something happen
+  automatically, later and repeatedly, with nobody present
+- run_status → check a background run you (or a schedule) started
 
 ═══════════════════════════════════════════════
 DOMAIN PLAYBOOKS (reusable skills)
@@ -207,6 +219,27 @@ Use web_search / fetch_url to pull current form, injuries, and odds from
 public sources, reason over them yourself, and always caveat that this is
 analysis, not a guaranteed outcome — never invent stats you didn't
 actually look up.
+
+**Working autonomously (background runs + schedules)** — you are not limited
+to what fits in one reply:
+  - A task with a lot of steps, a long wait, or an open-ended search →
+    start_background_run(goal). Write the goal as a complete standalone
+    instruction: the run starts with no conversation context beyond what you
+    put in that text. Tell the user the run id, then finish your reply — do
+    NOT sit and wait for it.
+  - "Every morning...", "each Monday...", "check X regularly" →
+    schedule_task(name, when, goal). Same rule: the goal must stand alone,
+    because nobody will be there to clarify it. Confirm the first fire time
+    back to the user.
+  - Unattended runs (scheduled work, resumed plans) cannot deploy, push,
+    restart services, or create more schedules. If a scheduled goal needs
+    one of those, do everything up to that line and report what a human
+    needs to run — don't pretend it shipped.
+  - Any plan you leave unfinished gets picked up automatically once the
+    thread goes quiet, so it's better to create a real plan (create_plan)
+    and mark steps honestly than to over-promise in one message. If you're
+    resumed by that mechanism, start with list_tasks and memory_search to
+    rebuild context before acting.
 
 **Coding practices** — this repo carries `skills/coding-practices/` (24
 reference files vendored from addyosmani/agent-skills, MIT licensed) for
@@ -307,6 +340,139 @@ def extract_final_text(text: str) -> str:
     return cleaned.strip()
 
 
+NUDGE_MESSAGE = (
+    "[SYSTEM NUDGE] You described an action but did not include a "
+    "[TOOL_CALL] block to actually perform it. Do not repeat the "
+    "description — immediately output the [TOOL_CALL] block for "
+    "that exact action now."
+)
+
+
+def tool_result_message(tool_name: str, tool_result: str) -> str:
+    """The user-role turn we feed back after running a tool."""
+    return (
+        f"[TOOL_RESULT for {tool_name}]\n{tool_result}\n[/TOOL_RESULT]\n\n"
+        "Use this result to answer the user's question. If you need more "
+        "information, use another tool. Otherwise, give your final answer."
+    )
+
+
+class StepOutcome:
+    """
+    What happened in one agent iteration.
+
+    kind:
+      "tool"   — a tool ran; `tool_name`/`tool_args`/`tool_result` are set
+      "nudge"  — the model narrated an action without calling a tool, and we
+                 pushed it to actually act instead of ending the turn
+      "final"  — no tool call and no unactioned intent: this is the answer
+      "paused" — the tool needs human approval. It has NOT run and nothing was
+                 appended to the transcript; the caller parks the run and
+                 replays this exact call once a human decides.
+    """
+
+    __slots__ = ("kind", "response", "tool_args", "tool_name", "tool_result")
+
+    def __init__(self, kind, response, tool_name=None, tool_args=None, tool_result=None):
+        self.kind = kind
+        self.response = response
+        self.tool_name = tool_name
+        self.tool_args = tool_args
+        self.tool_result = tool_result
+
+
+def execute_step(
+    working_messages: list[dict],
+    call_ai_fn,
+    full_prompt: str,
+    user_id: str = "default",
+    conv_key: str = "default",
+    allow_nudge: bool = True,
+    blocked_tools: set | None = None,
+    approval_fn=None,
+    on_tool_call=None,
+) -> StepOutcome:
+    """
+    Run exactly one iteration: call the AI, and execute a tool if it asked for one.
+
+    Appends the resulting turns to `working_messages` in place (except for a
+    final answer, which the caller decides what to do with). Callers that need
+    durability persist the returned outcome after each call.
+
+    blocked_tools: names refused before execution, with the refusal fed back as
+        the tool result. Used for unattended runs, where nobody is watching to
+        approve a deploy or a service restart.
+    approval_fn: optional (tool_name, args) -> bool. False means the tool needs
+        a human decision first: nothing runs, nothing is appended, and the
+        caller gets a "paused" outcome to park on. Distinct from blocked_tools,
+        which is a flat no the agent works around immediately.
+    """
+    response = call_ai_fn(working_messages, full_prompt)
+    tool_call = parse_tool_call(response)
+
+    if tool_call is None:
+        # The model didn't include a [TOOL_CALL] block. Usually that means
+        # it's truly done. But sometimes it just *narrates* the next step
+        # ("Now, I will save the file.") without acting — if we return that
+        # as the final answer, the bot looks stuck and the user has to say
+        # "ok" to nudge it along. Catch that case and auto-continue.
+        if allow_nudge and looks_like_unactioned_intent(response):
+            working_messages.append({"role": "assistant", "content": response})
+            working_messages.append({"role": "user", "content": NUDGE_MESSAGE})
+            return StepOutcome("nudge", response)
+        return StepOutcome("final", response)
+
+    tool_name = tool_call["tool"]
+    tool_args = tool_call["args"] if isinstance(tool_call.get("args"), dict) else {}
+
+    # Pass user_id / conv_key to memory + planner tools automatically —
+    # the model only needs to specify the task-relevant args.
+    if tool_name == "remember":
+        tool_args["user_id"] = user_id
+    if tool_name in ("create_plan", "update_task", "list_tasks"):
+        tool_args["conv_key"] = conv_key
+    if tool_name == "create_plan":
+        tool_args["user_id"] = user_id
+    # Autonomy tools report back to the conversation that started them.
+    for context_arg in tools.CONTEXT_TOOLS.get(tool_name, ()):
+        tool_args[context_arg] = {"_user_id": user_id, "_conv_key": conv_key}[context_arg]
+    # Owner-gated tools need to know who is actually asking, so a
+    # non-owner can't get the model to run them on their behalf.
+    if tool_name in tools.OWNER_ONLY_TOOLS:
+        tool_args["_requesting_user_id"] = user_id
+
+    # Approval is checked before the block list: "ask a human" is a better
+    # answer than "refused" when a human is reachable.
+    if approval_fn is not None and not approval_fn(tool_name, tool_args):
+        logger.info(f"🖐️ Tool {tool_name} needs approval — pausing instead of running it")
+        return StepOutcome("paused", response, tool_name, tool_args)
+
+    logger.info(f"🔧 Using tool: {tool_name}({json.dumps(tool_args, default=str)[:100]})")
+    if blocked_tools and tool_name in blocked_tools:
+        tool_result = (
+            f"❌ Blocked: '{tool_name}' cannot run in an unattended background run — "
+            "it changes state outside this server and nobody is watching to approve it. "
+            "Do the rest of the work, then report that this step needs a human to run it."
+        )
+        logger.info(f"⛔ Blocked tool in unattended run: {tool_name}")
+    else:
+        tool_result = tools.run_tool(tool_name, tool_args)
+    logger.info(f"📋 Tool result: {tool_result[:200]}...")
+
+    # Let the caller surface plan creation/updates live in Slack instead
+    # of them only being visible inside the model's own reasoning.
+    if on_tool_call and tool_name in ("create_plan", "update_task"):
+        try:
+            on_tool_call(tool_name, tool_result)
+        except Exception:
+            logger.warning("on_tool_call callback failed", exc_info=True)
+
+    working_messages.append({"role": "assistant", "content": response})
+    working_messages.append({"role": "user", "content": tool_result_message(tool_name, tool_result)})
+
+    return StepOutcome("tool", response, tool_name, tool_args, tool_result)
+
+
 def run_agent_loop(
     messages: list[dict],
     call_ai_fn,
@@ -343,89 +509,68 @@ def run_agent_loop(
     working_messages = list(messages)
     narration_nudges_used = 0
 
+    # For the critic gate: the goal it grades against, and the tool evidence
+    # it grades with.
+    goal_text = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
+    )
+    tool_trail = []
+    critic_rounds = 0
+    unresolved = ""
+
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"🔄 Agent loop iteration {iteration + 1}/{MAX_ITERATIONS}")
 
-        # Call AI with current messages
-        response = call_ai_fn(working_messages, full_prompt)
+        outcome = execute_step(
+            working_messages,
+            call_ai_fn,
+            full_prompt,
+            user_id=user_id,
+            conv_key=conv_key,
+            allow_nudge=(
+                narration_nudges_used < MAX_NARRATION_NUDGES
+                and iteration < MAX_ITERATIONS - 1
+            ),
+            on_tool_call=on_tool_call,
+        )
 
-        # Check for tool call
-        tool_call = parse_tool_call(response)
-
-        if tool_call is None:
-            # The model didn't include a [TOOL_CALL] block. Usually that means
-            # it's truly done. But sometimes it just *narrates* the next step
-            # ("Now, I will save the file.") without acting — if we return
-            # that as the final answer, the bot looks stuck and the user has
-            # to say "ok" to nudge it along. Catch that case and auto-continue
-            # instead of ending the turn.
+        if outcome.kind == "final":
+            # Critic gate (off by default here — see critic.interactive_enabled;
+            # a human is reading this reply and can push back themselves).
             if (
-                looks_like_unactioned_intent(response)
-                and narration_nudges_used < MAX_NARRATION_NUDGES
+                critic.interactive_enabled()
+                and critic_rounds < critic.max_rounds()
                 and iteration < MAX_ITERATIONS - 1
             ):
-                narration_nudges_used += 1
-                logger.info(
-                    f"⏭️ Detected unactioned intent (nudge {narration_nudges_used}/"
-                    f"{MAX_NARRATION_NUDGES}), auto-continuing instead of stopping"
+                verdict = critic.review(
+                    goal_text, tool_trail, extract_final_text(outcome.response), call_ai_fn
                 )
-                working_messages.append({"role": "assistant", "content": response})
-                working_messages.append({
-                    "role": "user",
-                    "content": (
-                        "[SYSTEM NUDGE] You described an action but did not include a "
-                        "[TOOL_CALL] block to actually perform it. Do not repeat the "
-                        "description — immediately output the [TOOL_CALL] block for "
-                        "that exact action now."
-                    ),
-                })
-                continue
+                if not verdict.accepted:
+                    critic_rounds += 1
+                    unresolved = verdict.reason
+                    logger.info(f"🔁 Critic sent the answer back (round {critic_rounds})")
+                    working_messages.append({"role": "assistant", "content": outcome.response})
+                    working_messages.append({
+                        "role": "user",
+                        "content": critic.revision_message(verdict.reason),
+                    })
+                    continue
+                unresolved = ""
 
-            # No tool call — this is the final answer
             logger.info("✅ Agent gave final answer")
-            return response
+            if unresolved:
+                return outcome.response + critic.unresolved_note(unresolved)
+            return outcome.response
 
-        # Execute the tool
-        tool_name = tool_call["tool"]
-        tool_args = tool_call["args"]
+        if outcome.kind == "tool":
+            tool_trail.append({"tool": outcome.tool_name, "result": outcome.tool_result})
 
-        # Pass user_id / conv_key to memory + planner tools automatically —
-        # the model only needs to specify the task-relevant args.
-        if tool_name == "remember":
-            tool_args["user_id"] = user_id
-        if tool_name in ("create_plan", "update_task", "list_tasks"):
-            tool_args["conv_key"] = conv_key
-        if tool_name == "create_plan":
-            tool_args["user_id"] = user_id
-        # Owner-gated tools need to know who is actually asking, so a
-        # non-owner can't get the model to run them on their behalf.
-        if tool_name in tools.OWNER_ONLY_TOOLS:
-            tool_args["_requesting_user_id"] = user_id
-
-        logger.info(f"🔧 Using tool: {tool_name}({json.dumps(tool_args)[:100]})")
-        tool_result = tools.run_tool(tool_name, tool_args)
-        logger.info(f"📋 Tool result: {tool_result[:200]}...")
-
-        # Let the caller surface plan creation/updates live in Slack instead
-        # of them only being visible inside the model's own reasoning.
-        if on_tool_call and tool_name in ("create_plan", "update_task"):
-            try:
-                on_tool_call(tool_name, tool_result)
-            except Exception:
-                logger.warning("on_tool_call callback failed", exc_info=True)
-
-        # Get any text the AI said before/after the tool call
-        preamble = extract_final_text(response)
-
-        # Add the AI's response and tool result to the conversation
-        working_messages.append({
-            "role": "assistant",
-            "content": response,
-        })
-        working_messages.append({
-            "role": "user",
-            "content": f"[TOOL_RESULT for {tool_name}]\n{tool_result}\n[/TOOL_RESULT]\n\nUse this result to answer the user's question. If you need more information, use another tool. Otherwise, give your final answer.",
-        })
+        if outcome.kind == "nudge":
+            narration_nudges_used += 1
+            logger.info(
+                f"⏭️ Detected unactioned intent (nudge {narration_nudges_used}/"
+                f"{MAX_NARRATION_NUDGES}), auto-continuing instead of stopping"
+            )
 
     # Hit max iterations — return what we have
     logger.warning(f"⚠️ Agent hit max iterations ({MAX_ITERATIONS})")

@@ -10,7 +10,8 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 - **Automatic fallback** — skips rate-limited/unhealthy routes with cooldowns
 - **Slack Integration** — DMs, @mentions, slash commands (`/ask`, `/clear`, `/providers`)
 - **Threaded Conversations** — Maintains context within Slack threads
-- **Zero Cost** — Runs on Oracle Cloud free tier + free AI APIs
+- **Near-zero cost** — runs on a Google Cloud e2-micro (or any 1 GB always-free
+  VM) with a keyless AI route; an optional paid route is tried last and capped
 - **Lightweight** — ~50MB RAM, single Python process
 - **Auto-restart** — Systemd service keeps it running 24/7
 - **Domain skills** — GitHub automation, server administration, and static
@@ -18,6 +19,9 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 - **Durable project memory** — decisions and completed-task summaries
   persist across separate Slack threads/conversations, not just within one
   thread (see below)
+- **Autonomous execution** — background runs that survive restarts,
+  schedules that start work with nobody present, and automatic resumption
+  of unfinished plans (see below)
 
 ## 🧠 Memory model
 
@@ -38,6 +42,153 @@ preferences and only the most recent ones are kept in context — they're
 not meant to be load-bearing. If something needs to survive long-term
 (a roadmap item, an explicit instruction, an architecture choice), it
 should be stored as a `decision`.
+
+## 🤖 Autonomy: runs, schedules, and self-resuming plans
+
+Everything else in the bot starts with a human typing. These three
+mechanisms let it work without that.
+
+### Background runs
+
+A **run** is a durable task. Every step is written to SQLite (`runs` and
+`run_events`) *before* the next one starts, so a run can be cancelled,
+inspected, and — after a crash or a `systemctl restart` — resumed exactly
+where it stopped, with its context intact, instead of starting the task
+over. Runs execute on background worker threads, so long work never blocks
+the chat.
+
+```
+/runs              list recent runs
+/runs 12           detail + result for run #12
+/runs cancel 12    stop it at its next step boundary
+```
+
+The agent starts one itself via `start_background_run` when work won't fit
+in a single reply.
+
+### Schedules
+
+`schedule_task` (owner only) makes something happen later, repeatedly, with
+nobody present — this is what turns the bot from reactive to self-starting.
+
+| Spec | Meaning |
+|---|---|
+| `every 15m`, `every 2h`, `every 1d` | fixed interval (minimum 1 minute) |
+| `hourly` | on the hour |
+| `daily 09:00` | every day at 09:00 |
+| `weekly mon 08:15` | Mondays at 08:15 |
+| `0 9 * * 1-5` | raw 5-field cron — weekdays at 09:00 |
+
+Times are the **server's** local timezone. `/schedules` lists them,
+`/schedules cancel <name>` removes one.
+
+### Self-resuming plans
+
+`create_plan` already stored multi-step plans, but nothing drove them
+forward: if the agent stopped at step 3 of 7, those steps sat there until
+someone spoke. Now a sweeper picks them up — but only once **both** the
+plan and its Slack thread have been idle for `PLAN_STALE_SECONDS`
+(default 10 min). That idle check is deliberate: it means the bot never
+talks over someone who is mid-conversation or interrupts a plan that's
+genuinely waiting on a human answer. Capped at `PLAN_MAX_RESUMES` per
+conversation per day.
+
+### Critic gate
+
+The agent decides for itself when it's finished — which is exactly where
+this bot has failed before (announcing it saved something it never saved).
+So after a final answer, a separate AI pass re-reads the goal, the **tool
+transcript**, and the proposed answer, and returns `ACCEPT` or `REVISE` +
+a specific reason. A `REVISE` goes back into the loop as another turn.
+
+It generalizes what `_run_quality_gate` already does for code — run an
+independent check before accepting, refuse to ship what fails it — to tasks
+with no test suite to run. The critic grades against tool results only; the
+agent's own prose is never evidence for itself.
+
+Three behaviours worth knowing, each deliberate:
+
+- **Fails open.** An unparseable or erroring critic ACCEPTs (logged). A
+  broken grader must not become a broken agent.
+- **A reported blocker counts as done.** An unattended run that stopped at a
+  blocked deploy and said so is finished — otherwise the gate would demand
+  the impossible thing every round until the cap.
+- **The cap ships the work.** After `CRITIC_MAX_ROUNDS`, the result is
+  delivered with the unresolved critique appended, so the concern reaches
+  the human instead of being silently dropped.
+
+On for background runs, off for live chat by default (`CRITIC_INTERACTIVE`)
+— a human reading a reply can push back themselves; nobody is reading an
+unattended run. Each critic call counts against the run's step budget.
+
+### Governor: risk tiers and human approval
+
+The `OWNER_SLACK_ID` lock answers *"is the human asking right now the
+owner?"* — which means nothing once a cron job is the caller. The governor
+adds the middle option between "allowed" and "refused": **ask**.
+
+Every tool has a risk tier — `read`, `write_local`, `external`. In an
+unattended run:
+
+| Tier | What happens |
+|---|---|
+| `read`, `write_local` | Runs. Asking permission to run `ls` just teaches people to approve without reading. |
+| `external` (deploy, push, restart, schedule) | The run **pauses on disk** and asks in Slack. |
+| Run-spawning tools | Always refused. Asking can't make a fork bomb safe. |
+
+```
+/approvals          what's waiting
+/approve 3          run it, exactly as requested
+/deny 3 wrong week  refuse it; the agent finishes without it and says so
+```
+
+Only the owner can decide. A schedule marked `allow_risky` skips the queue —
+pre-authorised, so a nightly deploy doesn't ask every night.
+
+Three properties are deliberate:
+
+- **Expiry is a deny.** An unanswered request times out (24h default) and the
+  run resumes with a refusal. Silence must never become consent.
+- **Pausing is durable.** The request is a row in SQLite and the run's status
+  is `awaiting_approval`. Restart the service and it's still waiting; approve
+  it a day later and the *exact* call it asked for runs, not a re-derived one.
+- **Unclassified tools are EXTERNAL.** Forgetting to classify a new deploy
+  tool is far worse than one unnecessary approval. A test asserts every
+  registered tool has a tier, so the default never fires in practice.
+
+### Cost accounting
+
+`/costs` shows AI calls per provider. Free routes are best-effort; a paid
+backup is a real monthly budget, and an agent that starts its own work can
+spend it unattended. Name the paid routes (`PAID_PROVIDERS`) and cap them per
+day (`PAID_DAILY_LIMIT`) — past the cap they drop out of rotation while free
+routes keep serving, so the bot degrades instead of stopping.
+
+### Other limits on unattended work
+
+- **Approvals off?** Then external tools are a flat no again — there is
+  nobody to ask, so the run does everything up to that line and reports it.
+- **Creating more autonomous work is always refused**, opt-in or not: a run
+  that can queue runs is one bad reasoning step from a fork bomb of them.
+- **Budgets** — per-run step and time caps (`RUN_MAX_STEPS`,
+  `RUN_MAX_SECONDS`); on hitting one the run reports what it finished
+  rather than vanishing. Plus a daily cap on self-started runs
+  (`RUN_DAILY_LIMIT`) so a misfiring schedule can't spin. Runs *you* ask
+  for are never blocked by that cap.
+- **Every step is auditable** in `run_events`, including refusals and
+  approval decisions.
+- **A hung run can't hide.** Each step writes a heartbeat; the scheduler fails
+  any run that stops heartbeating (`RUN_STUCK_SECONDS`). Without it a run hung
+  inside a tool stays `running` forever — and `running` counts as active, so
+  its schedule would never fire again.
+
+See `.env.example` for all the knobs.
+
+### Tests
+
+```bash
+pytest tests/ -q     # 162 tests, no Slack workspace or API keys needed
+```
 
 ## 🛠️ Domain Skills
 
@@ -83,16 +234,26 @@ The built-in router can also use the provider integrations already in the bot, i
 
 ## 🚀 Quick Start
 
-### 1. Create Oracle Cloud Free Instance
+### 1. Create a free VM
 
-- Shape: `VM.Standard.E2.1.Micro` (1 OCPU, 1 GB) — Always Free
-- Or: `VM.Standard.A1.Flex` (up to 4 OCPU, 24 GB) — Always Free (if available)
-- OS: Ubuntu 22.04
+Reference deployment is a **Google Cloud e2-micro** (2 vCPU burst, 1 GB RAM,
+always-free tier in `us-west1`, `us-central1`, or `us-east1`), Ubuntu 22.04.
+Anything comparable works — Oracle's `VM.Standard.E2.1.Micro` is the same
+class of box, and the setup below is identical on both.
+
+The 1 GB ceiling is a real design constraint, not a footnote: it's why there
+is no Docker, no gateway service, no vector database, and why background runs
+default to 2 workers.
+
+Moving to self-hosted hardware later needs no different install: `setup.sh`
+only assumes Ubuntu/Debian, systemd, and outbound HTTPS. What *does* change
+is the tuning — see "Self-hosting" below.
 
 ### 2. SSH into your server
 
 ```bash
-ssh -i your-key.key ubuntu@YOUR-SERVER-IP
+gcloud compute ssh your-instance-name        # GCP
+ssh -i your-key.key ubuntu@YOUR-SERVER-IP    # or plain SSH anywhere else
 ```
 
 ### 3. Run setup script
@@ -137,6 +298,12 @@ sudo journalctl -u my-agent -f  # live logs
 | `/ask <question>` | Quick one-shot question |
 | `/clear` | Reset conversation memory |
 | `/providers` | Show routes, keyless/key-backed status, and cooldown health |
+| `/runs` | List background runs (`/runs <id>`, `/runs cancel <id>`) |
+| `/schedules` | List scheduled tasks (`/schedules cancel <name>`) |
+| `/approvals` | What the agent is waiting on a human to authorise |
+| `/approve <id>` / `/deny <id> <why>` | Decide a pending request (owner only) |
+| `/costs` | AI calls per provider, paid routes tracked separately |
+| `/status`, `/health` | Capabilities snapshot / deep operational health |
 
 ## 🔧 Management Commands
 
@@ -162,22 +329,49 @@ sudo systemctl restart my-agent
 
 ```
 my-agent-mini/
-├── bot.py              # Main bot (single file, ~300 lines)
-├── agent.py            # ReAct agent loop + system prompt
+├── bot.py              # Slack app: events, slash commands, provider router
+├── agent.py            # ReAct loop + the execute_step primitive + prompt
+├── runner.py           # Durable run engine (queue, workers, resume, budgets)
+├── triggers.py         # Schedules + the stalled-plan sweeper
 ├── memory.py           # SQLite-backed durable + recent memory
+├── concept_graph.py    # NetworkX entity/relationship layer over memory.db
 ├── tools.py            # Tool implementations
-├── requirements.txt    # Python dependencies (3 packages)
+├── critic.py           # Critic gate: is "done" actually done?
+├── governor.py         # Risk tiers, approval queue, cost accounting
+├── tests/              # 162 tests — no Slack or API keys needed
+├── requirements.txt    # Python dependencies
 ├── setup.sh            # One-click server setup
-├── .env.example        # Template for API keys
+├── .env.example        # Template for API keys + autonomy settings
 ├── .gitignore          # Protects .env
 ├── skills/
 │   └── coding-practices/  # 24 reference skill files (see README above)
 └── README.md           # This file
 ```
 
+## 🏠 Self-hosting (more than 1 GB)
+
+The defaults are sized for a 1 GB always-free VM. On self-hosted hardware
+with real memory, three things are worth revisiting — none of them require
+code changes:
+
+| Setting | Why it changes |
+|---|---|
+| `RUN_WORKERS=2` | Sized for 1 GB. More RAM means more concurrent runs. |
+| `RUN_CONTEXT_LIMIT_CHARS=24000` | Sized for an 8k-context free route. A larger local model folds later and loses less detail. |
+| `PAID_DAILY_LIMIT` | Largely moot if a local model becomes the fallback. |
+
+`CUSTOM_LLM_URL` already points the router at any OpenAI-compatible endpoint,
+so a locally hosted model (llama.cpp, Ollama, vLLM) slots in as a route with
+no code change — and unlike the paid gateway, it costs nothing per call, so
+`PAID_PROVIDERS` can simply stop naming anything.
+
+The one architectural decision tied to the small box is the deferral of
+sub-agent delegation (see `CLAUDE.md`). That was declined on RAM and AI-call
+cost, both of which self-hosting changes — worth re-opening then, not now.
+
 ## 🔗 Related
 
-- **[My-Agent](https://github.com/denis94uk-coder/My-agent)** — Full version with Docker, LiteLLM, web dashboard, and 12 AI providers. Needs 4 OCPU / 24 GB (Oracle A1.Flex).
+- **[My-Agent](https://github.com/denis94uk-coder/My-agent)** — Full version with Docker, LiteLLM, web dashboard, and 12 AI providers. Needs a much larger box (4 vCPU / 24 GB).
 
 ## 💡 How Hybrid Failover Works
 
@@ -191,6 +385,10 @@ User sends message in Slack
  Send response back to Slack
 ```
 
+Paid routes are always sorted **last**, whatever order they were registered
+in, and drop out entirely once `PAID_DAILY_LIMIT` is reached — so a free route
+is never skipped in favour of one that costs money.
+
 If a route is rate-limited, returns an error, or times out, the bot automatically cools it down and tries the next healthy route. The router is best-effort: it cannot guarantee unlimited free access, bypass authentication, or make an unavailable service work.
 
 ## 📊 Resource Usage
@@ -200,4 +398,6 @@ If a route is rate-limited, returns an error, or times out, the bot automaticall
 - **Disk:** < 100 MB total
 - **Network:** Minimal (API calls only)
 
-Perfect for Oracle's E2.1.Micro (1 GB RAM) free instance!
+Comfortable on a 1 GB always-free instance (Google e2-micro, Oracle
+E2.1.Micro). Background runs add roughly 10-20 MB per active worker while
+they're executing; `RUN_WORKERS=2` is the default for that reason.

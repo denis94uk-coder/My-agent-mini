@@ -50,6 +50,9 @@ from slack_sdk import WebClient
 import memory
 import tools
 import agent
+import governor
+import runner
+import triggers
 import concept_graph
 
 # ── Logging ──
@@ -360,7 +363,17 @@ def build_providers():
         else:
             PROVIDERS.append(keyless_provider)
 
+    # Paid routes go last, whatever order they were registered in. Registration
+    # order is just the order the blocks are written above — which had NVIDIA's
+    # free tier sitting *behind* the paid gateway, so a Pollinations failure
+    # would spend credit while a free route went untried. A stable sort keeps
+    # every other preference (keyless first, then the free keys in order) intact.
+    PROVIDERS.sort(key=lambda p: 1 if governor.is_paid(p["name"]) else 0)
+
+    paid = [p["name"] for p in PROVIDERS if governor.is_paid(p["name"])]
     logger.info(f"🧠 Loaded {len(PROVIDERS)} AI routes: {[p['name'] for p in PROVIDERS]}")
+    if paid:
+        logger.info(f"💳 Paid routes (tried last, capped daily): {paid}")
 
 
 # ── File Handling ──
@@ -627,6 +640,20 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
         providers_order = vision + others
 
     available = [p for p in providers_order if _provider_is_available(p)]
+
+    # Paid routes are a real monthly budget, and an agent that starts its own
+    # work can spend it while nobody is looking. Past the daily cap they drop
+    # out of rotation — free routes still serve, so the bot degrades rather
+    # than stopping.
+    if governor.paid_budget_exhausted():
+        affordable = [p for p in available if not governor.is_paid(p["name"])]
+        if affordable and len(affordable) < len(available):
+            logger.info(
+                f"💳 Paid daily cap reached ({governor.paid_calls_today()} calls) — "
+                "using free routes only"
+            )
+            available = affordable
+
     if not available:
         return "❌ All AI routes are temporarily cooling down after errors or rate limits. Try again shortly."
 
@@ -645,6 +672,11 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
                 result = call_openai_compat(provider, messages, system_prompt, provider_images)
 
             _record_provider_success(provider)
+            governor.record_ai_call(
+                provider["name"],
+                input_chars=sum(len(m.get("content") or "") for m in messages) + len(system_prompt),
+                output_chars=len(result or ""),
+            )
             logger.info(f"✅ {provider['name']} responded in {round(time.time() - start, 1)}s")
             return result
 
@@ -972,6 +1004,122 @@ def handle_providers(ack, command, say):
     say(text="\n".join(lines), channel=command["channel_id"])
 
 
+@slack_app.command("/runs")
+def handle_runs(ack, command, say):
+    """Show background runs, or cancel one with `/runs cancel <id>`."""
+    ack()
+    channel = command["channel_id"]
+    text = command.get("text", "").strip().split()
+
+    if text and text[0] == "cancel":
+        if len(text) < 2 or not text[1].isdigit():
+            say(text="Usage: `/runs cancel <run id>`", channel=channel)
+            return
+        run_id = int(text[1])
+        if runner.cancel_run(run_id):
+            say(text=f"🛑 Run #{run_id} cancelled (it stops at its next step).", channel=channel)
+        else:
+            say(text=f"Run #{run_id} isn't queued or running.", channel=channel)
+        return
+
+    if text and text[0].isdigit():
+        say(text=tools.run_tool("run_status", {"run_id": int(text[0])}), channel=channel)
+        return
+
+    say(
+        text="🏃 *Background runs*\n\n" + runner.format_runs()
+        + "\n\n_`/runs <id>` for detail, `/runs cancel <id>` to stop one._",
+        channel=channel,
+    )
+
+
+@slack_app.command("/schedules")
+def handle_schedules(ack, command, say):
+    """Show scheduled tasks, or cancel one with `/schedules cancel <name>`."""
+    ack()
+    channel = command["channel_id"]
+    text = command.get("text", "").strip().split(maxsplit=1)
+
+    if text and text[0] == "cancel":
+        if len(text) < 2:
+            say(text="Usage: `/schedules cancel <name>`", channel=channel)
+            return
+        if triggers.cancel_schedule(text[1].strip()):
+            say(text=f"✅ Schedule '{text[1].strip()}' cancelled.", channel=channel)
+        else:
+            say(text=f"❌ No schedule named '{text[1].strip()}'.", channel=channel)
+        return
+
+    say(
+        text="⏰ *Scheduled tasks*\n\n" + triggers.format_schedules()
+        + "\n\n_`/schedules cancel <name>` to remove one._",
+        channel=channel,
+    )
+
+
+@slack_app.command("/approvals")
+def handle_approvals(ack, command, say):
+    """Show what the agent is waiting on a human to authorise."""
+    ack()
+    say(text="🖐️ *Waiting for approval*\n\n" + governor.format_approvals(),
+        channel=command["channel_id"])
+
+
+def _decide_approval(command, say, approved: bool):
+    channel = command["channel_id"]
+    parts = command.get("text", "").strip().split(maxsplit=1)
+    verb = "approve" if approved else "deny"
+    if not parts or not parts[0].isdigit():
+        say(text=f"Usage: `/{verb} <approval id>`" + ("" if approved else " `<optional reason>`"),
+            channel=channel)
+        return
+
+    approval_id = int(parts[0])
+    note = parts[1] if len(parts) > 1 else ""
+    user_id = command.get("user_id", "")
+
+    # Only the owner decides. An approval queue anyone can answer is not a
+    # control, and the runs behind it act with the owner's credentials.
+    if not tools._is_owner(user_id):
+        say(text="❌ Only the bot's owner can approve or deny.", channel=channel)
+        return
+
+    decided = governor.decide(approval_id, approved, decided_by=user_id, note=note)
+    if not decided:
+        say(text=f"❌ Approval #{approval_id} isn't pending (already decided, or no such id).",
+            channel=channel)
+        return
+
+    resumed = runner.resume_after_decision(decided)
+    word = "Approved" if approved else "Denied"
+    say(
+        text=f"{'✅' if approved else '🚫'} {word} `{decided['tool']}` for run "
+             f"#{decided['run_id']}."
+             + (" The run is back in the queue." if resumed
+                else " (The run was no longer waiting.)"),
+        channel=channel,
+    )
+
+
+@slack_app.command("/approve")
+def handle_approve(ack, command, say):
+    ack()
+    _decide_approval(command, say, True)
+
+
+@slack_app.command("/deny")
+def handle_deny(ack, command, say):
+    ack()
+    _decide_approval(command, say, False)
+
+
+@slack_app.command("/costs")
+def handle_costs(ack, command, say):
+    """AI call accounting, with paid routes tracked separately."""
+    ack()
+    say(text=governor.format_usage(), channel=command["channel_id"])
+
+
 @slack_app.command("/status")
 def handle_status(ack, command, say):
     ack()
@@ -1048,11 +1196,56 @@ def handle_health(ack, command, say):
         f"{stats['open_tasks']} open plan step(s), {stats['db_size_mb']} MB\n"
         f"*Concept graph:* {concept_graph.get_graph_stats()['entities']} entities, "
         f"{concept_graph.get_graph_stats()['edges']} connections\n"
+        f"*Autonomy:* {len(runner.list_runs(limit=99, status='running'))} run(s) executing, "
+        f"{len(runner.list_runs(limit=99, status='queued'))} queued, "
+        f"{len(runner.list_runs(limit=99, status=runner.AWAITING_APPROVAL))} awaiting approval, "
+        f"{len(triggers.list_schedules(include_disabled=False))} active schedule(s)\n"
+        f"*Paid AI calls today:* {governor.paid_calls_today()}"
+        + (f"/{governor.paid_daily_limit()}" if governor.paid_daily_limit() else " (uncapped)")
+        + "\n"
         f"*Disk:* {disk_str}\n"
         f"*Log file:* {log_size_kb} KB (rotates at 5 MB, keeps 3 backups)\n"
         f"*Errors in this process ({len(ERROR_LOG)} tracked, last 5):*\n{err_lines}\n"
     )
     say(text=health_text, channel=command["channel_id"])
+
+
+# ── Autonomy wiring ──
+# The run engine and scheduler are deliberately Slack-agnostic: they get an
+# AI backend and a "post this somewhere" callback injected here, which is
+# what keeps them testable without a Slack workspace.
+
+def post_run_message(channel: str, thread_ts: str, text: str):
+    """Where a background run reports back to."""
+    slack_client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts or None,
+        text=truncate_for_slack(text),
+    )
+
+
+def start_autonomy() -> tuple[int, bool]:
+    """Bring up background workers + the scheduler. Returns (workers, scheduler_on)."""
+    runner.configure(
+        call_ai_fn=lambda msgs, prompt: call_ai(msgs, prompt),
+        system_prompt=SYSTEM_PROMPT,
+        post_message=post_run_message,
+    )
+    workers = runner.start_workers()
+    scheduler_on = triggers.start_scheduler()
+
+    # Context budgeting is invisible until a model rejects the request, so
+    # state it at boot. The system prompt is sent on every call and dwarfs the
+    # transcript budget; a route with too small a window fails on step one.
+    prompt_chars = len(agent.get_agent_system_prompt(SYSTEM_PROMPT))
+    worst_case = prompt_chars + runner.context_limit_chars()
+    logger.info(
+        f"   Context: system prompt {prompt_chars:,} chars (~{prompt_chars // 4:,} tok) "
+        f"+ transcript budget {runner.context_limit_chars():,} chars "
+        f"→ worst case ~{worst_case // 4:,} tokens/call; routes need "
+        f"~{((worst_case // 4) // 1000) + 2}k context"
+    )
+    return workers, scheduler_on
 
 
 # ── Start ──
@@ -1074,6 +1267,12 @@ if __name__ == "__main__":
         logger.info(f"   Operating manual: ✅ loaded ({len(OPERATING_MANUAL)} chars)")
     else:
         logger.info("   Operating manual: none (add operating_manual.md to enable)")
+
+    workers, scheduler_on = start_autonomy()
+    logger.info(f"   Run workers: {workers} (max {runner.max_steps_default()} steps, "
+                f"{runner.max_seconds_default()}s per run)")
+    logger.info(f"   Scheduler: {'✅ on' if scheduler_on else '❌ off'}, "
+                f"{len(triggers.list_schedules(include_disabled=False))} active schedule(s)")
 
     handler = SocketModeHandler(slack_app, SLACK_APP_TOKEN)
     handler.start()
