@@ -1,4 +1,17 @@
+# Any .env variant: editor backups (.env.save, .env.save.1), stray names
+# from a mistyped redirect, and per-environment copies. Only the exact name
+# ".env" was ignored before, so a nano backup holding the same API keys was
+# one `git add -A` away from being committed.
 .env
+.env.*
+.env*
+!.env.example
+
+# SQLite databases: conversations, facts, plans, run history.
+*.db
+*.db-wal
+*.db-shm
+
 __pycache__/
 *.pyc
 *.pyo
