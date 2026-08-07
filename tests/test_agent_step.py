@@ -18,6 +18,8 @@ import memory
 @pytest.fixture(autouse=True)
 def temp_db(tmp_path, monkeypatch):
     monkeypatch.setattr(memory, "DB_PATH", tmp_path / "memory.db")
+    # The owner lock fails closed; these tests exercise execution, not auth.
+    monkeypatch.setenv("OWNER_SLACK_ID", "default")
     yield
 
 

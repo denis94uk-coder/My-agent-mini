@@ -210,11 +210,31 @@ does **not** work on a fresh server (no credential helper); `github_write_file`
 `clone_repo`) are the reliable paths for proposing a change — both open a
 PR for human review instead of committing straight to a base branch.
 
-**Owner lock:** `github_write_file`, `github_create_issue`,
-`restart_service`, and `deploy_static_site` only run for the Slack user ID
-in `OWNER_SLACK_ID` — anyone else gets refused. Set this before making the
-bot reachable by more than just you; without it, these tools fail open
-(anyone can trigger them using your credentials).
+**Owner lock — fails closed.** `run_shell`, `run_python`,
+`github_write_file`, `github_create_issue`, `restart_service`,
+`deploy_static_site`, `push_branch`, `schedule_task`, `cancel_schedule`, and
+`start_background_run` run only for the Slack user ID in `OWNER_SLACK_ID`.
+
+Shell and Python are on that list because they are remote code execution on
+the host: any Slack user — or a prompt injection carried in a webpage the
+agent was asked to read — would otherwise get a shell on your VM. No denylist
+makes that safe; not exposing it is the only real control.
+
+**If `OWNER_SLACK_ID` is unset, all of these refuse for everyone, including
+you.** That is deliberate. The previous behaviour failed *open*, so a fresh
+install handed shell access to anyone who could message the bot. A default
+that is only safe when someone remembers to set an environment variable is
+not a safe default. The bot logs a loud warning at startup when it is unset.
+
+**SSRF guard.** `fetch_url` resolves every host and refuses private,
+loopback, link-local, reserved and multicast addresses, plus cloud metadata
+hostnames — and re-checks on every redirect hop, so a public URL cannot
+bounce the agent onto `169.254.169.254` and hand out instance credentials.
+
+**Secret redaction.** `run_shell` and `run_python` output is scrubbed for
+credential *shapes* (`ghp_`, `github_pat_`, `xox…`, `sk-`, `AIza`, `mg_`) as
+well as keyword lines, so `echo $GITHUB_TOKEN` does not post your token into
+a Slack channel.
 
 ### Coding practices reference
 
@@ -338,7 +358,7 @@ my-agent-mini/
 ├── tools.py            # Tool implementations
 ├── critic.py           # Critic gate: is "done" actually done?
 ├── governor.py         # Risk tiers, approval queue, cost accounting
-├── tests/              # 162 tests — no Slack or API keys needed
+├── tests/              # 207 tests — no Slack or API keys needed
 ├── requirements.txt    # Python dependencies
 ├── setup.sh            # One-click server setup
 ├── .env.example        # Template for API keys + autonomy settings

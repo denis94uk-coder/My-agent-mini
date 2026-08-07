@@ -603,7 +603,11 @@ def _blocked_tools_for(run: dict) -> set:
         return set()
     blocked = set(tools.UNATTENDED_BLOCKED_TOOLS)
     if not run["allow_risky"] and not governor.approvals_enabled():
-        blocked |= set(tools.OWNER_ONLY_TOOLS)
+        # No approver reachable, so EXTERNAL-tier tools become a flat no.
+        # Scoped by tier, not by OWNER_ONLY_TOOLS: run_shell is owner-only but
+        # local, and blocking it here would stop a scheduled task from running
+        # a command on its own box for no safety gain.
+        blocked |= governor.external_tools()
     return blocked
 
 

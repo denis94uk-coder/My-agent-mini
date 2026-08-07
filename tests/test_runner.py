@@ -22,6 +22,8 @@ import tools
 def temp_db(tmp_path, monkeypatch):
     """Point every module's storage at a throwaway database."""
     monkeypatch.setattr(memory, "DB_PATH", tmp_path / "memory.db")
+    # The owner lock fails closed; these tests exercise execution, not auth.
+    monkeypatch.setenv("OWNER_SLACK_ID", "default")
     # The critic gate is exercised in test_critic.py. Off here so these tests
     # measure the run engine's own steps and events, not the extra AI call.
     monkeypatch.setenv("CRITIC_ENABLED", "false")

@@ -53,7 +53,17 @@ def get_tools_description() -> str:
 # person who set it up — without this, any Slack user could ask the bot
 # to "push this to your repo" or "restart the service" and it would
 # comply using the owner's own credentials.
+#
+# CRITICAL: run_shell and run_python are ALSO owner-only. They execute
+# arbitrary code on the host VM, so any Slack user — or a prompt injection
+# carried in a webpage or file the agent fetches — would otherwise get remote
+# code execution on the box. There is no denylist strong enough to make shell
+# access safe for untrusted users; the only correct control is not exposing it
+# to them at all.
 OWNER_ONLY_TOOLS = {
+    # Direct code execution on the host.
+    "run_shell",
+    "run_python",
     "github_write_file",
     "github_create_issue",
     "restart_service",
@@ -63,6 +73,9 @@ OWNER_ONLY_TOOLS = {
     # acting later, on its own, using the owner's credentials.
     "schedule_task",
     "cancel_schedule",
+    # Starting a background run commits shared resources — worker threads on a
+    # 1 GB box and calls against a metered paid route — to autonomous work.
+    "start_background_run",
 }
 
 # Tools that need to know which conversation they were called from — the
@@ -73,12 +86,27 @@ CONTEXT_TOOLS = {
 }
 
 
+_OWNER_WARNED = False
+
+
 def _is_owner(user_id: str) -> bool:
     owner_id = os.environ.get("OWNER_SLACK_ID", "").strip()
     if not owner_id:
-        # No owner configured: fail open only for single-user/dev setups.
-        # Set OWNER_SLACK_ID before exposing the bot beyond yourself.
-        return True
+        # Fail CLOSED. With no owner configured nobody may use the privileged
+        # tools — including the person who installed it. This previously failed
+        # OPEN, which meant shell access, GitHub writes, service restarts and
+        # the /approve command were available to *any* Slack user who could
+        # reach the bot. A default that is only safe when someone remembers to
+        # set an environment variable is not a safe default.
+        global _OWNER_WARNED
+        if not _OWNER_WARNED:
+            _OWNER_WARNED = True
+            logger.warning(
+                "OWNER_SLACK_ID is not set — owner-only tools (run_shell, "
+                "run_python, GitHub writes, restart, deploy, scheduling) are "
+                "DISABLED for everyone. Set it in .env to enable them."
+            )
+        return False
     return user_id == owner_id
 
 
@@ -252,6 +280,75 @@ def get_weather(location: str) -> str:
         return f"❌ Weather lookup failed: {str(e)[:200]}"
 
 
+# ── SSRF protection for fetch_url ──
+# The agent runs on a cloud VM and will fetch any URL it is given — including
+# one embedded in a webpage or file it was asked to read. Without this guard,
+# fetch_url can be pointed at the cloud metadata service (169.254.169.254 on
+# both GCP and AWS) to steal instance credentials, or at internal services to
+# pivot inside the network. Every host is resolved to its IPs and rejected if
+# any is private, loopback, link-local, reserved or multicast; redirects are
+# followed manually so a redirect cannot smuggle the request onto a blocked
+# host after the first check passed.
+
+import ipaddress
+import socket
+from urllib.parse import urljoin, urlparse
+
+_SSRF_BLOCKED_HOSTNAMES = {"localhost", "metadata", "metadata.google.internal"}
+
+
+def _url_host_is_safe(hostname: str) -> bool:
+    if not hostname:
+        return False
+    host = hostname.lower()
+    if host in _SSRF_BLOCKED_HOSTNAMES or host.endswith((".internal", ".local")):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast):
+            return False
+    return True
+
+
+def _safe_http_get(url: str, headers: dict, timeout: int = 15):
+    """
+    GET with SSRF protection, re-validating every redirect hop.
+
+    Returns (response, None) or (None, error_message).
+    """
+    for _ in range(6):
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return None, "❌ Blocked: malformed URL."
+        if parsed.scheme not in ("http", "https"):
+            return None, f"❌ Blocked: unsupported scheme '{parsed.scheme}'."
+        if not _url_host_is_safe(parsed.hostname or ""):
+            return None, (
+                "❌ Blocked: that host resolves to a private, loopback or "
+                "link-local address. Internal services and cloud metadata "
+                "endpoints are not reachable through this tool."
+            )
+        try:
+            resp = http_requests.get(url, headers=headers, timeout=timeout,
+                                     allow_redirects=False)
+        except Exception as e:
+            return None, f"Failed to fetch URL: {str(e)[:300]}"
+        if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+            url = urljoin(url, resp.headers["Location"])
+            continue
+        return resp, None
+    return None, "❌ Blocked: too many redirects."
+
+
 @tool("fetch_url", "Fetch a webpage and extract its main text content.", "url")
 def fetch_url(url: str) -> str:
     """Fetch a URL and extract readable text."""
@@ -260,7 +357,9 @@ def fetch_url(url: str) -> str:
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
-        resp = http_requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        resp, error = _safe_http_get(url, headers, timeout=15)
+        if error:
+            return error
         resp.raise_for_status()
 
         content_type = resp.headers.get("Content-Type", "")
@@ -319,7 +418,9 @@ def run_python(code: str) -> str:
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
 
-        return output.strip() or "(no output)"
+        # Same redaction as run_shell: code the model wrote can just as easily
+        # print an environment variable holding a token.
+        return _redact_shell_output(output).strip() or "(no output)"
 
     except subprocess.TimeoutExpired:
         return "❌ Code execution timed out (30s limit)"
@@ -447,7 +548,7 @@ def list_tasks_tool(conv_key: str = "default") -> str:
     "start_background_run",
     "Start a long task as a background run that survives restarts and doesn't block chat. "
     "Use for work that needs many steps or a long wait; you get a run id back immediately "
-    "and the result is posted when it finishes. Not for quick answers.",
+    "and the result is posted when it finishes. Not for quick answers. Owner only.",
     "goal",
 )
 def start_background_run(goal: str, _user_id: str = "default", _conv_key: str = "") -> str:
@@ -572,6 +673,16 @@ BLOCKED_PATTERNS = [
 SECRET_OUTPUT_PATTERNS = (
     re.compile(r"(?im)^.*(?:SLACK_BOT_TOKEN|SLACK_APP_TOKEN|API_KEY|SECRET|PASSWORD|TOKEN).*=?[^\n]*$"),
     re.compile(r"(?im)^.*(?:BEGIN (?:RSA|OPENSSH|EC) PRIVATE KEY).*\\n?(?:.*\\n?){0,3}"),
+    # Credential *shapes*, not just lines that happen to mention a keyword.
+    # `echo $GITHUB_TOKEN` prints a bare token with no keyword anywhere near it
+    # and the patterns above sail straight past that — the most likely way a
+    # real secret from this box ever reaches a Slack channel.
+    re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),      # GitHub classic
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),                  # GitHub fine-grained
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),                  # Slack
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),                         # OpenAI-style
+    re.compile(r"AIza[A-Za-z0-9_-]{30,}"),                        # Google API
+    re.compile(r"\bmg_[A-Za-z0-9]{20,}"),                         # merge.dev gateway
 )
 MAX_SHELL_OUTPUT = 3500
 
