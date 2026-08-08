@@ -237,7 +237,9 @@ def build_providers():
 
     # Keyless best-effort route. It is first by default so stale/expired API
     # keys in an older .env cannot delay or block the free route. Set
-    # ROUTER_PREFER_KEYLESS=false to use configured keys first.
+    # ROUTER_PREFER_KEYLESS=false to use configured keys first. ROUTER_ORDER,
+    # if set, names the order outright and supersedes this flag for any route
+    # it mentions.
     keyless_provider = None
     if os.getenv("POLLINATIONS_ENABLED", "true").lower() not in ("0", "false", "no"):
         keyless_provider = {
@@ -386,12 +388,24 @@ def build_providers():
     # free tier sitting *behind* the paid gateway, so a Pollinations failure
     # would spend credit while a free route went untried. A stable sort keeps
     # every other preference (keyless first, then the free keys in order) intact.
-    PROVIDERS.sort(key=lambda p: 1 if governor.is_paid(p["name"]) else 0)
+    #
+    # ROUTER_ORDER then decides the order among the free routes, because
+    # registration order is not a preference anyone chose — it happened to put
+    # Gemini ahead of Groq only because its block is written first. Paid stays
+    # the outer key: it is a budget guard, not a preference to be overridden.
+    PROVIDERS.sort(
+        key=lambda p: (
+            1 if governor.is_paid(p["name"]) else 0,
+            governor.route_order_rank(p["name"]),
+        )
+    )
 
     paid = [p["name"] for p in PROVIDERS if governor.is_paid(p["name"])]
     logger.info(f"🧠 Loaded {len(PROVIDERS)} AI routes: {[p['name'] for p in PROVIDERS]}")
     if paid:
         logger.info(f"💳 Paid routes (tried last, capped daily): {paid}")
+    if os.getenv("ROUTER_ORDER", "").strip():
+        logger.info(f"   Route order from ROUTER_ORDER: {os.environ['ROUTER_ORDER']}")
 
 
 # ── File Handling ──

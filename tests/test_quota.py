@@ -189,3 +189,46 @@ def test_estimate_includes_an_output_allowance():
 def test_estimate_handles_empty_and_negative_input():
     assert governor.estimate_tokens(0) > 0
     assert governor.estimate_tokens(-5) > 0
+
+
+# ── Route order ──
+
+def test_unset_order_leaves_every_route_unranked(monkeypatch):
+    """Without the setting, registration order must be left exactly as it was."""
+    monkeypatch.delenv("ROUTER_ORDER", raising=False)
+    assert governor.route_order_rank("Groq") == governor.route_order_rank("Gemini")
+
+
+def test_named_routes_sort_in_the_order_given(monkeypatch):
+    monkeypatch.setenv("ROUTER_ORDER", "groq,gemini")
+    assert governor.route_order_rank("Groq") < governor.route_order_rank("Gemini")
+
+
+def test_unnamed_routes_fall_behind_named_ones(monkeypatch):
+    monkeypatch.setenv("ROUTER_ORDER", "groq")
+    assert governor.route_order_rank("Groq") < governor.route_order_rank("Gemini")
+    assert governor.route_order_rank("Gemini") == governor.route_order_rank("NVIDIA")
+
+
+def test_order_matches_by_substring(monkeypatch):
+    monkeypatch.setenv("ROUTER_ORDER", "pollinations")
+    assert governor.route_order_rank("Pollinations (keyless)") == 0
+
+
+def test_whitespace_and_empties_in_the_order_are_tolerated(monkeypatch):
+    monkeypatch.setenv("ROUTER_ORDER", " groq , , gemini ,")
+    assert governor.route_order_rank("Groq") == 0
+    assert governor.route_order_rank("Gemini") == 1
+
+
+def test_paid_still_outranks_a_preferred_order(monkeypatch):
+    """
+    ROUTER_ORDER expresses a preference; paid-last is a budget guard. Sorting
+    on (paid, rank) must keep a named paid route behind an unnamed free one.
+    """
+    monkeypatch.setenv("ROUTER_ORDER", "merge,groq")
+    routes = [{"name": "Groq"}, {"name": "Merge Gateway"}, {"name": "NVIDIA"}]
+    routes.sort(key=lambda p: (
+        1 if governor.is_paid(p["name"]) else 0, governor.route_order_rank(p["name"]),
+    ))
+    assert [r["name"] for r in routes] == ["Groq", "NVIDIA", "Merge Gateway"]

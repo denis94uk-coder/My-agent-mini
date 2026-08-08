@@ -539,6 +539,31 @@ def retry_after_seconds(response, default: float) -> float:
     return default
 
 
+_UNRANKED = 10_000
+
+
+def route_order_rank(provider_name: str) -> int:
+    """
+    Where a route sits in ROUTER_ORDER, or `_UNRANKED` when it is not listed.
+
+    Registration order in build_providers is just the order the blocks happen
+    to be written in, which is not a preference anyone chose — it put Gemini
+    ahead of Groq purely because its block comes first. ROUTER_ORDER makes the
+    preference explicit: "groq,gemini" tries Groq first, and anything omitted
+    keeps its registration order behind everything named.
+
+    Matching is by substring, so "groq" finds "Groq" and a renamed route keeps
+    working. Paid routes still sort last regardless — that is a budget guard,
+    not a preference, and it is not this function's to override.
+    """
+    lowered = (provider_name or "").lower()
+    names = [n.strip().lower() for n in os.getenv("ROUTER_ORDER", "").split(",") if n.strip()]
+    for index, name in enumerate(names):
+        if name in lowered:
+            return index
+    return _UNRANKED
+
+
 def record_tokens(provider_name: str, tokens: int) -> None:
     """Add a call's token cost to the rolling minute window."""
     now = time.time()
