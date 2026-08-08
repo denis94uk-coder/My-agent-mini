@@ -53,6 +53,7 @@ import agent
 import governor
 import runner
 import triggers
+import workflows
 import concept_graph
 
 # ── Logging ──
@@ -1068,6 +1069,33 @@ def handle_clear(ack, command, say):
     finally:
         conn.close()
     say(text="🧹 Memory cleared!", channel=channel)
+
+
+@slack_app.command("/workflow")
+def handle_workflow(ack, command, say):
+    """`/workflow` to list the recurring jobs, `/workflow start <name>` to schedule one."""
+    ack()
+    channel = command["channel_id"]
+    args = (command.get("text") or "").strip().split()
+
+    if not args or args[0] in ("list", "help"):
+        say(text=workflows.describe(), channel=channel)
+        return
+
+    if args[0] != "start" or len(args) < 2:
+        say(text="Usage: `/workflow` or `/workflow start <name>`", channel=channel)
+        return
+
+    # Scheduling commits the bot to acting later with the owner's credentials,
+    # which is the same reason schedule_task is owner-only.
+    if not tools._is_owner(command["user_id"]):
+        say(text="❌ Only the bot's owner can schedule workflows.", channel=channel)
+        return
+
+    say(
+        text=workflows.start(args[1], owner_user_id=command["user_id"], channel=channel),
+        channel=channel,
+    )
 
 
 @slack_app.command("/providers")

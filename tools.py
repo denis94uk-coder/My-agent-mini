@@ -1260,8 +1260,102 @@ def push_branch(
 
 
 @tool(
+    "github_list_pull_requests",
+    "List open (or closed) pull requests: number, title, author, branch, draft "
+    "state. github_list_issues deliberately excludes PRs, so this is the only "
+    "way to see them.",
+    "owner='', repo='', state='open'",
+)
+def github_list_pull_requests(owner: str = "", repo: str = "", state: str = "open") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        resp = http_requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls",
+            headers=headers,
+            params={"state": state, "per_page": 20},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        prs = resp.json()
+        if not prs:
+            return f"No {state} pull requests."
+        lines = []
+        for p in prs:
+            draft = " [draft]" if p.get("draft") else ""
+            lines.append(
+                f"#{p['number']} {p['title']}{draft} — @{p['user']['login']}, "
+                f"{p['head']['ref']} → {p['base']['ref']}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ GitHub PR list error: {str(e)[:300]}"
+
+
+@tool(
+    "github_pr_status",
+    "Mergeability and CI results for one pull request: review state, merge "
+    "conflicts, and which checks failed. Use before deciding whether a PR "
+    "needs work.",
+    "number, owner='', repo=''",
+)
+def github_pr_status(number: int, owner: str = "", repo: str = "") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        base = f"{GITHUB_API}/repos/{owner}/{repo}"
+        pr = http_requests.get(f"{base}/pulls/{number}", headers=headers, timeout=15)
+        pr.raise_for_status()
+        pr = pr.json()
+
+        lines = [f"#{pr['number']} {pr['title']} ({pr['state']})"]
+        if pr.get("merged"):
+            lines.append("Merged — no further work needed.")
+            return "\n".join(lines)
+        # mergeable is computed asynchronously by GitHub; null means "ask again"
+        # rather than "fine", and reporting null as mergeable is how an agent
+        # talks itself into pushing onto a conflicted branch.
+        mergeable = pr.get("mergeable")
+        lines.append(
+            "Mergeable: " + {True: "yes", False: "NO — conflicts with base"}.get(
+                mergeable, "not computed yet, re-check shortly"
+            )
+        )
+
+        checks = http_requests.get(
+            f"{base}/commits/{pr['head']['sha']}/check-runs", headers=headers, timeout=15
+        )
+        if checks.ok:
+            runs = checks.json().get("check_runs", [])
+            failed = [r for r in runs if r.get("conclusion") in ("failure", "timed_out")]
+            pending = [r for r in runs if r.get("status") != "completed"]
+            if not runs:
+                lines.append("CI: no checks reported.")
+            elif failed:
+                lines.append(f"CI: {len(failed)} of {len(runs)} FAILED")
+                for r in failed[:5]:
+                    lines.append(f"  ✗ {r['name']} — {r.get('html_url', '')}")
+            elif pending:
+                lines.append(f"CI: {len(pending)} still running.")
+            else:
+                lines.append(f"CI: all {len(runs)} checks passed.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ GitHub PR status error: {str(e)[:300]}"
+
+
+@tool(
     "github_list_issues",
-    "List open (or closed) issues in a GitHub repo.",
+    "List open (or closed) issues in a GitHub repo. Excludes pull requests — "
+    "use github_list_pull_requests for those.",
     "owner='', repo='', state='open'",
 )
 def github_list_issues(owner: str = "", repo: str = "", state: str = "open") -> str:

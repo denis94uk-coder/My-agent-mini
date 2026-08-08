@@ -66,6 +66,8 @@ TOOL_TIERS = {
     "list_tasks": READ,
     "github_read_file": READ,
     "github_list_issues": READ,
+    "github_list_pull_requests": READ,
+    "github_pr_status": READ,
     "repo_read_file": READ,
     "repo_list_files": READ,
     "server_health": READ,
