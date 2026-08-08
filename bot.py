@@ -218,11 +218,18 @@ def _provider_status(provider: dict) -> str:
     remaining = max(0, int(state.get("cooldown_until", 0) - time.time()))
     # Show the minute window alongside health. A route can be "healthy" and
     # still be one call from a 429, which is invisible without this.
-    limit = governor.tpm_limit(provider["name"])
-    budget = ""
-    if limit:
-        spent = governor.tokens_last_minute(provider["name"])
-        budget = f", {spent:,}/{limit:,} tok/min"
+    parts = []
+    if governor.tpm_limit(provider["name"]):
+        parts.append(
+            f"{governor.tokens_last_minute(provider['name']):,}/"
+            f"{governor.tpm_limit(provider['name']):,} tok/min"
+        )
+    if governor.rpm_limit(provider["name"]):
+        parts.append(
+            f"{governor.requests_last_minute(provider['name'])}/"
+            f"{governor.rpm_limit(provider['name'])} req/min"
+        )
+    budget = (", " + ", ".join(parts)) if parts else ""
     if remaining:
         return f"cooldown ({remaining}s){budget}"
     if state.get("last_ok"):
@@ -256,7 +263,10 @@ def build_providers():
             "name": "Gemini",
             "type": "gemini",
             "api_key": os.environ["GEMINI_API_KEY"],
-            "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            # gemini-2.0-flash retired 2026-03-03. Free-tier access is the
+            # Flash line; override with GEMINI_MODEL and check the current
+            # name at ai.google.dev/gemini-api/docs/models if a call 404s.
+            "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             "url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         })
 

@@ -466,13 +466,32 @@ def paid_budget_exhausted() -> bool:
 # Tracking is in-memory: a minute window has nothing worth persisting, and it
 # must stay cheap on a 1 GB box.
 
-_TPM_DEFAULTS = {"groq": 12000}
+_TPM_DEFAULTS = {"groq": 12000, "gemini": 250000}
+# Requests per minute is a separate ceiling and can bind first: Gemini's free
+# tier allows ~10 requests/minute against a 250,000 token/minute budget, so a
+# ten-step agent loop exhausts the request limit having spent 2% of the tokens.
+# Tracking only tokens would pace perfectly and still 429.
+_RPM_DEFAULTS = {"groq": 30, "gemini": 10}
 _TPM_WINDOW: dict[str, list] = {}
 _TPM_LOCK = threading.Lock()
 
 # Output length is unknown before the call. Charge a flat allowance so the
 # estimate errs high — undercounting spends a 429, overcounting costs a pause.
 _OUTPUT_TOKEN_ALLOWANCE = 800
+
+
+def _limit_for(provider_name: str, defaults: dict, env_var: str) -> int:
+    """Per-route ceiling from `env_var`, falling back to `defaults`, else 0."""
+    lowered = (provider_name or "").lower()
+    table = dict(defaults)
+    for pair in os.getenv(env_var, "").split(","):
+        name, _, value = pair.partition(":")
+        if name.strip() and value.strip().isdigit():
+            table[name.strip().lower()] = int(value)
+    for key, limit in table.items():
+        if key in lowered:
+            return max(0, limit)
+    return 0
 
 
 def tpm_limit(provider_name: str) -> int:
@@ -483,16 +502,18 @@ def tpm_limit(provider_name: str) -> int:
     e.g. "groq:12000,gemini:250000". Matching is by substring so it keeps
     working when a provider is renamed in build_providers.
     """
-    lowered = (provider_name or "").lower()
-    table = dict(_TPM_DEFAULTS)
-    for pair in os.getenv("ROUTER_TPM_LIMITS", "").split(","):
-        name, _, value = pair.partition(":")
-        if name.strip() and value.strip().isdigit():
-            table[name.strip().lower()] = int(value)
-    for key, limit in table.items():
-        if key in lowered:
-            return max(0, limit)
-    return 0
+    return _limit_for(provider_name, _TPM_DEFAULTS, "ROUTER_TPM_LIMITS")
+
+
+def rpm_limit(provider_name: str) -> int:
+    """Requests-per-minute ceiling, or 0 for "unmetered". See ROUTER_RPM_LIMITS."""
+    return _limit_for(provider_name, _RPM_DEFAULTS, "ROUTER_RPM_LIMITS")
+
+
+def requests_last_minute(provider_name: str) -> int:
+    now = time.time()
+    with _TPM_LOCK:
+        return sum(1 for ts, _ in _TPM_WINDOW.get(provider_name, []) if now - ts < 60)
 
 
 def retry_after_seconds(response, default: float) -> float:
@@ -579,30 +600,46 @@ def tokens_last_minute(provider_name: str) -> int:
         return sum(t for ts, t in _TPM_WINDOW.get(provider_name, []) if now - ts < 60)
 
 
+def _window_wait(window: list, now: float, limit: int, cost, incoming: int) -> float:
+    """Seconds until `incoming` more of `cost` fits under `limit`."""
+    spent = sum(cost(e) for e in window)
+    if spent + incoming <= limit:
+        return 0.0
+    freed = 0
+    for entry in window:  # oldest first; each expiry frees its own share
+        freed += cost(entry)
+        if spent - freed + incoming <= limit:
+            return max(0.0, 60 - (now - entry[0])) + 0.5
+    return 0.0
+
+
 def tpm_wait_seconds(provider_name: str, est_tokens: int) -> float:
     """
-    Seconds to wait before `est_tokens` fits inside this route's TPM window.
+    Seconds to wait before this call fits inside the route's minute window.
+
+    Covers both ceilings. Tokens alone are not enough: Gemini's free tier
+    pairs a generous 250,000 tokens/minute with ~10 requests/minute, so an
+    agent loop exhausts the request limit having spent 2% of the tokens, and
+    token-only pacing would wait for nothing and still 429.
 
     0 when it fits now or the route is unmetered. A single call larger than
-    the whole limit also returns 0 — waiting cannot help, and the honest 429
-    is more useful than a pause that changes nothing.
+    the whole token limit also returns 0 — waiting cannot help, and the
+    honest 429 is more useful than a pause that changes nothing.
     """
-    limit = tpm_limit(provider_name)
-    if not limit or est_tokens >= limit:
+    tokens, requests = tpm_limit(provider_name), rpm_limit(provider_name)
+    if not tokens and not requests:
+        return 0.0
+    if tokens and est_tokens >= tokens:
         return 0.0
     now = time.time()
     with _TPM_LOCK:
         window = sorted(e for e in _TPM_WINDOW.get(provider_name, []) if now - e[0] < 60)
-    spent = sum(t for _, t in window)
-    if spent + est_tokens <= limit:
-        return 0.0
-    # Oldest entries expire first; wait for just enough of them to roll off.
-    freed = 0
-    for ts, tokens in window:
-        freed += tokens
-        if spent - freed + est_tokens <= limit:
-            return max(0.0, 60 - (now - ts)) + 0.5
-    return 0.0
+    waits = [0.0]
+    if tokens:
+        waits.append(_window_wait(window, now, tokens, lambda e: e[1], est_tokens))
+    if requests:
+        waits.append(_window_wait(window, now, requests, lambda e: 1, 1))
+    return max(waits)
 
 
 def estimate_tokens(input_chars: int) -> int:

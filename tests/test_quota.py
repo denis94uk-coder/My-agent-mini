@@ -20,6 +20,7 @@ import governor
 def _clean_window(monkeypatch):
     governor.reset_rate_limit_state()
     monkeypatch.delenv("ROUTER_TPM_LIMITS", raising=False)
+    monkeypatch.delenv("ROUTER_RPM_LIMITS", raising=False)
     yield
     governor.reset_rate_limit_state()
 
@@ -232,3 +233,55 @@ def test_paid_still_outranks_a_preferred_order(monkeypatch):
         1 if governor.is_paid(p["name"]) else 0, governor.route_order_rank(p["name"]),
     ))
     assert [r["name"] for r in routes] == ["Groq", "NVIDIA", "Merge Gateway"]
+
+
+# ── Requests per minute, the other ceiling ──
+
+def test_gemini_has_both_ceilings_by_default():
+    assert governor.tpm_limit("Gemini") == 250_000
+    assert governor.rpm_limit("Gemini") == 10
+
+
+def test_requests_are_counted_in_the_same_window():
+    for _ in range(3):
+        governor.record_tokens("Gemini", 10)
+    assert governor.requests_last_minute("Gemini") == 3
+
+
+def test_the_request_limit_binds_even_with_tokens_to_spare():
+    """
+    Gemini's shape: ~10 requests/minute against 250,000 tokens/minute. Ten
+    small calls exhaust the requests having spent 2% of the tokens, so
+    token-only pacing would wave the eleventh through into a 429.
+    """
+    for _ in range(10):
+        governor.record_tokens("Gemini", 500)      # 5,000 of 250,000 tokens
+    assert governor.tokens_last_minute("Gemini") < governor.tpm_limit("Gemini") // 10
+    assert governor.tpm_wait_seconds("Gemini", 500) > 0
+
+
+def test_the_request_limit_clears_with_the_oldest_request(monkeypatch):
+    for _ in range(10):
+        governor.record_tokens("Gemini", 500)
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now + 61)
+    assert governor.tpm_wait_seconds("Gemini", 500) == 0
+
+
+def test_a_route_metered_only_on_requests_still_paces(monkeypatch):
+    monkeypatch.setenv("ROUTER_RPM_LIMITS", "custom:2")
+    monkeypatch.setenv("ROUTER_TPM_LIMITS", "custom:0")
+    governor.record_tokens("Custom endpoint", 1)
+    governor.record_tokens("Custom endpoint", 1)
+    assert governor.tpm_wait_seconds("Custom endpoint", 1) > 0
+
+
+def test_env_overrides_the_request_limit(monkeypatch):
+    monkeypatch.setenv("ROUTER_RPM_LIMITS", "groq:2")
+    assert governor.rpm_limit("Groq") == 2
+
+
+def test_routes_with_neither_ceiling_never_wait():
+    for _ in range(500):
+        governor.record_tokens("Pollinations (keyless)", 10_000)
+    assert governor.tpm_wait_seconds("Pollinations (keyless)", 5_000) == 0
