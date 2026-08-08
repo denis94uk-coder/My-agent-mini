@@ -161,3 +161,62 @@ def test_unattended_runs_block_owner_only_tools(audit_env):
     "Slack, and no test asserts one exists."))
 def test_owner_privileges_can_be_revoked_without_editing_env(audit_env):
     assert any(hasattr(mod, "revoke_owner") for mod in (tools, governor, runner))
+
+
+# ── the Slack command surface ──
+# Owner-only enforcement lives in two places: tools.run_tool for tools, and
+# hand-written `_is_owner` checks in each slash-command listener. The second
+# list is the one that can drift, so it is enumerated here.
+
+from audit_support import Say, slack_bot, slash  # noqa: E402,F401
+
+
+def test_owner_only_slash_commands_refuse_a_stranger(slack_bot):
+    """/clear, /workflow start, /approve and /deny all check the owner."""
+    bot, registry = slack_bot
+    for command, text in [("/clear", ""), ("/workflow", "start repo-review"),
+                          ("/approve", "1"), ("/deny", "1 nope")]:
+        say, acked = slash(registry, command, text=text, user="U_STRANGER")
+        assert acked, f"{command} never acked"
+        assert "owner" in (say.last or "").lower(), (
+            f"{command} did not refuse a stranger: {say.last!r}")
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "FINDING A3 (HIGH) — destructive slash commands with no owner check. "
+    "bot.py:1116 `/runs cancel <id>` and bot.py:1145 `/schedules cancel "
+    "<name>` call runner.cancel_run / triggers.cancel_schedule directly; "
+    "neither listener calls tools._is_owner, unlike /clear (bot.py:1058), "
+    "/workflow (bot.py:1074) and /approve (bot.py:1177). Any member of the "
+    "workspace can therefore kill the owner's background runs and delete the "
+    "owner's schedules — including the ops-watch and repo-review workflows — "
+    "and the schedule deletion is not recoverable from Slack."))
+def test_destructive_slash_commands_refuse_a_stranger(slack_bot):
+    bot, registry = slack_bot
+    row = runner.enqueue_run("owner's job", owner_user_id="U_OWNER")
+    run_id = run_id_of(row)
+    triggers.add_schedule(name="ops-watch", spec="every 1h", goal="watch",
+                          owner_user_id="U_OWNER")
+
+    slash(registry, "/runs", text=f"cancel {run_id}", user="U_STRANGER")
+    slash(registry, "/schedules", text="cancel ops-watch", user="U_STRANGER")
+
+    assert runner.get_run(run_id)["status"] != "cancelled", "stranger cancelled a run"
+    assert [s for s in triggers.list_schedules() if s["name"] == "ops-watch"], (
+        "stranger deleted the owner's schedule")
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "FINDING A4 (MEDIUM) — read-only operator commands are open to the whole "
+    "workspace. /runs (bot.py:1116) prints every background run's goal text, "
+    "/schedules (bot.py:1145) prints every schedule's goal, and /health "
+    "(bot.py:1262) prints the last five internal errors, disk figures and "
+    "provider state. Goals are written by the owner and routinely name repos, "
+    "hosts and customers; the error list can carry provider error text "
+    "(see FINDING G3)."))
+def test_operator_readouts_are_not_world_readable(slack_bot):
+    bot, registry = slack_bot
+    runner.enqueue_run("rotate the prod credentials for acme-corp",
+                       owner_user_id="U_OWNER")
+    say, _ = slash(registry, "/runs", user="U_STRANGER")
+    assert "acme-corp" not in (say.last or "")
