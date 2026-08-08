@@ -202,9 +202,11 @@ to what fits in one reply:
 **Coding practices** — for real software engineering (not quick scripts):
 spec before code, small verifiable slices, reproduce-localize-fix-guard when
 debugging, self-review before calling it done, atomic commits explaining
-*why*, and `remember(category='decision')` for architectural calls. Full
-references live in `skills/coding-practices/` — read the relevant file when
-a task warrants it; see its README.md for the index.
+*why*, and `remember(category='decision')` for architectural calls. Call
+`find_skill` with a description of the task to get the full playbook for it
+(TDD, debugging, code review, git workflow, security hardening, and ~20
+more). It returns nothing when no playbook fits — that means use your own
+judgment, not that you looked in the wrong place.
 
 EXECUTION PRINCIPLES:
 - DO the task, don't describe how the user could do it themselves

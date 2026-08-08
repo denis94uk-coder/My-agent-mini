@@ -11,13 +11,24 @@ reference material for this bot's own coding-workspace work (cloning repos,
 editing multi-file projects, testing, and pushing changes).
 
 These are plain Markdown, framework-agnostic instructions — no CLI, API, or
-docker dependency. They're not wired into a live "read this file before
-acting" mechanism yet (this bot's `read_file`/`list_files` tools operate on
-`~/agent_workspace`, not this repo's checkout). For now, `agent.py`'s system
-prompt carries a condensed one-line-per-skill index so the model always has
-awareness of the practices; the full text here is for deeper reference (by
-a human, or by a future tool that can read this repo directly, e.g. once
-the multi-file coding-workspace upgrade lands).
+docker dependency.
+
+They are read through the `find_skill` tool, which searches this directory by
+term overlap against each file's frontmatter `description` (written as "use
+when X", which is the question being asked) and returns the matching playbook
+in full. That is the "future tool that can read this repo directly" this note
+used to anticipate: `read_file` basenames into `~/agent_workspace` and
+`repo_read_file` resolves under the clone directory, so neither could ever
+open this checkout.
+
+Retrieval rather than prompt text on purpose. These 24 files are ~289 KB, and
+the system prompt is re-sent on every AI call in a loop that fires up to
+MAX_ITERATIONS times — inlining even the index would cost that on every step
+of every turn. `agent.py`'s prompt now carries a single pointer to
+`find_skill` instead, so the cost is one tool call, only when a task warrants
+one. A query no playbook covers returns nothing rather than the least-bad
+match: a returned playbook reads as instruction, so an irrelevant one is worse
+than none.
 
 ## Index
 

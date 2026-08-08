@@ -18,6 +18,7 @@ import memory
 import concept_graph
 import isolation
 import mcp_client
+import skills_index
 
 logger = logging.getLogger("my-agent-mini")
 
@@ -448,6 +449,50 @@ def run_python(code: str) -> str:
                 os.unlink(temp_path)
             except OSError:
                 pass
+
+
+@tool(
+    "find_skill",
+    "Look up a reusable engineering playbook (TDD, debugging, code review, "
+    "git workflow, security hardening, and ~20 more) before doing real "
+    "software work. Call with a query describing the task, or with no query "
+    "to see the full index.",
+    "query='', name=''",
+)
+def find_skill(query: str = "", name: str = "") -> str:
+    query, name = (query or "").strip(), (name or "").strip()
+
+    if name:
+        skill = skills_index.get(name)
+        if not skill:
+            available = ", ".join(s.name for s in skills_index.all_skills())
+            return f"❌ No skill named '{name}'. Available: {available}"
+        return skills_index.render(skill)
+
+    if not query:
+        lines = skills_index.index_lines()
+        if not lines:
+            return "No skill playbooks are installed."
+        return (
+            "Available playbooks (call find_skill with a query, or name= to "
+            "read one in full):\n" + "\n".join(lines)
+        )
+
+    matches = skills_index.search(query)
+    if not matches:
+        # Deliberately empty rather than the least-bad match: the model reads a
+        # returned playbook as instruction, so an irrelevant one is worse than
+        # none at all.
+        return (
+            f"No playbook covers '{query[:80]}'. Use your own judgment — call "
+            "find_skill with no query to see what does exist."
+        )
+
+    best = skills_index.render(matches[0])
+    if len(matches) > 1:
+        others = ", ".join(s.name for s in matches[1:])
+        best += f"\n\n---\nAlso possibly relevant (read with name=): {others}"
+    return best
 
 
 # ── MCP (Model Context Protocol) ──

@@ -96,6 +96,9 @@ TOOL_TIERS = {
     "start_background_run": EXTERNAL,
     # MCP. `mcp_list` only enumerates what a configured server offers.
     "mcp_list": READ,
+    # Reads playbook files shipped with the code. No effects, no arguments
+    # that reach the network or the filesystem beyond `skills/`.
+    "find_skill": READ,
     # `mcp_call` is the one tool whose reach is not knowable from its name: it
     # dispatches to a remote server chosen at call time. Its static tier is
     # EXTERNAL — the safe answer when the arguments are not in hand — and
