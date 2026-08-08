@@ -7,8 +7,11 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 ## ✨ Features
 
 - **Built-in smart router** — keyless best-effort route plus optional providers
-- **Automatic fallback** — skips rate-limited/unhealthy routes with cooldowns
-- **Slack Integration** — DMs, @mentions, slash commands (`/ask`, `/clear`, `/providers`)
+- **Quota-aware routing** — tracks each route's tokens *and* requests per
+  minute and waits for the window rather than spending a 429; honours the
+  reset time a rate-limited provider states instead of guessing
+- **Slack Integration** — DMs, @mentions, slash commands (`/ask`, `/clear`,
+  `/providers`, `/workflow`)
 - **Threaded Conversations** — Maintains context within Slack threads
 - **Near-zero cost** — runs on a Google Cloud e2-micro (or any 1 GB always-free
   VM) with a keyless AI route; an optional paid route is tried last and capped
@@ -22,6 +25,9 @@ No Docker. No second gateway service. Just one Python bot that connects to Slack
 - **Autonomous execution** — background runs that survive restarts,
   schedules that start work with nobody present, and automatic resumption
   of unfinished plans (see below)
+- **Preset workflows** — the recurring jobs the bot exists to do (PR review,
+  repo health, ops watch, weekly decision log), written as standalone goals
+  and started with one command
 
 ## 🧠 Memory model
 
@@ -187,8 +193,43 @@ See `.env.example` for all the knobs.
 ### Tests
 
 ```bash
-pytest tests/ -q     # 162 tests, no Slack workspace or API keys needed
+pytest tests/ -q     # 277 tests, no Slack workspace or API keys needed
 ```
+
+## 🗓️ Workflows — the recurring jobs
+
+Everything above is capability. A workflow is a *use*: a job worth doing on a
+schedule, with its goal written once, properly, for a run that will start days
+from now with nobody present to clarify it.
+
+```
+/workflow                      # list them
+/workflow start ops-watch      # schedule one (owner only)
+```
+
+| Workflow | Default schedule | What it does |
+|---|---|---|
+| `repo-review` | daily 09:00 | Which open PRs need attention — mergeability and CI per PR, failures first |
+| `repo-health` | weekly Mon | Clones the repo, runs the quality gate, reports what broke |
+| `ops-watch` | every 6h | Disk, memory and services; replies `All clear` when nothing crosses a threshold |
+| `decision-log` | weekly Fri | Summarises the week's decisions from memory into one durable note |
+
+`repo-review` and `repo-health` need `GITHUB_TOKEN`, `GITHUB_DEFAULT_OWNER`
+and `GITHUB_DEFAULT_REPO`; missing configuration is refused when you schedule
+it rather than surfacing as a failed run at 9am. `ops-watch` and
+`decision-log` need nothing.
+
+Two things shape how the goals are written. They run **unattended**, so each
+names where to stop — deploys, pushes, restarts and new schedules are blocked
+in an unattended run, and a goal that needs one reports what a human should do
+instead of failing. And they run on a **token budget**, so each states the
+order to work in and when to stop, and asks for read-only tools to be batched.
+A workflow that quietly spent the day's quota would take the interactive bot
+down with it.
+
+Starting one goes through the same `triggers.add_schedule` a human schedule
+uses, so there is no second execution path — `/workflow` is a library of
+well-written goals, not a parallel engine.
 
 ## 🛠️ Domain Skills
 
@@ -296,7 +337,9 @@ chmod +x setup.sh
 nano .env
 ```
 
-The default `POLLINATIONS_ENABLED=true` route needs no AI API key and is tried first, so an old/expired API key cannot block it. It is best-effort only and can be rate-limited or unavailable. For stronger reliability, add one or more optional provider keys in `.env` (for example NVIDIA, Gemini, Groq, or Mistral). Save with **Ctrl+O**, Enter, then **Ctrl+X**.
+The default `POLLINATIONS_ENABLED=true` route needs no AI API key and is tried first, so an old/expired API key cannot block it. It is best-effort only and can be rate-limited or unavailable.
+
+For real reliability add at least two keyed routes (for example Groq and Gemini — both have free tiers), so one hitting its rate limit does not leave the bot with nothing. Use `ROUTER_ORDER` to say which is tried first. Save with **Ctrl+O**, Enter, then **Ctrl+X**.
 
 ### 5. Start the bot
 
@@ -317,7 +360,8 @@ sudo journalctl -u my-agent -f  # live logs
 |---------|-------------|
 | `/ask <question>` | Quick one-shot question |
 | `/clear` | Reset conversation memory |
-| `/providers` | Show routes, keyless/key-backed status, and cooldown health |
+| `/providers` | Routes, keyless/key-backed status, cooldown health, and minute-window usage |
+| `/workflow` | List preset recurring jobs; `/workflow start <name>` schedules one |
 | `/runs` | List background runs (`/runs <id>`, `/runs cancel <id>`) |
 | `/schedules` | List scheduled tasks (`/schedules cancel <name>`) |
 | `/approvals` | What the agent is waiting on a human to authorise |
@@ -357,8 +401,9 @@ my-agent-mini/
 ├── concept_graph.py    # NetworkX entity/relationship layer over memory.db
 ├── tools.py            # Tool implementations
 ├── critic.py           # Critic gate: is "done" actually done?
-├── governor.py         # Risk tiers, approval queue, cost accounting
-├── tests/              # 207 tests — no Slack or API keys needed
+├── governor.py         # Risk tiers, approvals, cost accounting, rate-limit pacing
+├── workflows.py        # Preset recurring jobs (goal text + schedule)
+├── tests/              # 277 tests — no Slack or API keys needed
 ├── requirements.txt    # Python dependencies
 ├── setup.sh            # One-click server setup
 ├── .env.example        # Template for API keys + autonomy settings
@@ -398,18 +443,36 @@ cost, both of which self-hosting changes — worth re-opening then, not now.
 ```
 User sends message in Slack
          ↓
- Built-in router chooses a healthy route
-         ↓ fails or rate-limited?
- Cool that route down and try the next route
+ Router estimates the call's token cost
+         ↓
+ Orders routes by how long each must wait for its minute window
+         ↓ nothing has headroom?
+ Wait a few seconds for the window to roll, rather than spend a 429
+         ↓ the call still fails?
+ Cool that route down for as long as it asked, try the next
          ↓
  Send response back to Slack
 ```
 
-Paid routes are always sorted **last**, whatever order they were registered
-in, and drop out entirely once `PAID_DAILY_LIMIT` is reached — so a free route
-is never skipped in favour of one that costs money.
+**Why the pacing exists.** Free tiers cap tokens per *minute* long before
+tokens per day, and the agent loop is the exact shape that trips it: up to ten
+calls fired back to back, each re-sending the whole system prompt. A 12,000
+token/minute route against a ~4,400 token prompt rejects the third call of any
+multi-step task while ~95% of its daily budget is untouched. Requests per
+minute are tracked too, because a route can have tokens to spare and no
+requests left — Gemini's free tier pairs ~250,000 tokens/minute with ~10
+requests/minute.
 
-If a route is rate-limited, returns an error, or times out, the bot automatically cools it down and tries the next healthy route. The router is best-effort: it cannot guarantee unlimited free access, bypass authentication, or make an unavailable service work.
+Set `ROUTER_ORDER` to choose which route is tried first; without it the order
+is whichever provider block happens to come first in `build_providers`, which
+is not a preference. Paid routes are always sorted **last** regardless, and
+drop out entirely once `PAID_DAILY_LIMIT` is reached — so a free route is
+never skipped in favour of one that costs money.
+
+A 429 states its own reset window in `Retry-After` or `x-ratelimit-reset-*`,
+and the bot uses that rather than a fixed guess. The router is best-effort: it
+cannot guarantee unlimited free access, bypass authentication, or make an
+unavailable service work.
 
 ## 📊 Resource Usage
 
