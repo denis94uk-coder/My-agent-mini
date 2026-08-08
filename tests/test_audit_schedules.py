@@ -69,16 +69,12 @@ def test_malformed_intervals_are_rejected(audit_env, spec):
         triggers.parse_spec(spec)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING E2 (MEDIUM) — _validate_cron (triggers.py:190) checks only the "
-    "character set, never field ranges. `0 25 * * *` is accepted, stored, and "
-    "listed as an active schedule, but _cron_matches can never be true, so it "
-    "silently never fires. next_run_after does raise on an impossible date "
-    "after scanning 400 days — but only when it is called, and add_schedule "
-    "calls it before the row is written for some specs, so the failure mode "
-    "varies by which field holds the typo."))
-@pytest.mark.parametrize("spec", ["0 25 * * *", "99 9 * * *", "0 9 * 13 *"])
+@pytest.mark.parametrize("spec", ["99 99 * * *", "0 25 * * *", "0 9 32 13 *",
+                                 "0 9 * 13 *", "99 9 * * *", "0 9 * * 9",
+                                 "30-10 9 * * *"])
 def test_out_of_range_cron_fields_are_rejected(audit_env, spec):
+    """FIXED (was FINDING E2): every cron field is range-checked, so a spec that
+    could never fire is refused at creation instead of listed as active."""
     with pytest.raises(ValueError):
         triggers.parse_spec(spec)
 
@@ -113,22 +109,23 @@ def test_a_daytime_schedule_is_unaffected_by_dst(audit_env, london):
         "2026-03-29 09:00 BST", "2026-03-30 09:00 BST", "2026-03-31 09:00 BST"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING E3 (MEDIUM) — cron schedules are evaluated in the server's local "
-    "timezone (triggers.py:202 `time.localtime`) with no stored timezone and "
-    "no UTC normalisation, so DST changes the contract silently. Verified for "
-    "Europe/London 2026: `daily 01:30` fires TWICE on 2026-10-25 (01:30 BST "
-    "then 01:30 GMT, one hour apart) and ZERO times on 2026-03-29, jumping "
-    "straight to the 30th. For a schedule that opens PRs or deploys, the "
-    "autumn case is a duplicate action nobody asked for. Also note the box is "
-    "documented as GCP e2-micro, which is UTC by default — so this only bites "
-    "after someone sets a local timezone, and the schedule text gives no hint "
-    "which zone it meant."))
 def test_a_schedule_in_the_dst_window_fires_exactly_once_a_day(audit_env, london):
+    """FIXED (was FINDING E3, autumn half): on the fall-back day 01:30 happens
+    twice, an hour apart, and the schedule used to fire on both — a duplicate
+    deploy or PR nobody asked for. next_run_after now refuses to return the
+    same local wall-clock minute it just fired on."""
     autumn = _fires("daily 01:30", time.mktime((2026, 10, 24, 23, 0, 0, 0, 0, -1)), 3)
-    spring = _fires("daily 01:30", time.mktime((2026, 3, 28, 23, 0, 0, 0, 0, -1)), 2)
     assert len({f.split()[0] for f in autumn}) == len(autumn), f"duplicate day: {autumn}"
-    assert spring[0].startswith("2026-03-29"), f"skipped a day: {spring}"
+
+
+def test_the_spring_forward_gap_skips_a_day_rather_than_doubling_up(audit_env, london):
+    """ACCEPTED BEHAVIOUR (residual of FINDING E3). 01:30 does not exist on the
+    spring-forward day, so that schedule moves to the next day rather than
+    firing at a substituted hour. Recorded because it is a real surprise for a
+    once-a-day job — and because the safe direction to fail is 'not twice'."""
+    spring = _fires("daily 01:30", time.mktime((2026, 3, 28, 23, 0, 0, 0, 0, -1)), 2)
+    assert spring[0].startswith("2026-03-30"), spring
+    assert not any(f.startswith("2026-03-29") for f in spring)
 
 
 # ── CRUD ──

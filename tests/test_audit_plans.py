@@ -136,17 +136,9 @@ def test_resumed_plan_run_is_unattended_and_carries_the_plan_goal(audit_env):
     assert "publish the report" in run["goal"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING D3 (MEDIUM) — a plan blocked on a human is resumed as if it were "
-    "merely idle. memory.py:50 gives tasks two states, 'pending' and 'done'; "
-    "there is no 'blocked'/'waiting' state and nothing records that a step is "
-    "waiting on an answer. So a plan whose next step is 'ask the owner which "
-    "domain to deploy to' goes quiet for PLAN_STALE_SECONDS and is then "
-    "re-queued as unattended work — up to PLAN_MAX_RESUMES times — each round "
-    "burning AI calls to rediscover that it still needs the human. The idle "
-    "check (triggers.py:421) cannot distinguish 'nobody is working on this' "
-    "from 'this is waiting on you'."))
 def test_a_plan_waiting_on_a_human_is_not_resumed(audit_env):
+    """FIXED (was FINDING D3): a step marked `blocked` takes the whole plan out
+    of the sweeper's view until a human unblocks it."""
     conv = "C8:1"
     memory.create_plan(conv, "U_OWNER",
                        ["ask the owner which domain to deploy to",

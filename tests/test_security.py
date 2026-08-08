@@ -201,7 +201,10 @@ def test_redirects_are_revalidated(monkeypatch):
 
     assert response is None
     assert "private, loopback" in error
-    assert hops == ["http://example.com/redirect"]   # never fetched the metadata URL
+    # The first hop is fetched by its validated IP with the original Host
+    # header (see _safe_http_get); what matters is that the metadata URL was
+    # never requested at all.
+    assert len(hops) == 1 and "169.254.169.254" not in hops[0]
 
 
 def test_redirect_chains_terminate(monkeypatch):

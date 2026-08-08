@@ -287,7 +287,23 @@ def undecided_action_for_run(run_id: int) -> dict | None:
 
 
 def decide(approval_id: int, approved: bool, decided_by: str = "", note: str = "") -> dict | None:
-    """Approve or deny a pending request. Returns the updated row, or None."""
+    """
+    Approve or deny a pending request. Returns the updated row, or None.
+
+    Only the owner decides, checked here rather than only in the Slack command
+    that calls it. An approval queue anyone can answer is not a control, and
+    the check belonged in one place — the module that owns the invariant — not
+    in every caller that might one day exist.
+    """
+    import tools  # local import: tools imports memory, not governor
+
+    if not tools._is_owner(decided_by or ""):
+        logger.warning(
+            f"🖐️ Refused approval decision on #{approval_id} from "
+            f"{decided_by or 'an unidentified caller'}: not the owner"
+        )
+        return None
+
     conn = _db()
     try:
         cur = conn.execute(

@@ -76,18 +76,9 @@ def test_every_command_acks(audit_env, slack_bot, command):
 
 # ── delivered-once ──
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I3 (MEDIUM) — no delivery deduplication. bot.py's message and "
-    "app_mention listeners (bot.py:963, bot.py:997) key on nothing: there is no "
-    "seen-event table and no check of event ts / event_id / "
-    "x-slack-retry-num, which slack_bolt does surface in socket mode "
-    "(slack_bolt/adapter/socket_mode/internals.py:20). A redelivery after a "
-    "socket reconnect therefore runs the whole agent loop again: a second "
-    "reply, a second set of tool calls, double the AI spend. Bolt acks events "
-    "immediately (thread_runner.py:106), so this is a reconnect-window bug "
-    "rather than a per-message one — but the same gap also means two event "
-    "types for one message are processed twice (see FINDING I4)."))
 def test_a_redelivered_event_is_handled_once(audit_env, slack_bot, monkeypatch):
+    """FIXED (was FINDING I3): channel+ts identifies the message, and the
+    first listener to claim it wins."""
     bot, registry = slack_bot
     calls = []
     monkeypatch.setattr(bot, "call_ai",
@@ -99,16 +90,9 @@ def test_a_redelivered_event_is_handled_once(audit_env, slack_bot, monkeypatch):
     assert len(s1.sent) + len(s2.sent) == 1
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I4 (MEDIUM) — an @mention inside a DM is handled twice. Slack "
-    "delivers both message.im and app_mention for it; handle_message "
-    "(bot.py:963) filters only on bot_id, subtype and channel_type, and never "
-    "checks whether the text mentions the bot, while handle_mention "
-    "(bot.py:997) has no channel_type filter. Both therefore run the full "
-    "agent loop: two replies, two sets of tool calls. Needs a live workspace "
-    "to confirm Slack's delivery of app_mention in IMs; the code-level gap — "
-    "neither listener excludes the other's case — is confirmed here."))
 def test_a_mention_inside_a_dm_is_handled_once(audit_env, slack_bot, monkeypatch):
+    """FIXED (was FINDING I4): both listeners go through the same claim, so
+    whichever event Slack delivers first is the one that runs."""
     bot, registry = slack_bot
     calls = []
     monkeypatch.setattr(bot, "call_ai",
@@ -119,14 +103,9 @@ def test_a_mention_inside_a_dm_is_handled_once(audit_env, slack_bot, monkeypatch
     assert len(calls) == 1, f"the agent ran {len(calls)} times for one message"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I5 (MEDIUM) — the bot answers @mentions from other bots. "
-    "handle_mention (bot.py:997) has no bot_id guard, unlike handle_message "
-    "(bot.py:965). Any app that posts a message containing this bot's handle "
-    "— an alerting webhook, a CI notifier, another assistant — triggers a full "
-    "agent loop attributed to user 'unknown', and two such bots mentioning "
-    "each other loop until a budget stops them."))
 def test_a_mention_from_another_bot_is_ignored(audit_env, slack_bot, monkeypatch):
+    """FIXED (was FINDING I5): handle_mention now has the bot_id guard
+    handle_message always had."""
     bot, registry = slack_bot
     calls = []
     monkeypatch.setattr(bot, "call_ai",
@@ -153,15 +132,9 @@ def test_channel_chatter_without_a_mention_is_ignored(audit_env, slack_bot):
     assert say.sent == []
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I6 (MEDIUM) — a DM with a file attached is silently dropped. "
-    "handle_message returns early on ANY subtype (bot.py:965), and Slack tags "
-    "a message carrying an upload as subtype 'file_share'. bot.py has a "
-    "complete file pipeline behind that early return — image vision, PDF text "
-    "extraction, code-file reading (bot.py:484-560) — which a DM can therefore "
-    "never reach. Blanket-filtering subtypes is right for message_changed and "
-    "message_deleted; file_share is not one of those."))
 def test_a_dm_with_a_file_is_processed(audit_env, slack_bot, monkeypatch):
+    """FIXED (was FINDING I6): file_share is no longer filtered out with the
+    genuinely noisy subtypes, so the file pipeline is reachable from a DM."""
     bot, registry = slack_bot
     calls = []
     monkeypatch.setattr(bot, "call_ai",

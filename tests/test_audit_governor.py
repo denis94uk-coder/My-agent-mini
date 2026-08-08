@@ -191,14 +191,9 @@ def test_approvals_disabled_turns_external_into_a_flat_no(audit_env, monkeypatch
     assert runner._approval_gate({"unattended": True, "allow_risky": False}) is None
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING B1 (MEDIUM) — the approval decision has no authorisation check of "
-    "its own. governor.decide (governor.py:286) accepts any decided_by string; "
-    "the only owner check lives in bot.py:_decide_approval (bot.py:1177), i.e. "
-    "in the Slack layer. Any other caller — a future HTTP hook, a tool, a "
-    "REPL, a test-mode entry point — approves the owner's pending deploys. The "
-    "module that owns the invariant does not enforce it."))
 def test_decide_rejects_a_non_owner_caller(audit_env):
+    """FIXED (was FINDING B1): governor.decide checks the owner itself, so the
+    invariant no longer depends on every caller remembering to."""
     ap = governor.request_approval(1, "push_branch", {"branch": "x"})
     assert governor.decide(ap["id"], True, decided_by="U_STRANGER") is None
 

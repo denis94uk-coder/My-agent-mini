@@ -91,9 +91,47 @@ CONTEXT_TOOLS = {
 
 
 _OWNER_WARNED = False
+_ENV_MTIME = 0.0
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def _refresh_owner_from_env_file() -> None:
+    """Re-read OWNER_SLACK_ID from .env when the file changes.
+
+    Ownership was one env var read at boot, so revoking it — someone leaves,
+    an account is compromised — meant editing .env *and* restarting the
+    service, with every scheduled run acting as the old owner until someone
+    did. Re-reading on change makes an edit take effect on the next check.
+    """
+    global _ENV_MTIME
+    try:
+        mtime = os.path.getmtime(_ENV_PATH)
+    except OSError:
+        return
+    if mtime == _ENV_MTIME:
+        return
+    _ENV_MTIME = mtime
+    try:
+        with open(_ENV_PATH, "r", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line.startswith("OWNER_SLACK_ID"):
+                    continue
+                _, _, value = line.partition("=")
+                value = value.split("#", 1)[0].strip().strip("\'\"")
+                if os.environ.get("OWNER_SLACK_ID", "") != value:
+                    logger.warning(f"🔑 OWNER_SLACK_ID changed in .env — now {value or '(unset)'!r}")
+                os.environ["OWNER_SLACK_ID"] = value
+                return
+        # The line is gone entirely: that is a revocation, and it fails closed.
+        if os.environ.pop("OWNER_SLACK_ID", None):
+            logger.warning("🔑 OWNER_SLACK_ID removed from .env — owner-only tools are now disabled")
+    except OSError:
+        return
 
 
 def _is_owner(user_id: str) -> bool:
+    _refresh_owner_from_env_file()
     owner_id = os.environ.get("OWNER_SLACK_ID", "").strip()
     if not owner_id:
         # Fail CLOSED. With no owner configured nobody may use the privileged
@@ -306,6 +344,34 @@ from urllib.parse import urljoin, urlparse
 _SSRF_BLOCKED_HOSTNAMES = {"localhost", "metadata", "metadata.google.internal"}
 
 
+def _resolve_public_ips(hostname: str) -> list[str] | None:
+    """Every address a name resolves to, or None if any of them is internal.
+
+    Returning the addresses (not just a verdict) is what lets the caller
+    connect to the address it validated instead of resolving a second time.
+    """
+    if not hostname:
+        return None
+    host = hostname.lower()
+    if host in _SSRF_BLOCKED_HOSTNAMES or host.endswith((".internal", ".local")):
+        return None
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return None
+    addresses = []
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return None
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast):
+            return None
+        addresses.append(str(addr))
+    return addresses or None
+
+
 def _url_host_is_safe(hostname: str) -> bool:
     if not hostname:
         return False
@@ -340,15 +406,35 @@ def _safe_http_get(url: str, headers: dict, timeout: int = 15):
             return None, "❌ Blocked: malformed URL."
         if parsed.scheme not in ("http", "https"):
             return None, f"❌ Blocked: unsupported scheme '{parsed.scheme}'."
-        if not _url_host_is_safe(parsed.hostname or ""):
+        addresses = _resolve_public_ips(parsed.hostname or "")
+        if not addresses:
             return None, (
                 "❌ Blocked: that host resolves to a private, loopback or "
                 "link-local address. Internal services and cloud metadata "
                 "endpoints are not reachable through this tool."
             )
+        # Connect to the address we validated, not to the name. Handing the
+        # hostname to requests would resolve it a second time, and a record
+        # with a 0-second TTL can answer public on the check and private on
+        # the connect. Over TLS the certificate is issued to the name, so the
+        # URL keeps the hostname there and the window is narrowed instead by
+        # re-resolving immediately before the request.
+        request_url, request_headers = url, dict(headers)
+        if parsed.scheme == "http":
+            pinned = addresses[0]
+            netloc = f"[{pinned}]" if ":" in pinned else pinned
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            request_url = parsed._replace(netloc=netloc).geturl()
+            request_headers["Host"] = parsed.netloc
+        elif _resolve_public_ips(parsed.hostname or "") is None:
+            return None, (
+                "❌ Blocked: that host changed to a private address between the "
+                "check and the request."
+            )
         try:
-            resp = http_requests.get(url, headers=headers, timeout=timeout,
-                                     allow_redirects=False)
+            resp = http_requests.get(request_url, headers=request_headers,
+                                     timeout=timeout, allow_redirects=False)
         except Exception as e:
             return None, f"Failed to fetch URL: {str(e)[:300]}"
         if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):

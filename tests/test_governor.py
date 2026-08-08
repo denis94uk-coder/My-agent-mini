@@ -107,9 +107,9 @@ def test_request_and_decide():
     assert approval["args"] == {"site_name": "demo"}
     assert approval["tier"] == governor.EXTERNAL
 
-    decided = governor.decide(approval["id"], True, decided_by="U1")
+    decided = governor.decide(approval["id"], True, decided_by="default")
     assert decided["status"] == governor.APPROVED
-    assert decided["decided_by"] == "U1"
+    assert decided["decided_by"] == "default"
 
 
 def test_internal_args_are_not_stored():
@@ -117,10 +117,19 @@ def test_internal_args_are_not_stored():
     assert "_requesting_user_id" not in approval["args"]
 
 
+def test_only_the_owner_can_decide():
+    """The check lives in governor, not only in the Slack command."""
+    approval = governor.request_approval(1, "push_branch", {"branch": "x"})
+    assert governor.decide(approval["id"], True, decided_by="U_STRANGER") is None
+    assert governor.decide(approval["id"], True, decided_by="") is None
+    assert governor.get_approval(approval["id"])["status"] == governor.PENDING
+    assert governor.decide(approval["id"], True, decided_by="default") is not None
+
+
 def test_deciding_twice_does_nothing():
     approval = governor.request_approval(1, "push_branch", {})
-    assert governor.decide(approval["id"], True, decided_by="U1")
-    assert governor.decide(approval["id"], False, decided_by="U2") is None
+    assert governor.decide(approval["id"], True, decided_by="default")
+    assert governor.decide(approval["id"], False, decided_by="default") is None
     assert governor.get_approval(approval["id"])["status"] == governor.APPROVED
 
 
@@ -139,7 +148,7 @@ def test_expiry_is_a_deny_not_a_yes(monkeypatch):
 
 def test_denial_text_carries_the_reason_and_forbids_workarounds():
     approval = governor.request_approval(1, "restart_service", {})
-    denied = governor.decide(approval["id"], False, decided_by="U1", note="not during business hours")
+    denied = governor.decide(approval["id"], False, decided_by="default", note="not during business hours")
     text = governor.refusal_text(denied)
     assert "not during business hours" in text
     assert "another way" in text
@@ -201,7 +210,7 @@ def test_approved_tool_runs_on_resume_and_the_run_continues():
         assert runner.get_run(run_id)["status"] == runner.AWAITING_APPROVAL
 
         approval = governor.pending_for_run(run_id)
-        decided = governor.decide(approval["id"], True, decided_by="U1")
+        decided = governor.decide(approval["id"], True, decided_by="default")
         assert runner.resume_after_decision(decided) is True
         assert runner.get_run(run_id)["status"] == "queued"
 
@@ -228,7 +237,7 @@ def test_denied_tool_becomes_a_refusal_the_agent_works_around():
     runner.execute_run(runner.get_run(run_id))
 
     approval = governor.pending_for_run(run_id)
-    decided = governor.decide(approval["id"], False, decided_by="U1", note="wrong week")
+    decided = governor.decide(approval["id"], False, decided_by="default", note="wrong week")
     runner.resume_after_decision(decided)
     final = runner.execute_run(runner.get_run(run_id))
 

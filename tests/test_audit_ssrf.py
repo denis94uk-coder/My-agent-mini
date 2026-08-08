@@ -101,8 +101,8 @@ class _Resp:
 def test_redirect_to_a_private_ip_is_blocked_at_the_hop(audit_env, monkeypatch):
     monkeypatch.setattr(tools.http_requests, "get",
                         lambda *a, **k: _Resp(302, "http://169.254.169.254/latest/"))
-    monkeypatch.setattr(tools, "_url_host_is_safe",
-                        lambda h: h not in ("169.254.169.254",))
+    monkeypatch.setattr(tools, "_resolve_public_ips",
+                        lambda h: None if h == "169.254.169.254" else ["93.184.216.34"])
     resp, error = tools._safe_http_get("https://public.example.com", {})
     assert resp is None and "Blocked" in error
 
@@ -114,7 +114,8 @@ def test_redirect_chain_ending_private_is_blocked(audit_env, monkeypatch):
         return _Resp(302, hops.pop(0)) if hops else _Resp(200)
 
     monkeypatch.setattr(tools.http_requests, "get", fake_get)
-    monkeypatch.setattr(tools, "_url_host_is_safe", lambda h: not h.startswith("10."))
+    monkeypatch.setattr(tools, "_resolve_public_ips",
+                        lambda h: None if h.startswith("10.") else ["93.184.216.34"])
     resp, error = tools._safe_http_get("https://a.example.com", {})
     assert resp is None and "Blocked" in error
 
@@ -129,29 +130,39 @@ def test_redirect_to_a_non_http_scheme_is_blocked(audit_env, monkeypatch):
 def test_redirect_loop_terminates(audit_env, monkeypatch):
     monkeypatch.setattr(tools.http_requests, "get",
                         lambda *a, **k: _Resp(302, "https://loop.example.com/"))
-    monkeypatch.setattr(tools, "_url_host_is_safe", lambda h: True)
+    monkeypatch.setattr(tools, "_resolve_public_ips", lambda h: ["93.184.216.34"])
     resp, error = tools._safe_http_get("https://loop.example.com/", {})
     assert resp is None and "too many redirects" in error
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING F1 (MEDIUM) — TOCTOU / DNS rebinding. _url_host_is_safe "
-    "(tools.py:300) resolves the name, then _safe_http_get (tools.py:341) "
-    "hands the ORIGINAL hostname to requests.get, which resolves it a second "
-    "time. An attacker-controlled name with a 0-second TTL can answer public "
-    "on the check and private on the connect. The validated IP is discarded "
-    "instead of being the thing connected to (pin the IP + send Host:, or "
-    "resolve once and reuse the address)."))
 def test_connects_to_the_validated_ip_not_the_hostname(audit_env, monkeypatch):
+    """FIXED (was FINDING F1): over http the request goes to the address that
+    was validated, with the original Host header, so a second resolution
+    cannot substitute a private one."""
     answers = [[(2, 1, 6, "", ("93.184.216.34", 0))],   # check sees public
-               [(2, 1, 6, "", ("127.0.0.1", 0))]]       # connect would see loopback
+               [(2, 1, 6, "", ("127.0.0.1", 0))]]       # a rebind on connect
     monkeypatch.setattr(tools.socket, "getaddrinfo", lambda *a, **k: answers.pop(0))
     requested = {}
     monkeypatch.setattr(tools.http_requests, "get",
-                        lambda url, **kw: requested.update(url=url) or _Resp(200))
+                        lambda url, **kw: requested.update(url=url, headers=kw.get("headers"))
+                        or _Resp(200))
     tools._safe_http_get("http://rebind.example.com/x", {})
     assert "93.184.216.34" in requested["url"], (
         "connected by hostname; the validated address was thrown away")
+    assert requested["headers"]["Host"] == "rebind.example.com"
+
+
+def test_a_host_that_turns_private_between_check_and_request_is_blocked(audit_env, monkeypatch):
+    """Over TLS the certificate is issued to the name, so the URL has to keep
+    the hostname. The window is narrowed by re-resolving immediately before the
+    request instead."""
+    answers = [[(2, 1, 6, "", ("93.184.216.34", 0))],
+               [(2, 1, 6, "", ("127.0.0.1", 0))]]
+    monkeypatch.setattr(tools.socket, "getaddrinfo", lambda *a, **k: answers.pop(0))
+    monkeypatch.setattr(tools.http_requests, "get",
+                        lambda *a, **k: pytest.fail("request made after a rebind"))
+    resp, error = tools._safe_http_get("https://rebind.example.com/x", {})
+    assert resp is None and "changed to a private address" in error
 
 
 # ── injection: untrusted text reaching the model ──

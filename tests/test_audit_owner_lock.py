@@ -139,28 +139,47 @@ def test_a_plan_with_no_recorded_owner_is_not_treated_as_the_owner(audit_env, mo
         "documenting the sharp edge: 'default' is a legal owner id")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING A1 (MEDIUM) — code vs documented contract. CLAUDE.md: 'Unattended "
-    "runs block OWNER_ONLY_TOOLS (opt-in via schedule allow_risky)'. "
-    "runner._blocked_tools_for (runner.py:585) blocks only "
-    "UNATTENDED_BLOCKED_TOOLS, plus EXTERNAL-tier tools when approvals are "
-    "off. With approvals on (the default) a cron run executes run_shell and "
-    "run_python as the owner, unattended, with no approval prompt — the tier "
-    "gate only covers EXTERNAL, and those two are WRITE_LOCAL."))
-def test_unattended_runs_block_owner_only_tools(audit_env):
+def test_unattended_runs_are_gated_by_tier_not_by_the_owner_only_list(audit_env):
+    """RESOLVED (was FINDING A1, as a documentation fix): CLAUDE.md claimed
+    unattended runs block OWNER_ONLY_TOOLS. They never did, and shouldn't —
+    repo-review cannot run the test suite without run_shell. The contract now
+    describes the tier gate that actually exists."""
     blocked = runner._blocked_tools_for({"unattended": True, "allow_risky": False})
-    assert set(tools.OWNER_ONLY_TOOLS) <= blocked
+    # Always a flat no: these spawn more autonomous work.
+    assert set(tools.UNATTENDED_BLOCKED_TOOLS) <= blocked
+    # Owner-only but local: allowed, and gated by the run's owner identity.
+    assert "run_shell" not in blocked and "run_python" not in blocked
+    # EXTERNAL is not blocked either — it parks for approval instead.
+    gate = runner._approval_gate({"unattended": True, "allow_risky": False})
+    assert gate("push_branch", {}) is False, "EXTERNAL should park, not run"
+    assert gate("run_shell", {}) is True, "WRITE_LOCAL should not park"
+
+    claude_md = Path(__file__).resolve().parent.parent / "CLAUDE.md"
+    assert "block `OWNER_ONLY_TOOLS`" not in claude_md.read_text(), (
+        "the stale contract is back in CLAUDE.md")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING A2 (MEDIUM) — no revocation path. Ownership is one env var "
-    "(tools.py:92 `_is_owner`) compared against a Slack user id recorded on the "
-    "run. Nothing consults workspace membership, so a schedule created by an "
-    "owner who has since been deactivated keeps executing owner-only tools "
-    "until a human edits .env and restarts. There is no way to revoke from "
-    "Slack, and no test asserts one exists."))
-def test_owner_privileges_can_be_revoked_without_editing_env(audit_env):
-    assert any(hasattr(mod, "revoke_owner") for mod in (tools, governor, runner))
+def test_owner_privileges_can_be_revoked_by_editing_env(audit_env, monkeypatch, tmp_path):
+    """FIXED (was FINDING A2): revoking used to need an .env edit AND a service
+    restart, so a departed owner's schedules kept full privilege in between.
+    The lock now re-reads .env when it changes, on the next check."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("OWNER_SLACK_ID=U_OWNER\n")
+    monkeypatch.setattr(tools, "_ENV_PATH", str(env_file))
+    monkeypatch.setattr(tools, "_ENV_MTIME", 0.0)
+    monkeypatch.setenv("OWNER_SLACK_ID", "U_OWNER")
+    assert tools._is_owner("U_OWNER") is True
+
+    # Hand the bot to someone else — no restart.
+    env_file.write_text("OWNER_SLACK_ID=U_SUCCESSOR\n")
+    assert tools._is_owner("U_OWNER") is False
+    assert tools._is_owner("U_SUCCESSOR") is True
+
+    # Remove the line entirely: that is a revocation, and it fails closed.
+    env_file.write_text("# nobody owns this any more\n")
+    assert tools._is_owner("U_SUCCESSOR") is False
+    assert tools.run_tool("run_shell", {"command": "id",
+                                        "_requesting_user_id": "U_SUCCESSOR"}).startswith("❌")
 
 
 # ── the Slack command surface ──
@@ -199,17 +218,15 @@ def test_destructive_slash_commands_refuse_a_stranger(slack_bot):
         "stranger deleted the owner's schedule")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING A4 (MEDIUM) — read-only operator commands are open to the whole "
-    "workspace. /runs (bot.py:1116) prints every background run's goal text, "
-    "/schedules (bot.py:1145) prints every schedule's goal, and /health "
-    "(bot.py:1262) prints the last five internal errors, disk figures and "
-    "provider state. Goals are written by the owner and routinely name repos, "
-    "hosts and customers; the error list can carry provider error text "
-    "(see FINDING G3)."))
 def test_operator_readouts_are_not_world_readable(slack_bot):
+    """FIXED (was FINDING A4): goal text and the error list are owner-only;
+    everyone still sees status, counts and schedule names."""
     bot, registry = slack_bot
     runner.enqueue_run("rotate the prod credentials for acme-corp",
                        owner_user_id="U_OWNER")
-    say, _ = slash(registry, "/runs", user="U_STRANGER")
-    assert "acme-corp" not in (say.last or "")
+    stranger, _ = slash(registry, "/runs", user="U_STRANGER")
+    assert "acme-corp" not in (stranger.last or "")
+    assert "#1" in (stranger.last or ""), "status should still be visible"
+
+    owner, _ = slash(registry, "/runs", user="U_OWNER")
+    assert "acme-corp" in (owner.last or ""), "the owner still sees their own goals"

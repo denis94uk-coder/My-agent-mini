@@ -1090,8 +1090,14 @@ def stop_workers():
     _WORKERS_STARTED = False
 
 
-def format_runs(limit: int = 8) -> str:
-    """Human-readable run list for Slack."""
+def format_runs(limit: int = 8, show_goals: bool = True) -> str:
+    """
+    Human-readable run list for Slack.
+
+    `show_goals=False` keeps the goal text out. Goals are written by the owner
+    and routinely name repos, hosts and customers, while `/runs` is readable by
+    anyone in the workspace.
+    """
     runs = list_runs(limit=limit)
     if not runs:
         return "No runs yet."
@@ -1101,8 +1107,9 @@ def format_runs(limit: int = 8) -> str:
     for r in runs:
         when = time.strftime("%m-%d %H:%M", time.localtime(r["created"]))
         detail = f"{r['steps_used']}/{r['max_steps']} steps"
+        goal = r["goal"][:70] if show_goals else "_(goal hidden — owner only)_"
         lines.append(
             f"{icons.get(r['status'], '•')} *#{r['id']}* [{r['source']}] {when} — "
-            f"{r['goal'][:70]} _({r['status']}, {detail})_"
+            f"{goal} _({r['status']}, {detail})_"
         )
     return "\n".join(lines)

@@ -100,16 +100,10 @@ def test_clear_does_not_touch_another_channel(audit_env, slack_bot):
     assert len(memory.get_history("C_OTHER:1", limit=10)) == 1
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I2 (MEDIUM) — /clear says 'Memory cleared!' but deletes rows from "
-    "`conversations` only (bot.py:1058-1072). thread_summaries, facts "
-    "(including decisions), the concept graph and run transcripts all survive, "
-    "and cross-thread recall + rolling summaries put that content straight back "
-    "into the next reply. A user who clears a channel because something "
-    "sensitive was said has not removed it. README calls the command 'Reset "
-    "conversation memory', which is nearer the truth than the confirmation "
-    "message is."))
 def test_clear_clears_what_it_claims(audit_env, slack_bot):
+    """FIXED (was FINDING I2): /clear removes the channel's messages AND its
+    thread summaries — the summary was the path by which "cleared" content came
+    back — and the reply now states exactly what went and what was kept."""
     bot, registry = slack_bot
     memory.add_message("C_CHAN:1", "user", "my card number is 4111 1111 1111 1111")
     memory.save_thread_summary("C_CHAN:1", "U_OWNER",
@@ -117,11 +111,17 @@ def test_clear_clears_what_it_claims(audit_env, slack_bot):
     memory.add_fact("U_OWNER", "card on file ends 1111", category="decision")
 
     say, _ = slash(registry, "/clear", user="U_OWNER", channel="C_CHAN")
-    assert "cleared" in (say.last or "").lower()
+    reply = say.last or ""
+    assert "Cleared" in reply
 
-    leftovers = memory.search_all_relevant("card number")
+    leftovers = memory.search_all_relevant("card number", scope_channel="C_CHAN")
     assert not leftovers, f"still recallable after /clear: {leftovers}"
-    assert memory.get_facts("U_OWNER")["durable"] == []
+    assert memory.get_summary_state("C_CHAN:1") == ("", 0)
+
+    # Decisions are per-user project memory, not channel history: they survive
+    # on purpose, and the reply has to say so rather than claim a full wipe.
+    assert memory.get_facts("U_OWNER")["durable"] != []
+    assert "decisions" in reply and "kept" in reply
 
 
 # ── growth ──

@@ -34,6 +34,7 @@ import logging
 import mimetypes
 import traceback
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 # ── Load .env file (must happen BEFORE reading any tokens) ──
@@ -978,10 +979,44 @@ def _maybe_summarize_thread(conv_key: str, user_id: str):
     threading.Thread(target=_worker, daemon=True).start()
 
 
+# ── Delivered-once ──
+# Slack redelivers an event after a socket reconnect, and a message that
+# @-mentions the bot inside a DM arrives twice — once as message.im, once as
+# app_mention. Neither listener could tell, so the whole agent loop ran again:
+# a second reply, a second set of tool calls, double the AI spend. One channel
+# + timestamp is the message's identity; first listener to claim it wins.
+_SEEN_EVENTS: "OrderedDict[tuple, float]" = OrderedDict()
+_SEEN_LOCK = threading.Lock()
+SEEN_EVENT_TTL = 900          # a redelivery arrives in seconds, not minutes
+SEEN_EVENT_MAX = 1024
+
+
+def _claim_event(channel: str, ts: str) -> bool:
+    """True if this message is ours to handle; False if it was already taken."""
+    if not ts:
+        return True
+    key = (channel, ts)
+    now = time.time()
+    with _SEEN_LOCK:
+        cutoff = now - SEEN_EVENT_TTL
+        while _SEEN_EVENTS and next(iter(_SEEN_EVENTS.values())) < cutoff:
+            _SEEN_EVENTS.popitem(last=False)
+        if key in _SEEN_EVENTS:
+            logger.info(f"↩️ Ignoring duplicate delivery of {channel}/{ts}")
+            return False
+        _SEEN_EVENTS[key] = now
+        while len(_SEEN_EVENTS) > SEEN_EVENT_MAX:
+            _SEEN_EVENTS.popitem(last=False)
+    return True
+
+
 @slack_app.event("message")
 def handle_message(event, say):
     """Handle DMs — now with file support."""
-    if event.get("bot_id") or event.get("subtype"):
+    # `file_share` is an ordinary message that happens to carry an upload, and
+    # the whole file pipeline below only ever runs for it. The other subtypes
+    # (message_changed, message_deleted, channel_join …) really are noise.
+    if event.get("bot_id") or event.get("subtype") not in (None, "", "file_share"):
         return
 
     channel = event["channel"]
@@ -995,6 +1030,8 @@ def handle_message(event, say):
     if not user_text and not files:
         return
     if channel_type not in ("im", "mpim"):
+        return
+    if not _claim_event(channel, msg_ts):
         return
 
     file_info = f" + {len(files)} file(s)" if files else ""
@@ -1015,12 +1052,21 @@ def handle_message(event, say):
 @slack_app.event("app_mention")
 def handle_mention(event, say):
     """Handle @mentions in channels — now with file support."""
+    # Same guard handle_message has. Without it, any app that posts text
+    # containing this bot's handle — an alerting webhook, a CI notifier,
+    # another assistant — starts a full agent loop, and two such bots can
+    # keep each other going until a budget stops them.
+    if event.get("bot_id"):
+        return
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event["ts"]
     msg_ts = event.get("ts")
     user_id = event.get("user", "unknown")
     user_text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
     files = event.get("files", [])
+
+    if not _claim_event(channel, msg_ts):
+        return
 
     if not user_text and not files:
         say(text=f"Hey! I'm {BOT_NAME} 👋 Ask me anything — I can search the web, run code, analyze images, and more!", thread_ts=thread_ts)
@@ -1080,13 +1126,29 @@ def handle_clear(ack, command, say):
         say(text="❌ Only the bot's owner can clear memory.", channel=command["channel_id"])
         return
     channel = command["channel_id"]
+    # Thread summaries are memory too: leaving them behind meant a "cleared"
+    # channel could still quote the cleared conversation back, via the rolling
+    # digest and cross-thread recall. Project memory (decisions) is per-user
+    # and deliberately survives — so the reply now says exactly what went.
     conn = memory.get_db()
     try:
-        conn.execute("DELETE FROM conversations WHERE conv_key LIKE ?", (f"{channel}:%",))
+        messages = conn.execute(
+            "DELETE FROM conversations WHERE conv_key LIKE ?", (f"{channel}:%",)
+        ).rowcount
+        summaries = conn.execute(
+            "DELETE FROM thread_summaries WHERE conv_key LIKE ?", (f"{channel}:%",)
+        ).rowcount
         conn.commit()
     finally:
         conn.close()
-    say(text="🧹 Memory cleared!", channel=channel)
+    say(
+        text=(f"🧹 Cleared this channel's memory: {messages} message(s) and "
+              f"{summaries} thread summar{'y' if summaries == 1 else 'ies'}.\n"
+              "_Other channels are untouched, and durable project memory "
+              "(decisions you asked me to remember) is kept — ask me to forget "
+              "a specific decision if you want that gone too._"),
+        channel=channel,
+    )
 
 
 @slack_app.command("/workflow")
@@ -1155,12 +1217,18 @@ def handle_runs(ack, command, say):
             say(text=f"Run #{run_id} isn't queued or running.", channel=channel)
         return
 
+    is_owner = tools._is_owner(command.get("user_id", ""))
+
     if text and text[0].isdigit():
+        if not is_owner:
+            say(text="❌ Run detail is owner-only. `/runs` shows status without goals.",
+                channel=channel)
+            return
         say(text=tools.run_tool("run_status", {"run_id": int(text[0])}), channel=channel)
         return
 
     say(
-        text="🏃 *Background runs*\n\n" + runner.format_runs()
+        text="🏃 *Background runs*\n\n" + runner.format_runs(show_goals=is_owner)
         + "\n\n_`/runs <id>` for detail, `/runs cancel <id>` to stop one._",
         channel=channel,
     )
@@ -1189,7 +1257,8 @@ def handle_schedules(ack, command, say):
         return
 
     say(
-        text="⏰ *Scheduled tasks*\n\n" + triggers.format_schedules()
+        text="⏰ *Scheduled tasks*\n\n"
+        + triggers.format_schedules(show_goals=tools._is_owner(command.get("user_id", "")))
         + "\n\n_`/schedules cancel <name>` to remove one._",
         channel=channel,
     )
@@ -1316,12 +1385,16 @@ def handle_health(ack, command, say):
 
     log_size_kb = round(LOG_FILE.stat().st_size / 1024, 1) if LOG_FILE.exists() else 0
 
-    recent_errors = ERROR_LOG[-5:]
+    # Errors quote whatever failed — request URLs, file paths, provider
+    # payloads. Scrubbed, but still operator detail, so only the owner sees it.
+    recent_errors = ERROR_LOG[-5:] if tools._is_owner(command.get("user_id", "")) else []
     if recent_errors:
         err_lines = "\n".join(
             f"  • {time.strftime('%m-%d %H:%M', time.localtime(ts))} — {msg}"
             for ts, msg in recent_errors
         )
+    elif not tools._is_owner(command.get("user_id", "")):
+        err_lines = f"  _({len(ERROR_LOG)} tracked — owner only)_"
     else:
         err_lines = "  none 🎉"
 

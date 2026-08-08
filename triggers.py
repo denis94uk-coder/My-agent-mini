@@ -187,14 +187,52 @@ def _field_matches(field: str, value: int, wrap: int | None = None) -> bool:
     return False
 
 
+# minute, hour, day-of-month, month, day-of-week
+_CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+_CRON_FIELD_NAMES = ("minute", "hour", "day of month", "month", "day of week")
+
+
+def _validate_cron_field(field: str, low: int, high: int, name: str):
+    """Every number in one cron field has to be a number that field can hold."""
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"Empty {name} field. {SPEC_HELP}")
+        value, _, step = part.partition("/")
+        if step and (not step.isdigit() or int(step) == 0):
+            raise ValueError(f"Bad step '/{step}' in the {name} field. {SPEC_HELP}")
+        if value == "*":
+            continue
+        bounds = value.split("-")
+        if len(bounds) > 2:
+            raise ValueError(f"Bad range '{value}' in the {name} field. {SPEC_HELP}")
+        for bound in bounds:
+            if not bound.isdigit():
+                raise ValueError(f"Bad {name} value '{bound}'. {SPEC_HELP}")
+            if not (low <= int(bound) <= high):
+                raise ValueError(
+                    f"{name.capitalize()} {bound} is out of range ({low}-{high}). "
+                    f"{SPEC_HELP}")
+        if len(bounds) == 2 and int(bounds[0]) > int(bounds[1]):
+            raise ValueError(f"Backwards {name} range '{value}'. {SPEC_HELP}")
+
+
 def _validate_cron(cron: str):
+    """
+    Reject a cron line that cannot fire, not just one that cannot parse.
+
+    Character-set validation alone accepted `0 25 * * *`: stored, listed as an
+    active schedule, and silently never due, which is indistinguishable from a
+    working schedule until someone notices the work never happened.
+    """
     fields = cron.split()
     if len(fields) != 5:
         raise ValueError(f"A cron line needs 5 fields. {SPEC_HELP}")
     allowed = set("0123456789*/,- ")
-    for field in fields:
+    for field, (low, high), name in zip(fields, _CRON_RANGES, _CRON_FIELD_NAMES):
         if not field or set(field) - allowed:
             raise ValueError(f"Bad cron field '{field}'. {SPEC_HELP}")
+        _validate_cron_field(field, low, high, name)
 
 
 def _cron_matches(cron: str, when: float) -> bool:
@@ -219,9 +257,18 @@ def next_run_after(spec: str, after: float | None = None) -> float:
 
     # Scan minute by minute from the next whole minute. Bounded at ~13 months
     # so an impossible date (Feb 30) fails loudly instead of hanging.
+    #
+    # Cron is matched in the server's local time, so on a DST fall-back the
+    # same wall-clock minute happens twice, an hour apart: `daily 01:30` used
+    # to fire at 01:30 BST and again at 01:30 GMT. A schedule that opens a PR
+    # or deploys would do it twice. Skipping candidates that land on the same
+    # local Y-M-D H:M as the run we are scheduling after collapses the repeat
+    # back to one firing. (The spring-forward hour simply does not exist; that
+    # schedule moves to the next day, which is the safe direction.)
+    fired_minute = time.localtime(after)[:5]
     candidate = (int(after) // 60) * 60 + 60
     for _ in range(60 * 24 * 400):
-        if _cron_matches(value, candidate):
+        if _cron_matches(value, candidate) and time.localtime(candidate)[:5] != fired_minute:
             return float(candidate)
         candidate += 60
     raise ValueError(f"Schedule '{spec}' never matches a real date.")
@@ -391,8 +438,13 @@ def _set_schedule_fields(schedule_id: int, **fields):
         conn.close()
 
 
-def format_schedules() -> str:
-    """Human-readable schedule list for Slack."""
+def format_schedules(show_goals: bool = True) -> str:
+    """
+    Human-readable schedule list for Slack.
+
+    `show_goals=False` hides the goal text for the same reason format_runs
+    does: the list is world-readable, the goals are the owner's.
+    """
     scheds = list_schedules()
     if not scheds:
         return "No schedules set. Ask me to schedule something, e.g. _\"every weekday at 9am, check the repo for open PRs and summarize them\"_."
@@ -401,9 +453,10 @@ def format_schedules() -> str:
         state = "" if s["enabled"] else " _(disabled)_"
         nxt = time.strftime("%a %m-%d %H:%M", time.localtime(s["next_run"]))
         risky = " ⚠️ risky-tools-allowed" if s["allow_risky"] else ""
+        goal = s["goal"][:120] if show_goals else "goal hidden — owner only"
         lines.append(
             f"⏰ *{s['name']}* — `{s['spec']}` → next {nxt}{state}{risky}\n"
-            f"    _{s['goal'][:120]}_ ({s['run_count']} run(s) so far)"
+            f"    _{goal}_ ({s['run_count']} run(s) so far)"
         )
     return "\n".join(lines)
 
@@ -416,6 +469,11 @@ def stale_plan_conv_keys(now: float | None = None, stale_seconds: int | None = N
 
     Quiet means both the plan and the conversation itself have been idle —
     an actively chatting human is never interrupted by a resume.
+
+    A plan with a step marked `blocked` is not quiet, it is waiting: resuming
+    it just spends AI calls rediscovering that it still needs a human answer.
+    Mark the step `blocked` (the `update_task` tool already offers that status)
+    and the sweeper leaves the plan alone until someone unblocks it.
     """
     now = time.time() if now is None else now
     stale = stale_seconds if stale_seconds is not None else _int_env("PLAN_STALE_SECONDS", 600)
@@ -424,7 +482,8 @@ def stale_plan_conv_keys(now: float | None = None, stale_seconds: int | None = N
     conn = _db()
     try:
         rows = conn.execute(
-            "SELECT conv_key, MAX(updated) FROM tasks WHERE status != 'done' "
+            "SELECT conv_key, MAX(updated) FROM tasks WHERE status NOT IN ('done', 'blocked') "
+            "AND conv_key NOT IN (SELECT conv_key FROM tasks WHERE status = 'blocked') "
             "GROUP BY conv_key HAVING MAX(updated) < ?",
             (cutoff,),
         ).fetchall()

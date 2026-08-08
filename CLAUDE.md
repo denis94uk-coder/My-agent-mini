@@ -92,9 +92,14 @@ response — works on any provider, no native function calling required.
   EXTERNAL ⇒ owner-only. `run_shell` is owner-only but WRITE_LOCAL, because
   gating `ls` behind Slack approval trains people to approve blind.
 - **Unattended ≠ owner-approved.** `OWNER_SLACK_ID` asks "is the human asking
-  right now the owner?" — meaningless when cron is the caller. Unattended runs
-  block `OWNER_ONLY_TOOLS` (opt-in via schedule `allow_risky`) and always block
-  `UNATTENDED_BLOCKED_TOOLS` (tools that spawn more autonomous work).
+  right now the owner?" — meaningless when cron is the caller. An unattended
+  run acts as the schedule's recorded owner, and what it may do is decided by
+  *tier*, not by the owner-only list: `UNATTENDED_BLOCKED_TOOLS` is always a
+  flat no, EXTERNAL parks for approval (or is a flat no with approvals off),
+  and everything else runs. That deliberately includes owner-only WRITE_LOCAL
+  tools — `repo-review` cannot run the test suite without `run_shell`. Gating
+  those behind Slack approval would put an "approve `ls`?" prompt in front of
+  a human, which is how an approval queue becomes a button people press blind.
 - **Plan sweeper must not talk over a human.** Resume only when plan *and*
   Slack thread both idle ≥ `PLAN_STALE_SECONDS`. Don't drop that check.
 - **Durability boundary is the step, never mid-tool.** Persist to `run_events`
