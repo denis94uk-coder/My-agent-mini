@@ -153,8 +153,22 @@ def daily_limit() -> int:
     return max(0, _int_env("RUN_DAILY_LIMIT", 50))
 
 
+# Worker threads are named with this prefix so `health.py` can count the live
+# ones. Kept next to worker_count so the two stay in step.
+WORKER_THREAD_PREFIX = "run-worker-"
+
+
 def worker_count() -> int:
     return max(1, _int_env("RUN_WORKERS", 2))
+
+
+def workers_started() -> bool:
+    """Whether start_workers has run in this process.
+
+    The health check needs this to tell "the workers died" from "the workers
+    were never started" — only the first is a fault.
+    """
+    return _WORKERS_STARTED
 
 
 def max_retries() -> int:
@@ -1078,7 +1092,15 @@ def start_workers(count: int | None = None) -> int:
 
     n = count or worker_count()
     for i in range(n):
-        threading.Thread(target=_worker_loop, args=(f"w{i + 1}",), daemon=True).start()
+        # Named so the health endpoint can count how many are actually alive.
+        # A worker thread that died takes its share of the queue with it and
+        # nothing else notices — runs simply stop draining.
+        threading.Thread(
+            target=_worker_loop,
+            args=(f"w{i + 1}",),
+            name=f"{WORKER_THREAD_PREFIX}{i + 1}",
+            daemon=True,
+        ).start()
     return n
 
 

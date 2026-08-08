@@ -54,6 +54,7 @@ import governor
 import runner
 import triggers
 import workflows
+import health
 import concept_graph
 
 # ── Logging ──
@@ -1360,6 +1361,12 @@ def start_autonomy() -> tuple[int, bool]:
     )
     workers = runner.start_workers()
     scheduler_on = triggers.start_scheduler()
+
+    # Started after the workers so the endpoint never reports "0 alive" during
+    # the window before they exist. The route list is pushed in rather than
+    # imported, so health.py stays free of the Slack client.
+    health.set_route_source(lambda: [p["name"] for p in PROVIDERS])
+    health.start()
 
     # Context budgeting is invisible until a model rejects the request, so
     # state it at boot. The system prompt is sent on every call and dwarfs the
