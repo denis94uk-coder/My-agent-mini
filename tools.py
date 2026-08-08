@@ -443,11 +443,7 @@ def memory_search(query: str) -> str:
 
 @tool(
     "remember",
-    "Store durable memory for future conversations. Use category='decision' for "
-    "things that must survive into future threads — stated priorities, roadmap "
-    "items, architecture/process choices, explicit instructions ('don't do X yet'). "
-    "Use category='fact' (default) for casual preferences/details. Decisions are "
-    "never crowded out of context the way plain facts are.",
+    'Store durable memory. category=\'decision\' for anything that must survive into future threads (priorities, roadmap, architecture/process choices, "don\'t do X yet") — decisions are never crowded out of context. category=\'fact\' (default) for casual preferences.',
     "fact, category",
 )
 def remember(fact: str, user_id: str = "default", category: str = "fact") -> str:
@@ -464,10 +460,7 @@ def remember(fact: str, user_id: str = "default", category: str = "fact") -> str
 
 @tool(
     "graph_recall",
-    "Search the concept graph for entities and their connections. "
-    "Use when you need to understand how concepts, technologies, projects, "
-    "or decisions relate to each other — complements memory_search which "
-    "finds raw text. Returns entities with types, relationships, and context.",
+    'Search the concept graph for entities and how they connect — complements memory_search, which finds raw text. Returns entities, types, relationships, context.',
     "query",
 )
 def graph_recall_tool(query: str) -> str:
@@ -546,9 +539,7 @@ def list_tasks_tool(conv_key: str = "default") -> str:
 
 @tool(
     "start_background_run",
-    "Start a long task as a background run that survives restarts and doesn't block chat. "
-    "Use for work that needs many steps or a long wait; you get a run id back immediately "
-    "and the result is posted when it finishes. Not for quick answers. Owner only.",
+    "Start a long task as a background run that survives restarts and doesn't block chat. Returns a run id immediately; the result is posted when it finishes. Not for quick answers. Owner only.",
     "goal",
 )
 def start_background_run(goal: str, _user_id: str = "default", _conv_key: str = "") -> str:
@@ -831,7 +822,7 @@ def github_read_file(path: str, owner: str = "", repo: str = "", branch: str = "
 
 @tool(
     "github_write_file",
-    "Propose a change to a file in a GitHub repo. Creates a new branch, commits the change there, and opens a pull request against the base branch for human review — it never commits straight to main. Returns the PR URL. Owner-only tool.",
+    'Propose a one-file change to a GitHub repo: creates a branch, commits there, opens a PR — never commits to main. Returns the PR URL. Owner-only.',
     "path, content, message, owner='', repo='', base_branch='main'",
 )
 def github_write_file(
@@ -943,7 +934,7 @@ def _git_extra_header_arg() -> list[str]:
 
 @tool(
     "clone_repo",
-    "Clone a GitHub repo into the coding workspace (repos/<repo>) so you can read, edit, and test multiple files with repo_read_file/repo_write_file/run_shell. Safe to call again later — refreshes the existing clone to the latest branch instead of re-cloning. Works for private repos via GITHUB_TOKEN.",
+    'Clone a GitHub repo into repos/<repo> for multi-file work. Safe to call again — refreshes the existing clone instead of re-cloning. Private repos via GITHUB_TOKEN.',
     "repo, owner='', branch='main'",
 )
 def clone_repo(repo: str, owner: str = "", branch: str = "main") -> str:
@@ -1043,10 +1034,7 @@ def repo_read_file(relpath: str, start_line: int = 1) -> str:
 
 @tool(
     "repo_edit_file",
-    "Make a targeted edit to a file inside a cloned repo by replacing an exact "
-    "text snippet. Much safer than repo_write_file for existing files — never "
-    "rewrites the whole file. old_text must appear EXACTLY once (include enough "
-    "surrounding lines to make it unique). Read the file first with repo_read_file.",
+    'Edit a file in a cloned repo by replacing an exact snippet; never rewrites the whole file. old_text must appear EXACTLY once — include enough surrounding lines to make it unique. Read the file first with repo_read_file.',
     "relpath, old_text, new_text",
 )
 def repo_edit_file(relpath: str, old_text: str, new_text: str) -> str:
@@ -1152,10 +1140,7 @@ def _which(cmd: str) -> bool:
 
 @tool(
     "repo_check",
-    "Run the quality gate on a cloned repo: syntax-check all changed .py files, "
-    "ruff lint, and pytest if a tests/ folder exists. Run this after editing and "
-    "BEFORE committing/pushing. push_branch runs it automatically and refuses to "
-    "push on syntax errors or failing tests.",
+    'Run the quality gate on a cloned repo: syntax-check changed .py files, ruff lint, pytest if tests/ exists. Run after editing, before committing.',
     "repo",
 )
 def repo_check(repo: str) -> str:
@@ -1196,7 +1181,7 @@ def repo_list_files(relpath: str = "") -> str:
 
 @tool(
     "push_branch",
-    "Push locally committed changes from a cloned repo (repos/<repo>) as a new branch and open a pull request for human review — never touches the base branch directly. Commit your changes first via run_shell (cd repos/<repo> && git add -A && git commit -m '...'). Owner-only tool.",
+    'Push committed changes from repos/<repo> as a new branch and open a PR — never touches the base branch. Commit first via run_shell. Owner-only.',
     "repo, branch_name, pr_title, owner='', pr_body='', base_branch='main'",
 )
 def push_branch(
@@ -1275,8 +1260,102 @@ def push_branch(
 
 
 @tool(
+    "github_list_pull_requests",
+    "List open (or closed) pull requests: number, title, author, branch, draft "
+    "state. github_list_issues deliberately excludes PRs, so this is the only "
+    "way to see them.",
+    "owner='', repo='', state='open'",
+)
+def github_list_pull_requests(owner: str = "", repo: str = "", state: str = "open") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        resp = http_requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls",
+            headers=headers,
+            params={"state": state, "per_page": 20},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        prs = resp.json()
+        if not prs:
+            return f"No {state} pull requests."
+        lines = []
+        for p in prs:
+            draft = " [draft]" if p.get("draft") else ""
+            lines.append(
+                f"#{p['number']} {p['title']}{draft} — @{p['user']['login']}, "
+                f"{p['head']['ref']} → {p['base']['ref']}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ GitHub PR list error: {str(e)[:300]}"
+
+
+@tool(
+    "github_pr_status",
+    "Mergeability and CI results for one pull request: review state, merge "
+    "conflicts, and which checks failed. Use before deciding whether a PR "
+    "needs work.",
+    "number, owner='', repo=''",
+)
+def github_pr_status(number: int, owner: str = "", repo: str = "") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        base = f"{GITHUB_API}/repos/{owner}/{repo}"
+        pr = http_requests.get(f"{base}/pulls/{number}", headers=headers, timeout=15)
+        pr.raise_for_status()
+        pr = pr.json()
+
+        lines = [f"#{pr['number']} {pr['title']} ({pr['state']})"]
+        if pr.get("merged"):
+            lines.append("Merged — no further work needed.")
+            return "\n".join(lines)
+        # mergeable is computed asynchronously by GitHub; null means "ask again"
+        # rather than "fine", and reporting null as mergeable is how an agent
+        # talks itself into pushing onto a conflicted branch.
+        mergeable = pr.get("mergeable")
+        lines.append(
+            "Mergeable: " + {True: "yes", False: "NO — conflicts with base"}.get(
+                mergeable, "not computed yet, re-check shortly"
+            )
+        )
+
+        checks = http_requests.get(
+            f"{base}/commits/{pr['head']['sha']}/check-runs", headers=headers, timeout=15
+        )
+        if checks.ok:
+            runs = checks.json().get("check_runs", [])
+            failed = [r for r in runs if r.get("conclusion") in ("failure", "timed_out")]
+            pending = [r for r in runs if r.get("status") != "completed"]
+            if not runs:
+                lines.append("CI: no checks reported.")
+            elif failed:
+                lines.append(f"CI: {len(failed)} of {len(runs)} FAILED")
+                for r in failed[:5]:
+                    lines.append(f"  ✗ {r['name']} — {r.get('html_url', '')}")
+            elif pending:
+                lines.append(f"CI: {len(pending)} still running.")
+            else:
+                lines.append(f"CI: all {len(runs)} checks passed.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ GitHub PR status error: {str(e)[:300]}"
+
+
+@tool(
     "github_list_issues",
-    "List open (or closed) issues in a GitHub repo.",
+    "List open (or closed) issues in a GitHub repo. Excludes pull requests — "
+    "use github_list_pull_requests for those.",
     "owner='', repo='', state='open'",
 )
 def github_list_issues(owner: str = "", repo: str = "", state: str = "open") -> str:

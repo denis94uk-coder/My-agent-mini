@@ -51,11 +51,12 @@ No Docker, no gateway service. SQLite for everything.
 | `runner.py` | Durable run engine: queue, workers, resume-after-crash, budgets |
 | `triggers.py` | Schedules + stalled-plan sweeper |
 | `critic.py` | Critic gate: re-reads goal + transcript, ACCEPT or REVISE |
-| `governor.py` | Tool risk tiers, approval queue, per-provider cost accounting |
+| `governor.py` | Tool risk tiers, approval queue, cost accounting, rate-limit pacing |
 | `memory.py` | Conversations, facts, plans, thread summaries, FTS5 |
 | `concept_graph.py` | NetworkX entity/relation layer over `memory.db` |
 | `tools.py` | All tool impls + registry + owner lock |
-| `tests/` | 207 tests, no Slack/keys/network needed |
+| `workflows.py` | Preset recurring jobs (goal text + schedule), started via `/workflow` |
+| `tests/` | 277 tests, no Slack/keys/network needed |
 
 Key invariant: **both** the interactive loop and the run engine drive
 `agent.execute_step`. One implementation of the tool protocol. Don't fork it.
@@ -65,6 +66,21 @@ response — works on any provider, no native function calling required.
 
 ## Rules that bit us before
 
+- **Tokens per minute binds before tokens per day.** Groq free tier is 12k
+  TPM against 100k TPD; Gemini pairs 250k TPM with ~10 *requests*/min. The
+  loop fires up to 10 calls back to back, so a route dies mid-task with 95%
+  of its daily budget unspent. `governor` paces on both ceilings before the
+  call. Shrinking the prompt does not fix this — it only moves which step fails.
+- **A 429 states its own reset window.** Read `Retry-After` /
+  `x-ratelimit-reset-*`, don't guess. The old flat 90s was wrong both ways:
+  it sat out 8-second token windows and under-waited daily exhaustion.
+  `Retry-After` also permits an HTTP-date, whose digits parse as a plausible
+  duration — handle date form first.
+- **Only READ tools batch.** Several reads in one response cost one call
+  instead of N. A write needs its result seen before the next choice, and an
+  EXTERNAL tool needs its own approval decision, which one batched step
+  cannot express. The batch persists as *one* `tool_result` event so resume
+  rebuilds an identical transcript.
 - **Never narrate an action without taking it.** `_INTENT_ONLY_PATTERNS` in
   `agent.py` catches "I'll remember that" with no tool call. Live bug: bot said
   it remembered, didn't. Add any new save-intent verb to that list.
@@ -142,6 +158,15 @@ keep new modules free of Slack imports so this stays possible.
    key invariant above) to fix parse failures that aren't actually occurring.
    Sub-agents multiply AI calls and RAM on a 1 GB box with 2 workers, and cut
    against `UNATTENDED_BLOCKED_TOOLS`. Revisit only if the constraints change.
+
+7. ✅ Quota-aware routing (`governor`) — per-route token *and* request minute
+   windows checked before the call, `Retry-After` honoured, `ROUTER_ORDER` for
+   explicit route preference, read-only tool batching
+8. ✅ Workflows (`workflows.py`) — the recurring jobs the agent exists to do,
+   as preset goals written for unattended runs: `repo-review`, `repo-health`,
+   `ops-watch`, `decision-log`. Started with `/workflow start <name>`, which
+   goes through the same `triggers.add_schedule` a human schedule uses — no
+   second execution path
 
 Still open, in rough value order: critic/summariser on a stronger route than
 the agent itself; interactive loop handing off to a background run when it

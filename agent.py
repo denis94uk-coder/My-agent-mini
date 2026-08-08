@@ -21,11 +21,15 @@ import json
 import logging
 
 import critic
+import governor
 import tools
 
 logger = logging.getLogger("my-agent-mini")
 
 MAX_ITERATIONS = 10  # Safety limit to prevent infinite loops
+# Prose left in the last response after stripping its tool block, above which
+# it can stand as the answer instead of buying another call to rephrase it.
+MIN_SALVAGEABLE_ANSWER_CHARS = 200
 
 
 def get_agent_system_prompt(base_prompt: str, user_facts: dict[str, list[str]] | None = None) -> str:
@@ -67,29 +71,18 @@ YOUR REASONING FRAMEWORK (how a full agent thinks)
 
 For every non-trivial request, work in four phases:
 
-1. UNDERSTAND — What is the user really asking for? What would a great
-   result look like? If the request is ambiguous, make the most useful
-   assumption and state it.
+1. UNDERSTAND — what is actually being asked, and what would a great result
+   look like? If ambiguous, make the most useful assumption and state it.
+2. PLAN — break it into concrete steps and pick the tools. Prefer checking
+   real data (shell, files, web) over guessing.
+3. EXECUTE — one step at a time. After each result: did it work, what did I
+   learn, does the plan change? If a tool fails, try a different approach.
+4. DELIVER — show what you did and what you found. Never claim you did
+   something you didn't — if it failed, say so.
 
-2. PLAN — Break the task into concrete steps. Decide which tools you need
-   and in what order. Prefer checking real data (shell, files, web) over
-   guessing.
-
-3. EXECUTE — Work step by step with tools. After each result, re-evaluate:
-   Did it work? What did I learn? Do I need to adjust the plan? If a tool
-   fails, try a different approach — don't give up after one error.
-
-4. DELIVER — Give a clear, complete answer. Show what you did, what you
-   found, and what the user should do next. Never claim you did something
-   you didn't actually do — if something failed, say so honestly.
-
-PUSH BACK WHEN THE FACTS DISAGREE — you are an advisor, not a yes-man:
-before agreeing with a plan, claim, or premise, check it against PROJECT
-MEMORY, past conversation memory (memory_search), and real data you can
-cheaply verify with tools. If it conflicts, lead with the conflict and the
-specific evidence ("that contradicts the decision from <date>: ..."), then
-give your recommendation. If you agree, say what you checked — never just
-"great idea". Update your position on evidence, never on mere insistence.
+Before agreeing with any plan, claim, or premise, check it against PROJECT
+MEMORY, past conversations (memory_search), and data you can verify with
+tools. Lead with the conflict and the evidence when it disagrees.
 
 ═══════════════════════════════════════════════
 YOUR TOOLS
@@ -103,9 +96,19 @@ Respond with exactly this format when you need a tool:
 {{"tool": "tool_name", "args": {{"param": "value"}}}}
 [/TOOL_CALL]
 
-ONE tool per response. You'll get the result back, then you can use
-another tool or give your final answer. You have up to 10 tool steps
-per task — use them to actually complete work, not just talk about it.
+ONE tool per response, and you get the result back before choosing again.
+You have up to 10 tool steps per task — use them to complete work, not to
+talk about it.
+
+ONE EXCEPTION — read-only tools batch. When you need several independent
+reads (web_search, fetch_url, read_file, list_files, repo_read_file,
+repo_list_files, github_read_file, github_list_issues, memory_search,
+graph_recall, server_health, list_tasks, list_schedules, run_status), emit
+every [TOOL_CALL] block in the SAME response and you get all the results
+together. Only batch reads whose arguments you already know — if one read's
+arguments depend on another's result, they are not independent, so issue
+them in separate responses. Never batch a tool that writes, pushes, deploys,
+schedules, or remembers.
 
 CRITICAL RULE — never narrate an action without taking it: if your
 response contains phrases like "Now I will...", "Let me...", "I'll save/
@@ -114,36 +117,13 @@ that same response. Never send a message that only announces what you're
 about to do — either do it (include [TOOL_CALL]) or you're genuinely
 finished (give the real final answer, no "next step" language at all).
 
-TOOL SELECTION GUIDE:
-- run_shell → real actions on the server: install packages, git, curl,
-  check disk/memory, cron jobs, move files, run programs
-- run_python → calculations, data processing, parsing, quick scripts
-- write_file / read_file / list_files → save scripts, reports, notes in
-  your persistent workspace (~/agent_workspace)
-- web_search → current events, facts you're unsure about, research
-- fetch_url → read a specific webpage or API
-- memory_search → recall past conversations
-- remember → store durable memory. Use category='decision' for anything
-  that must survive into future, separate Slack threads: stated priorities,
-  roadmap/architecture choices, explicit instructions like "don't build X
-  yet". Use category='fact' (default) for casual preferences. When in
-  doubt about something project-level, prefer 'decision' — it's cheap to
-  store and expensive to silently forget.
-- create_plan → break ANY task with 2 or more distinct steps (e.g. "do X
-  then Y", "do X, Y and Z") into a visible, numbered plan and call this
-  tool FIRST, before doing any other work — even if the task feels small.
-  This is a hard rule, not a judgment call: if the user's request contains
-  more than one action verb ("write... translate... save...", "research...
-  and summarize..."), create_plan is your very first tool call.
-- update_task → mark a plan step 'in_progress' or 'done' as you complete it
-- list_tasks → check what's left on the current plan (use this if a task
-  looks like a continuation of earlier work)
-- start_background_run → hand off work that won't fit in this reply (long
-  research, a big multi-file change, anything with waiting in it). You get a
-  run id back immediately; the result is posted to this thread when it's done
-- schedule_task / list_schedules / cancel_schedule → make something happen
-  automatically, later and repeatedly, with nobody present
-- run_status → check a background run you (or a schedule) started
+TOOL SELECTION RULES (the registry above says what each tool does; these
+are the calls that are easy to get wrong):
+- create_plan is a hard rule, not a judgment call: if the request contains
+  more than one action verb ("write... translate... save..."), it is your
+  very first tool call, before any other work.
+- Prefer repo_edit_file (exact-snippet replace) over repo_write_file (full
+  overwrite) on any file you have not fully read.
 
 ═══════════════════════════════════════════════
 DOMAIN PLAYBOOKS (reusable skills)
@@ -151,134 +131,80 @@ DOMAIN PLAYBOOKS (reusable skills)
 
 **GitHub automation** — for a single quick file change, don't clone a whole
 repo:
-  - github_read_file → read a single file directly through the GitHub API,
-    no local clone needed.
-  - github_write_file → propose a one-file change as a pull request (it
-    opens a branch + PR, it never commits straight to main). Tell the human
-    the PR link and that it needs their review/merge — don't imply the
-    change is already live.
+  - github_read_file → read one file through the API, no clone needed.
+  - github_write_file → propose a one-file change as a PR (it opens a
+    branch + PR, never commits to main). Give the human the PR link and say
+    it needs review — don't imply the change is already live.
   - github_list_issues / github_create_issue → triage or file issues.
   - If GITHUB_TOKEN isn't configured, say so plainly and ask the human to
     set it — don't attempt a workaround that will just fail again.
   - run_shell / run_python / github_write_file / github_create_issue /
     restart_service / deploy_static_site / push_branch / schedule_task /
-    start_background_run are owner-only: if a non-owner Slack user asks for
-    one of these, the tool itself will refuse — just relay that refusal,
-    don't try to route around it. (run_shell and run_python are gated
-    precisely because they execute code on the host.) If OWNER_SLACK_ID
-    isn't configured at all they refuse for everyone, including the owner —
-    say so plainly rather than retrying.
+    start_background_run are owner-only: the tool itself refuses a non-owner,
+    so relay that refusal rather than routing around it. With no
+    OWNER_SLACK_ID configured they refuse everyone, owner included — say so
+    plainly rather than retrying.
 
 **Coding workspace (multi-file: clone / edit / test / push)** — for
 anything touching more than one file (a real feature, a multi-file fix, or
 just needing to read several files to understand a repo), work in a real
 local clone instead of one-file-at-a-time API calls:
-  1. clone_repo(repo, owner, branch) → clones into repos/<repo> (or
-     refreshes an existing clone to latest if you've cloned it before this
-     session). Not owner-gated — read access follows the same rule as
-     github_read_file.
-  2. repo_read_file / repo_list_files (paths relative to repos/, e.g.
-     "my-repo/src/app.py") → inspect files. Long files are paged — follow
-     the "continue with start_line=N" hint to read all of them.
-     For EDITS to existing files, prefer repo_edit_file (exact-snippet
-     replace, safe) over repo_write_file (full overwrite — only for new
-     files or files you have fully read).
-  3. repo_check(repo) → run the quality gate: syntax check on changed .py
-     files, ruff lint, pytest if a tests/ folder exists. Also use run_shell
-     (cd repos/<repo> && ...) for anything repo-specific. Don't skip this:
-     a change that "looks right" but was never run is not verified.
-  4. Once it passes, commit locally yourself: run_shell("cd repos/<repo> &&
-     git add -A && git commit -m '...'"). Keep commits focused — one logical
-     change per commit, like the git-workflow-and-versioning skill
-     describes (see skills/coding-practices/ in the repo).
-  5. push_branch(repo, branch_name, pr_title, ...) → pushes your branch and
-     opens a PR. Owner-only, and it never touches the base branch directly
-     — same "propose, don't auto-merge" contract as github_write_file.
-     It re-runs the quality gate automatically and REFUSES to push code
-     with syntax errors or failing tests; the gate report is appended to
-     the PR body so the human reviewer sees what was verified.
-  `git push` typed directly into run_shell will still fail (no credential
-  helper) — that's expected; use push_branch instead, it authenticates the
-  push itself without ever storing the token in the repo's git config.
+  1. clone_repo → clones into repos/<repo>, or refreshes an existing clone.
+  2. repo_read_file / repo_list_files, paths relative to repos/ (e.g.
+     "my-repo/src/app.py"). Long files page — follow the "continue with
+     start_line=N" hint until you have the whole file.
+  3. repo_check → the quality gate: syntax, ruff, pytest if tests/ exists.
+     Don't skip it; a change that was never run is not verified.
+  4. Commit locally: run_shell("cd repos/<repo> && git add -A && git commit
+     -m '...'"), one logical change per commit.
+  5. push_branch → pushes and opens a PR. It re-runs the gate and REFUSES
+     to push syntax errors or failing tests, attaching the report to the PR.
+  `git push` inside run_shell fails (no credential helper) — that's
+  expected, use push_branch, which authenticates without storing a token.
 
-**Website building** — for a simple static site (HTML/CSS/JS), use
-scaffold_site to write all files into workspace `sites/<name>/` in one
-call, then deploy_static_site to ship it live on Vercel and hand back the
-URL. Don't hand-narrate HTML in chat — write real files and deploy them.
-For anything needing a backend/framework build step (Next.js, npm
-install, etc.), use run_shell to scaffold and build the project inside
-the workspace, then deploy_static_site only covers plain static output —
-say so if the project needs a real build pipeline you can't run here.
+**Website building** — for a static site, scaffold_site writes all files
+into workspace `sites/<name>/` in one call, then deploy_static_site ships it
+to Vercel and returns the URL. Write real files, don't narrate HTML in chat.
+deploy_static_site only covers plain static output — for anything needing a
+build step (Next.js, npm install), build it via run_shell first, and say so
+if the project needs a pipeline you can't run here.
 
-**Server administration** — run_shell already covers all read-only checks
-(systemctl status, df, free, journalctl, ps). server_health gives a fast
-combined snapshot. For restarting a service (e.g. after a git pull),
-restart_service is required — plain `systemctl restart` in run_shell is
-blocked for safety. restart_service only works for services on the
-server's explicit allow-list; if it's refused, tell the human which
-service needs to be added rather than trying to bypass it.
-
-**Football predictions** — no dedicated data tool exists yet for this.
-Use web_search / fetch_url to pull current form, injuries, and odds from
-public sources, reason over them yourself, and always caveat that this is
-analysis, not a guaranteed outcome — never invent stats you didn't
-actually look up.
+**Server administration** — run_shell covers read-only checks (systemctl
+status, df, free, journalctl, ps); server_health is a fast combined
+snapshot. Restarts require restart_service — plain `systemctl restart` in
+run_shell is blocked, and restart_service only accepts services on the
+server's allow-list. If it refuses, tell the human which service needs
+adding rather than bypassing it.
 
 **Working autonomously (background runs + schedules)** — you are not limited
 to what fits in one reply:
-  - A task with a lot of steps, a long wait, or an open-ended search →
-    start_background_run(goal). Write the goal as a complete standalone
-    instruction: the run starts with no conversation context beyond what you
-    put in that text. Tell the user the run id, then finish your reply — do
-    NOT sit and wait for it.
-  - "Every morning...", "each Monday...", "check X regularly" →
-    schedule_task(name, when, goal). Same rule: the goal must stand alone,
-    because nobody will be there to clarify it. Confirm the first fire time
-    back to the user.
-  - Unattended runs (scheduled work, resumed plans) cannot deploy, push,
-    restart services, or create more schedules. If a scheduled goal needs
-    one of those, do everything up to that line and report what a human
-    needs to run — don't pretend it shipped.
-  - Any plan you leave unfinished gets picked up automatically once the
-    thread goes quiet, so it's better to create a real plan (create_plan)
-    and mark steps honestly than to over-promise in one message. If you're
-    resumed by that mechanism, start with list_tasks and memory_search to
-    rebuild context before acting.
+  - Many steps, a long wait, or an open-ended search → start_background_run.
+    "Every morning...", "each Monday..." → schedule_task. For both, the goal
+    must be a complete standalone instruction — the run starts with no
+    conversation context beyond that text, and nobody is there to clarify.
+    Report the run id or first fire time, then finish your reply; never sit
+    and wait for it.
+  - Unattended runs cannot deploy, push, restart services, or create more
+    schedules. If a scheduled goal needs one, do everything up to that line
+    and report what a human must run — don't pretend it shipped.
+  - An unfinished plan is resumed automatically once the thread goes quiet,
+    so create_plan and honest step marking beat over-promising in one
+    message. If you are the resumed run, start with list_tasks and
+    memory_search to rebuild context before acting.
 
-**Coding practices** — this repo carries `skills/coding-practices/` (24
-reference files vendored from addyosmani/agent-skills, MIT licensed) for
-whenever you're doing real software engineering work (not just quick
-scripts): writing a spec, planning tasks, implementing, debugging, reviewing,
-or shipping. Apply the *spirit* of these even without reading the files:
-  - Spec before code: clarify what "done" looks like before writing anything
-    non-trivial (spec-driven-development, planning-and-task-breakdown).
-  - Small, verifiable slices: implement, test, verify, then move on — not
-    one giant untested change (incremental-implementation,
-    test-driven-development).
-  - When something breaks: reproduce it, localize it, reduce it to a minimal
-    case, fix it, then add a guard so it can't silently regress
-    (debugging-and-error-recovery) — this is exactly how the narration-nudge
-    bug in this file was found and fixed.
-  - Self-review before calling something finished: would you approve this
-    change if a colleague submitted it? (code-review-and-quality)
-  - Git hygiene: atomic, small commits with clear messages
-    (git-workflow-and-versioning) — matters less here since pushes go via
-    the GitHub Contents API one file per commit, but still keep each
-    file's change focused and explain *why*, not just *what*.
-  - Document decisions, not just code: when you make an architectural or
-    tradeoff call, say why (documentation-and-adrs) — this pairs directly
-    with the `remember(category='decision')` tool.
-The full text of each skill is in the repo for deeper reference; see
-`skills/coding-practices/README.md` for the complete index.
+**Coding practices** — for real software engineering (not quick scripts):
+spec before code, small verifiable slices, reproduce-localize-fix-guard when
+debugging, self-review before calling it done, atomic commits explaining
+*why*, and `remember(category='decision')` for architectural calls. Full
+references live in `skills/coding-practices/` — read the relevant file when
+a task warrants it; see its README.md for the index.
 
 EXECUTION PRINCIPLES:
 - DO the task, don't describe how the user could do it themselves
-- Verify your work: after creating/changing something, check it succeeded
-  (e.g. after writing a script, run it; after installing, test it)
+- Verify your work: after writing a script, run it; after installing, test it
 - If a command fails, read the error, fix the cause, and retry differently
 - Chain tools: search → fetch → process → save → verify → report
 - Simple questions (greetings, opinions, known facts) need NO tools
-- Final answers: lead with the result, keep it clear and concise
 - Be honest about limits: you cannot access private accounts, send emails,
   or act outside this server unless a tool allows it
 """
@@ -316,24 +242,51 @@ def looks_like_unactioned_intent(text: str) -> bool:
     return bool(_INTENT_ONLY_RE.search(text))
 
 
-def parse_tool_call(text: str) -> dict | None:
-    """Extract a tool call from the AI response."""
-    match = re.search(r"\[TOOL_CALL\]\s*(\{.*\})\s*\[/TOOL_CALL\]", text, re.DOTALL)
-    if not match:
-        # Fallback: model forgot the closing tag
-        match = re.search(r"\[TOOL_CALL\]\s*(\{.*\})", text, re.DOTALL)
-    if not match:
-        return None
-    raw = match.group(1).strip()
-    # Try parsing; if extra text follows the JSON, trim to the last brace
-    for candidate in (raw, raw[: raw.rfind("}") + 1]):
+def _parse_one_call(body: str) -> dict | None:
+    """Parse the JSON inside a single [TOOL_CALL] block."""
+    raw = body.strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    candidates = [raw]
+    if start >= 0 and end > start:
+        candidates.append(raw[start:end + 1])
+    for candidate in candidates:
         try:
             call = json.loads(candidate)
-            if isinstance(call, dict) and "tool" in call and "args" in call:
-                return call
         except (json.JSONDecodeError, ValueError):
             continue
+        if isinstance(call, dict) and "tool" in call and "args" in call:
+            return call
     return None
+
+
+def parse_tool_calls(text: str) -> list[dict]:
+    """
+    Every tool call in the response, in order.
+
+    Blocks are delimited by their tags rather than by brace matching, so an
+    argument containing braces (a code snippet, a JSON payload) does not end
+    the block early. A missing closing tag is tolerated: the block then runs
+    to the next opening tag or to the end of the response.
+
+    The single-call regex this replaces was greedy, so two blocks in one
+    response matched from the first opening tag to the last closing tag and
+    parsed as nothing at all. The response was then treated as a final
+    answer — the model's narration was posted while neither tool ran.
+    """
+    calls = []
+    for match in re.finditer(
+        r"\[TOOL_CALL\](.*?)(?:\[/TOOL_CALL\]|(?=\[TOOL_CALL\])|\Z)", text, re.DOTALL
+    ):
+        call = _parse_one_call(match.group(1))
+        if call is not None:
+            calls.append(call)
+    return calls
+
+
+def parse_tool_call(text: str) -> dict | None:
+    """The first tool call in the response, or None."""
+    calls = parse_tool_calls(text)
+    return calls[0] if calls else None
 
 
 def extract_final_text(text: str) -> str:
@@ -375,7 +328,7 @@ class StepOutcome:
                  replays this exact call once a human decides.
     """
 
-    __slots__ = ("kind", "response", "tool_args", "tool_name", "tool_result")
+    __slots__ = ("kind", "response", "tool_args", "tool_name", "tool_result", "batch")
 
     def __init__(self, kind, response, tool_name=None, tool_args=None, tool_result=None):
         self.kind = kind
@@ -383,6 +336,63 @@ class StepOutcome:
         self.tool_name = tool_name
         self.tool_args = tool_args
         self.tool_result = tool_result
+        # Per-tool detail when several read-only tools ran in one step. The
+        # scalar fields above stay the combined view, so durability and replay
+        # treat a batch exactly like any other step.
+        self.batch = []
+
+
+def _batch_label(tool_calls: list[dict]) -> str:
+    """Name for a batched step, used in the transcript and in run events."""
+    return " + ".join(dict.fromkeys(str(c.get("tool")) for c in tool_calls))
+
+
+def _execute_read_batch(
+    working_messages: list[dict],
+    response: str,
+    tool_calls: list[dict],
+    user_id: str = "default",
+    conv_key: str = "default",
+    blocked_tools: set | None = None,
+) -> StepOutcome:
+    """
+    Run several read-only tools from one response and feed back one result.
+
+    The combined text is appended through `tool_result_message`, exactly as a
+    single-tool step is, so a run that resumes from persisted events rebuilds
+    the identical transcript rather than a re-shaped one.
+    """
+    sections, results = [], []
+    for call in tool_calls:
+        name = call["tool"]
+        args = call["args"] if isinstance(call.get("args"), dict) else {}
+        if name in ("list_tasks",):
+            args["conv_key"] = conv_key
+        for context_arg in tools.CONTEXT_TOOLS.get(name, ()):
+            args[context_arg] = {"_user_id": user_id, "_conv_key": conv_key}[context_arg]
+        if name in tools.OWNER_ONLY_TOOLS:
+            args["_requesting_user_id"] = user_id
+
+        if blocked_tools and name in blocked_tools:
+            result = (
+                f"❌ Blocked: '{name}' cannot run in an unattended background run."
+            )
+        else:
+            result = tools.run_tool(name, args)
+        logger.info(f"🔧 Batched tool: {name} → {result[:120]}...")
+        sections.append(f"── {name} ──\n{result}")
+        results.append({"tool": name, "args": args, "result": result})
+
+    label = _batch_label(tool_calls)
+    combined = "\n\n".join(sections)
+    logger.info(f"📦 Ran {len(tool_calls)} read-only tools in one step: {label}")
+
+    working_messages.append({"role": "assistant", "content": response})
+    working_messages.append({"role": "user", "content": tool_result_message(label, combined)})
+
+    outcome = StepOutcome("tool", response, label, {}, combined)
+    outcome.batch = results
+    return outcome
 
 
 def execute_step(
@@ -412,7 +422,27 @@ def execute_step(
         which is a flat no the agent works around immediately.
     """
     response = call_ai_fn(working_messages, full_prompt)
-    tool_call = parse_tool_call(response)
+    tool_calls = parse_tool_calls(response)
+
+    # Several read-only tools in one response run as a batch. Each extra
+    # round trip re-sends the whole system prompt, which is the dominant cost
+    # per call and the reason free-tier token/minute limits bite: three files
+    # read one at a time is three prompts, batched it is one.
+    #
+    # Only READ tier batches. A read is idempotent and side-effect-free, so
+    # ordering and partial failure are harmless. Anything that writes runs one
+    # per response, where the model sees each result before choosing again —
+    # and EXTERNAL tools additionally need their own approval decision, which
+    # a batch cannot express.
+    if len(tool_calls) > 1 and all(
+        governor.tier_of(c.get("tool")) == governor.READ for c in tool_calls
+    ):
+        return _execute_read_batch(
+            working_messages, response, tool_calls,
+            user_id=user_id, conv_key=conv_key, blocked_tools=blocked_tools,
+        )
+
+    tool_call = tool_calls[0] if tool_calls else None
 
     if tool_call is None:
         # The model didn't include a [TOOL_CALL] block. Usually that means
@@ -541,6 +571,11 @@ def run_agent_loop(
         if outcome.kind == "final":
             # Critic gate (off by default here — see critic.interactive_enabled;
             # a human is reading this reply and can push back themselves).
+            # Deliberately not skipped when no tool ran. An empty tool trail
+            # looks like the cheapest call to save and is the opposite: an
+            # answer claiming work with nothing behind it ("I've noted that
+            # down", no remember call) is exactly what the critic exists to
+            # catch, and it can only see that when it still runs.
             if (
                 critic.interactive_enabled()
                 and critic_rounds < critic.max_rounds()
@@ -567,7 +602,14 @@ def run_agent_loop(
             return outcome.response
 
         if outcome.kind == "tool":
-            tool_trail.append({"tool": outcome.tool_name, "result": outcome.tool_result})
+            # A batch grades as its individual tools — the critic reasons
+            # about what was actually checked, not about a joined label.
+            if outcome.batch:
+                tool_trail.extend(
+                    {"tool": r["tool"], "result": r["result"]} for r in outcome.batch
+                )
+            else:
+                tool_trail.append({"tool": outcome.tool_name, "result": outcome.tool_result})
 
         if outcome.kind == "nudge":
             narration_nudges_used += 1
@@ -576,8 +618,15 @@ def run_agent_loop(
                 f"{MAX_NARRATION_NUDGES}), auto-continuing instead of stopping"
             )
 
-    # Hit max iterations — return what we have
+    # Hit max iterations. Asking for a wrap-up costs another full call, and
+    # the last response usually already carries usable prose alongside its
+    # tool block — send that instead when there is enough of it to stand as
+    # an answer, and only pay for the extra call when there is not.
     logger.warning(f"⚠️ Agent hit max iterations ({MAX_ITERATIONS})")
+    salvaged = extract_final_text(outcome.response) if outcome.response else ""
+    if len(salvaged) >= MIN_SALVAGEABLE_ANSWER_CHARS:
+        logger.info("↩️ Using the last response as the answer instead of a wrap-up call")
+        return salvaged
     return call_ai_fn(
         working_messages + [{"role": "user", "content": "Please give your final answer now based on what you've gathered."}],
         full_prompt,

@@ -33,7 +33,9 @@ Three parts:
 import os
 import json
 import time
+import re
 import logging
+import threading
 
 import memory
 
@@ -64,6 +66,8 @@ TOOL_TIERS = {
     "list_tasks": READ,
     "github_read_file": READ,
     "github_list_issues": READ,
+    "github_list_pull_requests": READ,
+    "github_pr_status": READ,
     "repo_read_file": READ,
     "repo_list_files": READ,
     "server_health": READ,
@@ -449,6 +453,206 @@ def paid_budget_exhausted() -> bool:
     """True when paid routes should be skipped for the rest of the day."""
     limit = paid_daily_limit()
     return bool(limit) and paid_calls_today() >= limit
+
+
+# ── Rate-limit awareness ──
+#
+# Free routes are capped on tokens per minute long before tokens per day, and
+# the agent loop is the exact shape that trips it: up to MAX_ITERATIONS calls
+# fired back to back, each re-sending the whole system prompt. Groq's free
+# tier allows 12,000 TPM against a ~4,400-token prompt, so the third call of
+# any multi-step task is rejected while ~95% of the daily budget is untouched.
+#
+# Waiting a few seconds for the window to roll is strictly better than
+# spending a 429 to discover the same thing, so the router asks first.
+# Tracking is in-memory: a minute window has nothing worth persisting, and it
+# must stay cheap on a 1 GB box.
+
+_TPM_DEFAULTS = {"groq": 12000, "gemini": 250000}
+# Requests per minute is a separate ceiling and can bind first: Gemini's free
+# tier allows ~10 requests/minute against a 250,000 token/minute budget, so a
+# ten-step agent loop exhausts the request limit having spent 2% of the tokens.
+# Tracking only tokens would pace perfectly and still 429.
+_RPM_DEFAULTS = {"groq": 30, "gemini": 10}
+_TPM_WINDOW: dict[str, list] = {}
+_TPM_LOCK = threading.Lock()
+
+# Output length is unknown before the call. Charge a flat allowance so the
+# estimate errs high — undercounting spends a 429, overcounting costs a pause.
+_OUTPUT_TOKEN_ALLOWANCE = 800
+
+
+def _limit_for(provider_name: str, defaults: dict, env_var: str) -> int:
+    """Per-route ceiling from `env_var`, falling back to `defaults`, else 0."""
+    lowered = (provider_name or "").lower()
+    table = dict(defaults)
+    for pair in os.getenv(env_var, "").split(","):
+        name, _, value = pair.partition(":")
+        if name.strip() and value.strip().isdigit():
+            table[name.strip().lower()] = int(value)
+    for key, limit in table.items():
+        if key in lowered:
+            return max(0, limit)
+    return 0
+
+
+def tpm_limit(provider_name: str) -> int:
+    """
+    Tokens-per-minute ceiling for a route, or 0 for "unmetered".
+
+    ROUTER_TPM_LIMITS overrides the defaults as `substring:tokens` pairs,
+    e.g. "groq:12000,gemini:250000". Matching is by substring so it keeps
+    working when a provider is renamed in build_providers.
+    """
+    return _limit_for(provider_name, _TPM_DEFAULTS, "ROUTER_TPM_LIMITS")
+
+
+def rpm_limit(provider_name: str) -> int:
+    """Requests-per-minute ceiling, or 0 for "unmetered". See ROUTER_RPM_LIMITS."""
+    return _limit_for(provider_name, _RPM_DEFAULTS, "ROUTER_RPM_LIMITS")
+
+
+def requests_last_minute(provider_name: str) -> int:
+    now = time.time()
+    with _TPM_LOCK:
+        return sum(1 for ts, _ in _TPM_WINDOW.get(provider_name, []) if now - ts < 60)
+
+
+def retry_after_seconds(response, default: float) -> float:
+    """
+    How long a rate-limited route asked us to wait, in seconds.
+
+    Reads Retry-After (seconds, per RFC 9110) and falls back to the
+    x-ratelimit-reset-* headers OpenAI-compatible providers send, which carry
+    durations like "7.66s" or "2m59.56s" rather than plain numbers. Returns
+    `default` when the response says nothing usable, so a missing header is
+    never read as "retry immediately".
+
+    Capped, because one header should not be able to park a route for an hour.
+    """
+    headers = getattr(response, "headers", None) or {}
+    for key in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+        try:
+            raw = (headers.get(key) or "").strip()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        # Retry-After also permits an HTTP-date. Its digits look enough like a
+        # duration that the parser below would read "Wed, 21 Oct 2015 07:28:00
+        # GMT" as 2,071 seconds, so date form is handled before that can
+        # happen — and a date already in the past means retry now.
+        if "," in raw or "GMT" in raw.upper():
+            try:
+                from email.utils import parsedate_to_datetime
+                delta = parsedate_to_datetime(raw).timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                continue
+            return min(max(delta, 0.0), max(default, 300)) if delta > 0 else 0.0
+        seconds, matched = 0.0, False
+        for value, unit in re.findall(r"([\d.]+)\s*(ms|s|m|h)?", raw):
+            try:
+                number = float(value)
+            except ValueError:
+                continue
+            seconds += number * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}.get(unit or "s", 1)
+            matched = True
+        if matched and seconds > 0:
+            return min(seconds + 1, max(default, 300))
+    return default
+
+
+_UNRANKED = 10_000
+
+
+def route_order_rank(provider_name: str) -> int:
+    """
+    Where a route sits in ROUTER_ORDER, or `_UNRANKED` when it is not listed.
+
+    Registration order in build_providers is just the order the blocks happen
+    to be written in, which is not a preference anyone chose — it put Gemini
+    ahead of Groq purely because its block comes first. ROUTER_ORDER makes the
+    preference explicit: "groq,gemini" tries Groq first, and anything omitted
+    keeps its registration order behind everything named.
+
+    Matching is by substring, so "groq" finds "Groq" and a renamed route keeps
+    working. Paid routes still sort last regardless — that is a budget guard,
+    not a preference, and it is not this function's to override.
+    """
+    lowered = (provider_name or "").lower()
+    names = [n.strip().lower() for n in os.getenv("ROUTER_ORDER", "").split(",") if n.strip()]
+    for index, name in enumerate(names):
+        if name in lowered:
+            return index
+    return _UNRANKED
+
+
+def record_tokens(provider_name: str, tokens: int) -> None:
+    """Add a call's token cost to the rolling minute window."""
+    now = time.time()
+    with _TPM_LOCK:
+        window = [e for e in _TPM_WINDOW.get(provider_name, []) if now - e[0] < 60]
+        window.append((now, max(0, int(tokens))))
+        _TPM_WINDOW[provider_name] = window
+
+
+def tokens_last_minute(provider_name: str) -> int:
+    now = time.time()
+    with _TPM_LOCK:
+        return sum(t for ts, t in _TPM_WINDOW.get(provider_name, []) if now - ts < 60)
+
+
+def _window_wait(window: list, now: float, limit: int, cost, incoming: int) -> float:
+    """Seconds until `incoming` more of `cost` fits under `limit`."""
+    spent = sum(cost(e) for e in window)
+    if spent + incoming <= limit:
+        return 0.0
+    freed = 0
+    for entry in window:  # oldest first; each expiry frees its own share
+        freed += cost(entry)
+        if spent - freed + incoming <= limit:
+            return max(0.0, 60 - (now - entry[0])) + 0.5
+    return 0.0
+
+
+def tpm_wait_seconds(provider_name: str, est_tokens: int) -> float:
+    """
+    Seconds to wait before this call fits inside the route's minute window.
+
+    Covers both ceilings. Tokens alone are not enough: Gemini's free tier
+    pairs a generous 250,000 tokens/minute with ~10 requests/minute, so an
+    agent loop exhausts the request limit having spent 2% of the tokens, and
+    token-only pacing would wait for nothing and still 429.
+
+    0 when it fits now or the route is unmetered. A single call larger than
+    the whole token limit also returns 0 — waiting cannot help, and the
+    honest 429 is more useful than a pause that changes nothing.
+    """
+    tokens, requests = tpm_limit(provider_name), rpm_limit(provider_name)
+    if not tokens and not requests:
+        return 0.0
+    if tokens and est_tokens >= tokens:
+        return 0.0
+    now = time.time()
+    with _TPM_LOCK:
+        window = sorted(e for e in _TPM_WINDOW.get(provider_name, []) if now - e[0] < 60)
+    waits = [0.0]
+    if tokens:
+        waits.append(_window_wait(window, now, tokens, lambda e: e[1], est_tokens))
+    if requests:
+        waits.append(_window_wait(window, now, requests, lambda e: 1, 1))
+    return max(waits)
+
+
+def estimate_tokens(input_chars: int) -> int:
+    """Rough token cost of a call. ~4 chars/token plus an output allowance."""
+    return max(0, input_chars) // 4 + _OUTPUT_TOKEN_ALLOWANCE
+
+
+def reset_rate_limit_state() -> None:
+    """Test hook — the minute window is process state, not database state."""
+    with _TPM_LOCK:
+        _TPM_WINDOW.clear()
 
 
 def usage_summary(days: int = 7) -> list[dict]:
