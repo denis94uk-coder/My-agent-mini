@@ -161,6 +161,10 @@ import requests as http_requests
 # Inspired by OmniRoute, but kept inside this process so the 1 GB VM needs
 # no second gateway service. Health is in-memory only and contains no secrets.
 ROUTER_COOLDOWN_SECONDS = max(10, int(os.getenv("ROUTER_COOLDOWN_SECONDS", "90")))
+# How long a call may pause for a route's token/minute window to roll before
+# moving on. A short wait beats a 429 that parks the route entirely; a long
+# one just moves the stall from the provider into the Slack reply.
+ROUTER_MAX_TPM_WAIT_SECONDS = max(0, int(os.getenv("ROUTER_MAX_TPM_WAIT_SECONDS", "20")))
 ROUTER_LOCK = threading.Lock()
 PROVIDER_HEALTH = {}
 
@@ -183,12 +187,19 @@ def _record_provider_success(provider: dict) -> None:
 
 def _record_provider_failure(provider: dict, error: Exception) -> None:
     """Back off rate-limited/unhealthy routes instead of hammering them."""
-    status = getattr(getattr(error, "response", None), "status_code", None)
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
     with ROUTER_LOCK:
         old = PROVIDER_HEALTH.get(provider["name"], {})
         failures = int(old.get("failures", 0)) + 1
         if status == 429:
-            cooldown = ROUTER_COOLDOWN_SECONDS
+            # A rate-limited route says when it will accept traffic again.
+            # Guessing instead costs availability in both directions: the flat
+            # 90s sat out a token-per-minute window that clears in seconds,
+            # while a genuine daily exhaustion needs far longer than 90s.
+            cooldown = governor.retry_after_seconds(response, ROUTER_COOLDOWN_SECONDS)
+            if cooldown is None:
+                cooldown = ROUTER_COOLDOWN_SECONDS
         elif status is not None and status >= 500:
             cooldown = min(ROUTER_COOLDOWN_SECONDS, 30)
         else:
@@ -205,11 +216,18 @@ def _provider_status(provider: dict) -> str:
     with ROUTER_LOCK:
         state = PROVIDER_HEALTH.get(provider["name"], {})
     remaining = max(0, int(state.get("cooldown_until", 0) - time.time()))
+    # Show the minute window alongside health. A route can be "healthy" and
+    # still be one call from a 429, which is invisible without this.
+    limit = governor.tpm_limit(provider["name"])
+    budget = ""
+    if limit:
+        spent = governor.tokens_last_minute(provider["name"])
+        budget = f", {spent:,}/{limit:,} tok/min"
     if remaining:
-        return f"cooldown ({remaining}s)"
+        return f"cooldown ({remaining}s){budget}"
     if state.get("last_ok"):
-        return "healthy"
-    return "ready"
+        return f"healthy{budget}"
+    return f"ready{budget}"
 
 
 def build_providers():
@@ -657,9 +675,35 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
     if not available:
         return "❌ All AI routes are temporarily cooling down after errors or rate limits. Try again shortly."
 
+    # Tokens per minute, not per day, is what the agent loop actually hits: it
+    # fires up to MAX_ITERATIONS calls back to back, each re-sending the whole
+    # system prompt. Reordering so a route with headroom goes first turns a
+    # 429 (which parks the route for its whole reset window) into a call that
+    # simply succeeds somewhere else.
+    input_chars = sum(len(m.get("content") or "") for m in messages) + len(system_prompt)
+    est_tokens = governor.estimate_tokens(input_chars)
+    available.sort(key=lambda p: governor.tpm_wait_seconds(p["name"], est_tokens))
+
     errors = []
     for provider in available:
         try:
+            # With no route free of its minute window, waiting beats spending a
+            # 429 — but only briefly, and only when nothing else can serve.
+            wait = governor.tpm_wait_seconds(provider["name"], est_tokens)
+            if wait > 0:
+                if wait > ROUTER_MAX_TPM_WAIT_SECONDS:
+                    errors.append(
+                        f"• {provider['name']}: would exceed its token/minute limit "
+                        f"for another {int(wait)}s"
+                    )
+                    continue
+                logger.info(
+                    f"⏳ {provider['name']} at {governor.tokens_last_minute(provider['name']):,}"
+                    f"/{governor.tpm_limit(provider['name']):,} tokens this minute — "
+                    f"waiting {wait:.1f}s"
+                )
+                time.sleep(wait)
+
             logger.info(f"🔄 Trying {provider['name']} ({provider['model']})...")
             start = time.time()
             provider_images = images if provider["type"] == "gemini" else None
@@ -674,8 +718,11 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
             _record_provider_success(provider)
             governor.record_ai_call(
                 provider["name"],
-                input_chars=sum(len(m.get("content") or "") for m in messages) + len(system_prompt),
+                input_chars=input_chars,
                 output_chars=len(result or ""),
+            )
+            governor.record_tokens(
+                provider["name"], (input_chars + len(result or "")) // 4
             )
             logger.info(f"✅ {provider['name']} responded in {round(time.time() - start, 1)}s")
             return result
