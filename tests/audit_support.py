@@ -99,6 +99,8 @@ def slack_bot(audit_env, monkeypatch):
             return call
 
     monkeypatch.setattr(bot, "slack_client", FakeSlackClient())
+    # Keep the real router reachable for tests that exercise it directly.
+    bot._real_call_ai = bot.call_ai
     monkeypatch.setattr(bot, "call_ai", lambda messages, prompt=None, images=None: "stub answer")
     yield bot, registry
     sys.modules.pop("bot", None)
