@@ -191,6 +191,30 @@ def parse_verdict(text: str) -> Verdict:
     return Verdict(REVISE, reason=reason[:1500], raw=raw)
 
 
+# A refusal the agent could not have worked around. The prompt asks the critic
+# to accept these; that only holds while the critic model is strong enough to
+# follow it. The transcript already carries the evidence in a fixed form, so
+# the check belongs in code as well — a weak critic route must not be able to
+# demand impossible work every round until the cap.
+BLOCKED_MARKERS = (
+    "not authorized:",
+    "denied: a human declined",
+    "not approved: nobody answered",
+    "is blocked in unattended runs",
+    "not configured on the server",
+)
+
+
+def blocked_by_a_refusal(steps: list[dict]) -> str:
+    """The refusal the run reported, if its last tool result was one."""
+    for step in reversed(steps or []):
+        result = (step.get("result") or "").lower()
+        for marker in BLOCKED_MARKERS:
+            if marker in result:
+                return step.get("tool", "a tool")
+    return ""
+
+
 def review(goal: str, steps: list[dict], final_text: str, call_ai_fn) -> Verdict:
     """
     One critic pass. Never raises — a failing critic accepts and logs.
@@ -220,6 +244,14 @@ def review(goal: str, steps: list[dict], final_text: str, call_ai_fn) -> Verdict
         return Verdict(ACCEPT)
 
     verdict = parse_verdict(response)
+    if not verdict.accepted:
+        blocked_tool = blocked_by_a_refusal(steps)
+        if blocked_tool:
+            logger.info(
+                f"🔍 Critic said REVISE, but the transcript shows '{blocked_tool}' was "
+                "refused — reporting a blocker is a complete outcome. Accepting."
+            )
+            return Verdict(ACCEPT, raw=verdict.raw)
     logger.info(f"🔍 Critic: {verdict.kind}" + (f" — {verdict.reason[:120]}" if verdict.reason else ""))
     return verdict
 

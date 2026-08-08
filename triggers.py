@@ -21,6 +21,7 @@ Times are interpreted in the server's local timezone.
 """
 
 import os
+import re
 import time
 import logging
 import threading
@@ -106,7 +107,14 @@ def parse_spec(spec: str) -> tuple[str, object]:
         if len(parts) < 2:
             raise ValueError(f"'every' needs an interval, e.g. `every 15m`. {SPEC_HELP}")
         amount = "".join(parts[1:])
-        # Accept "15m", "15 min", "15 minutes"
+        # Accept "15m", "15 min", "15 minutes" — and nothing else. Stripping
+        # every non-alphanumeric character silently turned `every -5m` into
+        # every 5 minutes and `every 1.5h` into every 15 HOURS: a typo became
+        # a confirmed schedule at a cadence nobody asked for.
+        if not re.fullmatch(r"\d+[a-z]+", amount):
+            raise ValueError(
+                f"Could not read the interval '{' '.join(parts[1:])}' — use a whole "
+                f"number and a unit, e.g. `every 15m`. {SPEC_HELP}")
         digits = "".join(c for c in amount if c.isdigit())
         letters = "".join(c for c in amount if c.isalpha())
         if not digits or not letters:

@@ -691,8 +691,9 @@ def schedule_task(name: str, when: str, goal: str,
     next_at = time.strftime("%a %Y-%m-%d %H:%M", time.localtime(sched["next_run"]))
     return (
         f"✅ Scheduled '{sched['name']}' ({sched['spec']}) — first run {next_at} (server time).\n"
-        "Note: scheduled runs are unattended, so deploys, pushes and service restarts are "
-        "blocked in them; they'll report what needs a human instead."
+        "Note: scheduled runs are unattended, so anything that reaches outside this "
+        "server — a push, a PR, a service restart — pauses and asks you in Slack "
+        "before it happens (`/approvals`). Unanswered requests expire as a no."
     )
 
 

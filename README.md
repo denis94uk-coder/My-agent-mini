@@ -29,7 +29,10 @@ Two different things are stored in `memory.db`, and they behave differently:
 
 - **Thread history** — the last ~20 messages of a specific Slack thread,
   scoped to that thread only (`conv_key`). This is what makes replies in an
-  ongoing thread feel continuous; it's invisible to other threads.
+  ongoing thread feel continuous; it's invisible to other threads. Older
+  messages from *other threads in the same channel* can still be recalled when
+  they're relevant (that's the point of cross-thread memory) — but never from
+  another channel, so one person's DMs cannot surface in someone else's thread.
 - **Project memory** (`remember` tool, `category='decision'`, plus
   auto-generated `task_summary` entries when a plan finishes) — durable
   facts that get injected into **every** conversation for that user,
@@ -89,9 +92,11 @@ forward: if the agent stopped at step 3 of 7, those steps sat there until
 someone spoke. Now a sweeper picks them up — but only once **both** the
 plan and its Slack thread have been idle for `PLAN_STALE_SECONDS`
 (default 10 min). That idle check is deliberate: it means the bot never
-talks over someone who is mid-conversation or interrupts a plan that's
-genuinely waiting on a human answer. Capped at `PLAN_MAX_RESUMES` per
-conversation per day.
+talks over someone who is mid-conversation. A plan that is waiting on a
+human answer should have that step marked `blocked` (the `update_task` tool
+does this) — a blocked plan is never resumed, because idle and waiting look
+identical from the outside. Capped at `PLAN_MAX_RESUMES` per conversation
+per rolling 24 hours.
 
 ### Critic gate
 
@@ -180,14 +185,16 @@ routes keep serving, so the bot degrades instead of stopping.
 - **A hung run can't hide.** Each step writes a heartbeat; the scheduler fails
   any run that stops heartbeating (`RUN_STUCK_SECONDS`). Without it a run hung
   inside a tool stays `running` forever — and `running` counts as active, so
-  its schedule would never fire again.
+  its schedule would never fire again. It is failed outright, never re-queued:
+  the worker may still be alive inside that tool, and a retry would let a
+  second worker run the same steps concurrently.
 
 See `.env.example` for all the knobs.
 
 ### Tests
 
 ```bash
-pytest tests/ -q     # 162 tests, no Slack workspace or API keys needed
+pytest tests/ -q     # 546 tests, no Slack workspace or API keys needed
 ```
 
 ## 🛠️ Domain Skills
@@ -316,10 +323,12 @@ sudo journalctl -u my-agent -f  # live logs
 | Command | Description |
 |---------|-------------|
 | `/ask <question>` | Quick one-shot question |
-| `/clear` | Reset conversation memory |
+| `/search <query>` | Web search, no agent loop |
+| `/workflow` / `/workflow start <name>` | List preset recurring jobs, or schedule one (owner only) |
+| `/clear` | Clear this channel's messages and thread summaries (owner only). Durable project memory is kept |
 | `/providers` | Show routes, keyless/key-backed status, and cooldown health |
-| `/runs` | List background runs (`/runs <id>`, `/runs cancel <id>`) |
-| `/schedules` | List scheduled tasks (`/schedules cancel <name>`) |
+| `/runs` | List background runs. Goals and `/runs <id>` detail are owner-only; `/runs cancel <id>` is owner-only |
+| `/schedules` | List scheduled tasks. Goals and `/schedules cancel <name>` are owner-only |
 | `/approvals` | What the agent is waiting on a human to authorise |
 | `/approve <id>` / `/deny <id> <why>` | Decide a pending request (owner only) |
 | `/costs` | AI calls per provider, paid routes tracked separately |
@@ -358,7 +367,7 @@ my-agent-mini/
 ├── tools.py            # Tool implementations
 ├── critic.py           # Critic gate: is "done" actually done?
 ├── governor.py         # Risk tiers, approval queue, cost accounting
-├── tests/              # 207 tests — no Slack or API keys needed
+├── tests/              # 546 tests — no Slack or API keys needed
 ├── requirements.txt    # Python dependencies
 ├── setup.sh            # One-click server setup
 ├── .env.example        # Template for API keys + autonomy settings

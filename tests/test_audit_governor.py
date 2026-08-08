@@ -198,16 +198,14 @@ def test_decide_rejects_a_non_owner_caller(audit_env):
     assert governor.decide(ap["id"], True, decided_by="U_STRANGER") is None
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING B2 (LOW) — schedule_task tells the user something the engine does "
-    "not do. tools.py:588 returns 'scheduled runs are unattended, so deploys, "
-    "pushes and service restarts are blocked in them'. With APPROVALS_ENABLED "
-    "(the default) those tools are NOT blocked: the run parks and asks, and "
-    "with allow_risky it runs them outright. The message describes the "
-    "approvals-off configuration only."))
 def test_schedule_task_message_matches_actual_unattended_policy(audit_env):
+    """FIXED (was FINDING B2): the confirmation describes the approval flow that
+    actually runs, not the approvals-off configuration."""
     import inspect
     text = inspect.getsource(tools.schedule_task)
     external_blocked = governor.external_tools() <= runner._blocked_tools_for(
         {"unattended": True, "allow_risky": False})
-    assert not ("blocked in them" in text and not external_blocked)
+    assert not external_blocked, "with approvals on, EXTERNAL parks — it is not blocked"
+    assert "blocked in them" not in text, "the confirmation still claims a block"
+    assert "/approvals" in text and "asks you" in text, (
+        "the confirmation should describe the approval flow the run will take")

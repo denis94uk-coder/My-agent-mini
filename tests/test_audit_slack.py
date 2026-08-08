@@ -230,13 +230,9 @@ def test_a_bare_mention_gets_a_greeting_not_an_ai_call(audit_env, slack_bot, mon
     assert "Hey!" in say.last and calls == []
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I7 (LOW) — the mention-stripping regex (bot.py:1004, "
-    "`<@[A-Z0-9]+>`) does not match Slack's `<@U123|name>` label form, so that "
-    "spelling reaches the model and is stored in memory as raw markup. Cosmetic "
-    "on its own; it also means the 'bare mention → greeting' path misfires for "
-    "the labelled form."))
 def test_the_labelled_mention_form_is_stripped(audit_env, slack_bot):
+    """FIXED (was FINDING I7): the regex matches Slack's labelled mention form
+    too, so it never reaches the model or memory as raw markup."""
     bot, registry = slack_bot
     event(registry, "app_mention", {"channel": "C1", "ts": "23.1", "user": "U_USER",
                                     "text": "<@U0BOT|agent> summarise"})
@@ -244,13 +240,9 @@ def test_the_labelled_mention_form_is_stripped(audit_env, slack_bot):
     assert "<@" not in stored, f"raw mention markup stored: {stored!r}"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I8 (LOW) — a slash payload missing channel_id raises KeyError out "
-    "of the listener (bot.py:1044 `command['channel_id']`). Bolt catches it and "
-    "logs a 500, so the user sees the command silently do nothing. Every "
-    "command reads channel_id directly; command.get('channel_id') with a "
-    "response_url fallback would degrade instead."))
 def test_a_malformed_slash_payload_does_not_raise(audit_env, slack_bot):
+    """FIXED (was FINDING I8): commands read the channel through a helper that
+    degrades instead of raising KeyError into a logged 500."""
     bot, registry = slack_bot
     say = Say()
     registry[("command", "/ask")](lambda *a, **k: None,
@@ -277,27 +269,32 @@ def test_the_app_level_token_is_required_to_start(audit_env):
     assert "raise SystemExit(1)" in source
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I9 (LOW) — outbound posts have no rate-limit backoff. bot.py "
-    "builds WebClient(token=...) with default retry handlers, which are "
-    "[ConnectionErrorRetryHandler] only — a Slack 429 raises SlackApiError "
-    "rather than being retried. runner._notify (runner.py:528) catches it and "
-    "logs, so a rate-limited background run's result is dropped with only a "
-    "log line. slack_sdk ships RateLimitErrorRetryHandler for exactly this."))
-def test_outbound_posts_retry_on_a_slack_429(audit_env):
+def test_outbound_posts_retry_on_a_slack_429(audit_env, slack_bot):
+    """FIXED (was FINDING I9): slack_sdk's default handlers cover connection
+    errors only, so a Slack 429 raised and runner._notify dropped a finished
+    run's result. The client bot.py builds now carries a rate-limit handler."""
+    import importlib
+    import inspect
+
+    bot, _ = slack_bot
+    source = inspect.getsource(importlib.import_module("bot"))
+    assert "RateLimitErrorRetryHandler" in source, (
+        "the WebClient is built without a rate-limit retry handler")
+
     from slack_sdk import WebClient
-    handlers = [type(h).__name__ for h in WebClient(token="xoxb-x").retry_handlers]
-    assert any("RateLimit" in name for name in handlers), handlers
+    from slack_sdk.http_retry import default_retry_handlers
+    from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
+
+    client = WebClient(
+        token="xoxb-x",
+        retry_handlers=default_retry_handlers() + [RateLimitErrorRetryHandler(max_retry_count=3)],
+    )
+    assert any("RateLimit" in type(h).__name__ for h in client.retry_handlers)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I10 (LOW) — the error path can raise the same error again. When "
-    "say() fails (channel not joined, Slack degraded), handle_message's except "
-    "block answers with another say() (bot.py:994) which fails identically, so "
-    "the exception escapes the listener. Bolt's default error handler catches "
-    "it, so nothing crashes — but the user gets no message at all, and the "
-    "traceback is the only record. The apology post needs its own try/except."))
 def test_a_failed_post_never_kills_the_listener(audit_env, slack_bot, monkeypatch):
+    """FIXED (was FINDING I10): the apology post has its own try/except, so a
+    channel the bot cannot post to produces one log line, not a traceback."""
     """say() raising (not_in_channel, Slack down) must not escape the listener."""
     bot, registry = slack_bot
     monkeypatch.setattr(bot, "call_ai", lambda m, p=None, images=None: "answer")

@@ -190,16 +190,9 @@ def test_max_rounds_zero_disables_the_gate_without_eating_work(audit_env, monkey
     assert final["result"].startswith("the answer")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING C1 (LOW, by design — flagged so the trade-off is explicit) — "
-    "'a reported blocker counts as done' is enforced only by wording in "
-    "CRITIC_PROMPT (critic.py:110-118). Nothing in code recognises a blocked "
-    "tool result, so a weaker model on the critic route can REVISE a correctly "
-    "blocked run every round up to the cap, spending 2 extra AI calls per run "
-    "and shipping a misleading 'unresolved review note'. The transcript "
-    "already contains the machine-readable evidence ('❌ Not authorized', "
-    "'❌ Denied', '❌ Not approved') that a code-level check could use."))
 def test_a_reported_blocker_is_accepted_without_relying_on_the_prompt(audit_env):
+    """FIXED (was FINDING C1): the refusal markers in the transcript are checked
+    in code, so a weak critic route can no longer demand impossible work."""
     steps = [{"tool": "push_branch",
               "result": "❌ Not authorized: 'push_branch' can only be used by the owner."}]
     stubborn = lambda m, p=None: "VERDICT: REVISE\nREASON: you did not push the branch."  # noqa: E731

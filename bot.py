@@ -47,6 +47,8 @@ except ImportError:
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
+from slack_sdk.http_retry import default_retry_handlers
+from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 import memory
 import tools
@@ -112,8 +114,14 @@ if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
 BOT_NAME = os.getenv("BOT_NAME", "My Agent")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
-# Slack client for file downloads
-slack_client = WebClient(token=SLACK_BOT_TOKEN)
+# Slack client for file downloads and for everything a background run posts.
+# The default retry handlers cover connection errors only, so a Slack 429 —
+# ordinary on a busy workspace — raised instead of retrying, and runner._notify
+# dropped a finished run's result with nothing but a log line.
+slack_client = WebClient(
+    token=SLACK_BOT_TOKEN,
+    retry_handlers=default_retry_handlers() + [RateLimitErrorRetryHandler(max_retry_count=3)],
+)
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT",
     f"""You are {BOT_NAME}, a sharp AI assistant on Slack.
@@ -780,6 +788,16 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
     return f"❌ All AI providers failed:\n{error_list}\n\nThe router will retry cooled-down providers automatically."
 
 
+def command_channel(command: dict) -> str:
+    """The channel a slash command came from.
+
+    Reading `command_channel(command)` directly raised KeyError on a malformed
+    payload, which Bolt turns into a logged 500 and the user experiences as the
+    command doing nothing at all.
+    """
+    return command.get("channel_id") or command.get("channel", {}).get("id") or ""
+
+
 def truncate_for_slack(text: str, limit: int = 3900) -> str:
     """Truncate text to fit in a single Slack message."""
     if len(text) <= limit:
@@ -1046,7 +1064,13 @@ def handle_message(event, say):
             slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
             pass
-        say(text=f"Sorry, I hit an error: {scrub(str(e))[:200]}", thread_ts=thread_ts)
+        try:
+            say(text=f"Sorry, I hit an error: {scrub(str(e))[:200]}", thread_ts=thread_ts)
+        except Exception as post_error:
+            # The apology failed the same way the reply did (channel not
+            # joined, Slack degraded). Raising here only produces a second
+            # traceback in the log and still tells the user nothing.
+            logger.error(f"❌ Could not deliver the error message either: {post_error}")
 
 
 @slack_app.event("app_mention")
@@ -1062,7 +1086,8 @@ def handle_mention(event, say):
     thread_ts = event.get("thread_ts") or event["ts"]
     msg_ts = event.get("ts")
     user_id = event.get("user", "unknown")
-    user_text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
+    # `<@U123>` and Slack's labelled `<@U123|name>` are the same mention.
+    user_text = re.sub(r"<@[A-Z0-9]+(?:\|[^>]*)?>\s*", "", event.get("text", "")).strip()
     files = event.get("files", [])
 
     if not _claim_event(channel, msg_ts):
@@ -1084,7 +1109,13 @@ def handle_mention(event, say):
             slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
             pass
-        say(text=f"Sorry, I hit an error: {scrub(str(e))[:200]}", thread_ts=thread_ts)
+        try:
+            say(text=f"Sorry, I hit an error: {scrub(str(e))[:200]}", thread_ts=thread_ts)
+        except Exception as post_error:
+            # The apology failed the same way the reply did (channel not
+            # joined, Slack degraded). Raising here only produces a second
+            # traceback in the log and still tells the user nothing.
+            logger.error(f"❌ Could not deliver the error message either: {post_error}")
 
 
 # ── Slash Commands ──
@@ -1094,7 +1125,7 @@ def handle_ask(ack, command, say):
     ack()
     question = command.get("text", "").strip()
     if not question:
-        say("Usage: `/ask <your question>`", channel=command["channel_id"])
+        say("Usage: `/ask <your question>`", channel=command_channel(command))
         return
 
     response = agent.run_agent_loop(
@@ -1104,7 +1135,7 @@ def handle_ask(ack, command, say):
         user_id=command.get("user_id", "unknown"),
     )
     response = agent.extract_final_text(response)
-    say(text=f"*Q:* {question}\n\n{truncate_for_slack(response)}", channel=command["channel_id"])
+    say(text=f"*Q:* {question}\n\n{truncate_for_slack(response)}", channel=command_channel(command))
 
 
 @slack_app.command("/search")
@@ -1112,20 +1143,20 @@ def handle_search(ack, command, say):
     ack()
     query = command.get("text", "").strip()
     if not query:
-        say("Usage: `/search <what to search for>`", channel=command["channel_id"])
+        say("Usage: `/search <what to search for>`", channel=command_channel(command))
         return
 
     result = tools.run_tool("web_search", {"query": query})
-    say(text=f"🔍 *Search:* {query}\n\n{truncate_for_slack(result)}", channel=command["channel_id"])
+    say(text=f"🔍 *Search:* {query}\n\n{truncate_for_slack(result)}", channel=command_channel(command))
 
 
 @slack_app.command("/clear")
 def handle_clear(ack, command, say):
     ack()
     if not tools._is_owner(command.get("user_id", "")):
-        say(text="❌ Only the bot's owner can clear memory.", channel=command["channel_id"])
+        say(text="❌ Only the bot's owner can clear memory.", channel=command_channel(command))
         return
-    channel = command["channel_id"]
+    channel = command_channel(command)
     # Thread summaries are memory too: leaving them behind meant a "cleared"
     # channel could still quote the cleared conversation back, via the rolling
     # digest and cross-thread recall. Project memory (decisions) is per-user
@@ -1155,7 +1186,7 @@ def handle_clear(ack, command, say):
 def handle_workflow(ack, command, say):
     """`/workflow` to list the recurring jobs, `/workflow start <name>` to schedule one."""
     ack()
-    channel = command["channel_id"]
+    channel = command_channel(command)
     args = (command.get("text") or "").strip().split()
 
     if not args or args[0] in ("list", "help"):
@@ -1182,7 +1213,7 @@ def handle_workflow(ack, command, say):
 def handle_providers(ack, command, say):
     ack()
     if not PROVIDERS:
-        say(text="❌ No providers configured.", channel=command["channel_id"])
+        say(text="❌ No providers configured.", channel=command_channel(command))
         return
 
     lines = [f"🧠 *AI Router ({len(PROVIDERS)} routes):*\n"]
@@ -1190,14 +1221,14 @@ def handle_providers(ack, command, say):
         kind = "keyless best-effort" if p.get("keyless") else "your key"
         lines.append(f"{i}. *{p['name']}* — `{p['model']}` ({kind}; {_provider_status(p)})")
     lines.append("\n_Healthy routes are tried first. Rate-limited routes cool down automatically._")
-    say(text="\n".join(lines), channel=command["channel_id"])
+    say(text="\n".join(lines), channel=command_channel(command))
 
 
 @slack_app.command("/runs")
 def handle_runs(ack, command, say):
     """Show background runs, or cancel one with `/runs cancel <id>`."""
     ack()
-    channel = command["channel_id"]
+    channel = command_channel(command)
     text = command.get("text", "").strip().split()
 
     if text and text[0] == "cancel":
@@ -1238,7 +1269,7 @@ def handle_runs(ack, command, say):
 def handle_schedules(ack, command, say):
     """Show scheduled tasks, or cancel one with `/schedules cancel <name>`."""
     ack()
-    channel = command["channel_id"]
+    channel = command_channel(command)
     text = command.get("text", "").strip().split(maxsplit=1)
 
     if text and text[0] == "cancel":
@@ -1269,11 +1300,11 @@ def handle_approvals(ack, command, say):
     """Show what the agent is waiting on a human to authorise."""
     ack()
     say(text="🖐️ *Waiting for approval*\n\n" + governor.format_approvals(),
-        channel=command["channel_id"])
+        channel=command_channel(command))
 
 
 def _decide_approval(command, say, approved: bool):
-    channel = command["channel_id"]
+    channel = command_channel(command)
     parts = command.get("text", "").strip().split(maxsplit=1)
     verb = "approve" if approved else "deny"
     if not parts or not parts[0].isdigit():
@@ -1324,7 +1355,7 @@ def handle_deny(ack, command, say):
 def handle_costs(ack, command, say):
     """AI call accounting, with paid routes tracked separately."""
     ack()
-    say(text=governor.format_usage(), channel=command["channel_id"])
+    say(text=governor.format_usage(), channel=command_channel(command))
 
 
 @slack_app.command("/status")
@@ -1354,7 +1385,7 @@ def handle_status(ack, command, say):
         f"{graph_stats['edges']} connections\n\n"
         f"*Tools:* {', '.join(tools.TOOLS.keys())}\n"
     )
-    say(text=status_text, channel=command["channel_id"])
+    say(text=status_text, channel=command_channel(command))
 
 
 @slack_app.command("/health")
@@ -1418,7 +1449,7 @@ def handle_health(ack, command, say):
         f"*Log file:* {log_size_kb} KB (rotates at 5 MB, keeps 3 backups)\n"
         f"*Errors in this process ({len(ERROR_LOG)} tracked, last 5):*\n{err_lines}\n"
     )
-    say(text=health_text, channel=command["channel_id"])
+    say(text=health_text, channel=command_channel(command))
 
 
 # ── Autonomy wiring ──

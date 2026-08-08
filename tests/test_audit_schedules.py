@@ -57,14 +57,10 @@ def test_specs_that_must_be_rejected(audit_env, spec):
         triggers.parse_spec(spec)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING E1 (LOW) — the interval parser discards everything that is not a "
-    "digit or a letter (triggers.py:109), so `every -5m` becomes `every 5m` "
-    "and `every 1.5h` becomes `every 15h`. A negative or fractional interval "
-    "is a typo the user should hear about; instead the schedule is created "
-    "and confirmed at a cadence they did not ask for."))
 @pytest.mark.parametrize("spec", ["every -5m", "every 1.5h", "every +2h"])
 def test_malformed_intervals_are_rejected(audit_env, spec):
+    """FIXED (was FINDING E1): an interval must be a whole number and a unit, so
+    `every -5m` and `every 1.5h` are refused instead of silently rewritten."""
     with pytest.raises(ValueError):
         triggers.parse_spec(spec)
 
