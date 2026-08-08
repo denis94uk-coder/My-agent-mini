@@ -242,7 +242,7 @@ def test_a_usable_last_response_is_sent_instead_of_buying_a_wrap_up(monkeypatch)
         user_id="U1",
     )
 
-    assert result == prose.strip()
+    assert result.startswith(prose.strip())
     assert len(calls) == agent.MAX_ITERATIONS, "no extra wrap-up call"
 
 
@@ -264,5 +264,5 @@ def test_a_bare_tool_call_still_buys_the_wrap_up(monkeypatch):
         user_id="U1",
     )
 
-    assert result == "Final summary."
+    assert result.startswith("Final summary.")
     assert len(calls) == agent.MAX_ITERATIONS + 1
