@@ -435,7 +435,8 @@ def execute_step(
     # and EXTERNAL tools additionally need their own approval decision, which
     # a batch cannot express.
     if len(tool_calls) > 1 and all(
-        governor.tier_of(c.get("tool")) == governor.READ for c in tool_calls
+        governor.tier_of(c.get("tool"), c.get("args")) == governor.READ
+        for c in tool_calls
     ):
         return _execute_read_batch(
             working_messages, response, tool_calls,

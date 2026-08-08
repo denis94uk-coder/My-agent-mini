@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 import memory
 import concept_graph
 import isolation
+import mcp_client
 
 logger = logging.getLogger("my-agent-mini")
 
@@ -77,6 +78,12 @@ OWNER_ONLY_TOOLS = {
     # Starting a background run commits shared resources — worker threads on a
     # 1 GB box and calls against a metered paid route — to autonomous work.
     "start_background_run",
+    # mcp_call dispatches to whatever the operator configured, with whatever
+    # credentials are in that server's headers. Its *tier* narrows per server
+    # (a docs server is a read), but the owner axis does not: "who may invoke
+    # this" stays the owner, because the set of reachable effects is only as
+    # bounded as the config, and the config is the owner's.
+    "mcp_call",
 }
 
 # Tools that need to know which conversation they were called from — the
@@ -441,6 +448,88 @@ def run_python(code: str) -> str:
                 os.unlink(temp_path)
             except OSError:
                 pass
+
+
+# ── MCP (Model Context Protocol) ──
+#
+# Two tools, not one per remote tool. Registering each MCP tool individually
+# would put an unbounded, server-controlled set of names into TOOLS, and
+# `test_every_registered_tool_has_a_tier` would fail the build for every one of
+# them — correctly, because nobody classified them. Worse, the system prompt
+# lists every registered tool, so a server offering 80 tools would crowd out
+# the prompt on a box whose whole problem is tokens per minute.
+#
+# So MCP tools stay off the registry and are reached through one dispatcher.
+# `mcp_list` is the discovery step that replaces having them in the prompt.
+
+
+@tool(
+    "mcp_list",
+    "List the tools available from configured MCP servers. Call with no server "
+    "to see which servers exist, or with a server name to see its tools and "
+    "their arguments. Do this before mcp_call.",
+    "server=''",
+)
+def mcp_list(server: str = "") -> str:
+    server = (server or "").strip()
+    names = mcp_client.configured_server_names()
+    if not names:
+        return (
+            "No MCP servers are configured. The owner can add them in "
+            "mcp_servers.json or the MCP_SERVERS environment variable."
+        )
+
+    if not server:
+        return "Configured MCP servers:\n" + "\n".join(
+            f"  • {n} (tier: {mcp_client.server_tier(n)})" for n in names
+        ) + "\n\nCall mcp_list with a server name to see its tools."
+
+    try:
+        tools_list = mcp_client.list_tools(server)
+    except mcp_client.MCPError as e:
+        return f"❌ {e}"
+
+    if not tools_list:
+        return f"{server} exposes no tools."
+
+    lines = [f"Tools on {server}:"]
+    for t in tools_list:
+        description = (t.get("description") or "").strip().replace("\n", " ")
+        if len(description) > 200:
+            description = description[:200] + "…"
+        schema = t.get("inputSchema") or {}
+        params = ", ".join((schema.get("properties") or {}).keys())
+        lines.append(f"  • {t.get('name')}({params}) — {description}")
+    return "\n".join(lines)
+
+
+@tool(
+    "mcp_call",
+    "Call a tool on a configured MCP server. Use mcp_list first to find the "
+    "server, tool name and its arguments. `arguments` is a JSON object.",
+    "server, tool, arguments={}",
+)
+def mcp_call(server: str, tool: str, arguments: dict | None = None) -> str:
+    server, tool = (server or "").strip(), (tool or "").strip()
+    if not server or not tool:
+        return "❌ mcp_call needs both a server and a tool name."
+
+    # The model sometimes emits the arguments object as a JSON string rather
+    # than an object, because the whole tool protocol is text.
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError:
+            return "❌ `arguments` was a string but not valid JSON."
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return "❌ `arguments` must be a JSON object."
+
+    try:
+        return mcp_client.call_tool(server, tool, arguments)
+    except mcp_client.MCPError as e:
+        return f"❌ {e}"
 
 
 @tool("memory_search", "Search your past conversations for information.", "query")

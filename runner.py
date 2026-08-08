@@ -691,7 +691,10 @@ def _approval_gate(run: dict):
         if run["allow_risky"]:
             # The owner pre-authorised this schedule for external actions.
             return True
-        return governor.tier_of(tool_name) != governor.EXTERNAL
+        # Pass the args: `mcp_call`'s reach depends on which server it names,
+        # and without them every MCP call — including one against a read-only
+        # server the owner classified as such — would park the run.
+        return governor.tier_of(tool_name, args) != governor.EXTERNAL
 
     return gate
 

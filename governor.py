@@ -94,6 +94,14 @@ TOOL_TIERS = {
     "schedule_task": EXTERNAL,
     "cancel_schedule": EXTERNAL,
     "start_background_run": EXTERNAL,
+    # MCP. `mcp_list` only enumerates what a configured server offers.
+    "mcp_list": READ,
+    # `mcp_call` is the one tool whose reach is not knowable from its name: it
+    # dispatches to a remote server chosen at call time. Its static tier is
+    # EXTERNAL — the safe answer when the arguments are not in hand — and
+    # `tier_of` narrows it per call from the operator's own per-server
+    # classification. See the `args` parameter there.
+    "mcp_call": EXTERNAL,
 }
 
 
@@ -112,14 +120,40 @@ def external_tools() -> set:
     return {name for name, tier in TOOL_TIERS.items() if tier == EXTERNAL}
 
 
-def tier_of(tool_name: str) -> str:
+def tier_of(tool_name: str, args: dict | None = None) -> str:
     """
     Risk tier for a tool. Unknown tools are EXTERNAL — fail safe, not silent.
 
     A new tool that nobody classified is exactly the case where guessing wrong
     is expensive, so it gets the treatment that asks a human first.
+
+    `args` is optional and only consulted for tools whose reach genuinely
+    depends on them. Today that is `mcp_call`, which dispatches to whichever
+    MCP server the model names: a documentation server is a read, a deploy
+    server is not, and the tool name alone cannot tell them apart. The tier
+    comes from the operator's own per-server config, never from anything the
+    server or the model says about itself. Omitting `args` always yields the
+    conservative static tier, so a caller that does not pass them cannot end
+    up with a *weaker* answer than one that does.
     """
+    if tool_name == "mcp_call" and args:
+        return _mcp_call_tier(args)
     return TOOL_TIERS.get(tool_name, EXTERNAL)
+
+
+def _mcp_call_tier(args: dict) -> str:
+    """Per-server tier for one `mcp_call`, defaulting to EXTERNAL."""
+    server = str((args or {}).get("server") or "").strip()
+    if not server:
+        return EXTERNAL
+    try:
+        import mcp_client
+        tier = mcp_client.server_tier(server)
+    except Exception:
+        # A config the client cannot read must not silently downgrade a call
+        # to something that skips the approval queue.
+        return EXTERNAL
+    return tier if tier in TIER_ORDER else EXTERNAL
 
 
 def _bool_env(name: str, default: bool) -> bool:
