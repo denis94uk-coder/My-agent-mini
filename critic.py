@@ -31,6 +31,9 @@ import os
 import re
 import logging
 
+import governor
+import ai_routing
+
 logger = logging.getLogger("my-agent-mini")
 
 ACCEPT = "accept"
@@ -206,7 +209,11 @@ def review(goal: str, steps: list[dict], final_text: str, call_ai_fn) -> Verdict
         final=final_text[:3000],
     )
     try:
-        response = call_ai_fn(
+        # The critic decides whether real work is finished, off a transcript it
+        # reads once. It is the call in this system least tolerant of a weak
+        # model — a critic that misreads the transcript either loops the agent
+        # on work already done or waves through work that isn't.
+        response = ai_routing.for_task(call_ai_fn, governor.TASK_CRITIC)(
             [{"role": "user", "content": prompt}],
             "You are a strict but fair reviewer. You answer only with a verdict.",
         )

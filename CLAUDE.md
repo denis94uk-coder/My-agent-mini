@@ -56,7 +56,12 @@ No Docker, no gateway service. SQLite for everything.
 | `concept_graph.py` | NetworkX entity/relation layer over `memory.db` |
 | `tools.py` | All tool impls + registry + owner lock |
 | `workflows.py` | Preset recurring jobs (goal text + schedule), started via `/workflow` |
-| `tests/` | 277 tests, no Slack/keys/network needed |
+| `isolation.py` | Child-process confinement: env scrubbing + bubblewrap |
+| `mcp_client.py` | MCP client, streamable HTTP only; reached via `mcp_list`/`mcp_call` |
+| `skills_index.py` | Retrieval over `skills/` playbooks, behind `find_skill` |
+| `ai_routing.py` | Tags an injected `call_ai_fn` with its task class |
+| `health.py` | Localhost `/healthz` + `/livez`, answers from outside the agent loop |
+| `tests/` | 614 tests, no Slack/keys/network needed |
 
 Key invariant: **both** the interactive loop and the run engine drive
 `agent.execute_step`. One implementation of the tool protocol. Don't fork it.
@@ -131,6 +136,42 @@ response — works on any provider, no native function calling required.
   being skipped for a paid one.
 - `git push` in `run_shell` fails on the server (no credential helper). Use
   `push_branch` / `github_write_file` — both open a PR, never commit to main.
+- **A denylist is not a sandbox.** `BLOCKED_PATTERNS` is a speed bump over a
+  language with `$()`, aliases and base64. `isolation.wrap` is the boundary.
+  Both stay: the denylist gives a readable refusal, the sandbox does the work.
+  Scrubbing the environment matters more than it looks — `echo $GITHUB_TOKEN`
+  prints a live credential with no keyword near it, which is exactly what the
+  output redaction cannot catch. Removing the variable leaves nothing to redact.
+- **Schema DDL is a write transaction.** `get_db()` used to run
+  `journal_mode=WAL` plus the whole `CREATE TABLE` script on every call, so
+  every *read* opened by taking a write lock and the workers, scheduler and
+  sweeper serialised against each other. Runs it once per DB path per process
+  now — but keyed on the path, and re-checked against the file existing, or
+  the tests' tmpdir databases get no tables and a deleted `memory.db` is
+  never rebuilt.
+- **A tool whose reach depends on its arguments needs an args-aware tier.**
+  `mcp_call` is the only one so far. Static tier stays EXTERNAL and
+  `tier_of(name, args)` narrows it; omitting args must never give a *weaker*
+  answer than passing them, and the tier comes from the operator's config,
+  never from what a server says about itself.
+- **Route preference must never cost a stall.** Task-class routing sorts
+  behind minute headroom, and only ever reorders — a preferred route that is
+  cooling down or capped loses its place rather than taking the call with it.
+- **An instruction the model cannot follow is worse than none.** The prompt
+  pointed at `skills/coding-practices/` for years while no tool could open the
+  repo's own checkout. It burns steps and then invents a substitute. If the
+  prompt names a path, something must be able to read it.
+- **A miss must return nothing.** The model reads a returned playbook as
+  instruction, so `find_skill`'s least-bad match is worse than no match. One
+  overlapping word is coincidence; the two-term rule is what stops "what time
+  is my meeting" matching.
+- **`health.py` must never import `bot`.** `bot.py` owns the Slack client and
+  exits at import without tokens. The route list is pushed in with
+  `set_route_source`. This is the same rule that keeps the whole suite
+  runnable with no keys — it just now has a module that would break it.
+- **Liveness ≠ readiness.** `/livez` never 503s; a supervisor restarting a bot
+  that is merely out of AI routes loses every queued run for nothing.
+  `/healthz` 503s so `curl -f` fails without parsing the body.
 
 ## Testing
 
@@ -168,7 +209,34 @@ keep new modules free of Slack imports so this stays possible.
    goes through the same `triggers.add_schedule` a human schedule uses — no
    second execution path
 
-Still open, in rough value order: critic/summariser on a stronger route than
-the agent itself; interactive loop handing off to a background run when it
-hits `MAX_ITERATIONS`; vision (`images=`) in runs, currently interactive-only;
-embeddings for memory retrieval (deliberately deferred — FTS5 fits 1 GB).
+9. ✅ Child-process isolation (`isolation.py`) — `run_shell`/`run_python` get
+   an allowlisted environment with secret-named variables removed (always),
+   plus bubblewrap: read-only root, private `/tmp`, `.env` and `~/.ssh`
+   masked, workspace bound read-write (when `bwrap` is installed).
+   `BLOCKED_PATTERNS` stays as a clear refusal for obvious cases, but it is no
+   longer the boundary. Degrades visibly — `server_health` reports which
+   layers are in force
+10. ✅ MCP (`mcp_client.py`) — streamable HTTP only, no SDK dependency, two
+   registered tools (`mcp_list`, `mcp_call`) rather than one per remote tool.
+   `governor.tier_of` takes optional args so `mcp_call` narrows from EXTERNAL
+   to the operator's per-server tier. stdio transport declined: 50-150 MB of
+   subprocess each, and spawning processes for the model is what `isolation`
+   exists to contain
+11. ✅ Task-class routing (`ai_routing.py` + `governor.order_routes`) —
+   `ROUTER_ROUTE_CRITIC` / `_SUMMARY` / `_AGENT`. Minute headroom outranks
+   preference, so a favourite route never costs a stall, and nothing is ever
+   filtered out
+12. ✅ `MAX_ITERATIONS` handoff — an over-long interactive turn continues as a
+   background run seeded with the transcript, instead of ending with a partial
+   answer the user can only recover by re-asking
+13. ✅ `find_skill` (`skills_index.py`) — the vendored playbooks in `skills/`
+   were unreachable (`read_file` basenames into the workspace). Deterministic
+   IDF-weighted retrieval; a miss returns nothing rather than the least-bad
+   match
+14. ✅ Health endpoint (`health.py`) — `/healthz` (readiness, 503 when
+   degraded) and `/livez` (liveness, never 503). Loopback by default; the
+   report names routes and servers and there is no auth in front of this box
+
+Still open, in rough value order: vision (`images=`) in runs, currently
+interactive-only; embeddings for memory retrieval (deliberately deferred —
+FTS5 fits 1 GB).

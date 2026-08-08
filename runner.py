@@ -33,6 +33,7 @@ import threading
 import logging
 
 import agent
+import ai_routing
 import critic
 import governor
 import memory
@@ -152,8 +153,22 @@ def daily_limit() -> int:
     return max(0, _int_env("RUN_DAILY_LIMIT", 50))
 
 
+# Worker threads are named with this prefix so `health.py` can count the live
+# ones. Kept next to worker_count so the two stay in step.
+WORKER_THREAD_PREFIX = "run-worker-"
+
+
 def worker_count() -> int:
     return max(1, _int_env("RUN_WORKERS", 2))
+
+
+def workers_started() -> bool:
+    """Whether start_workers has run in this process.
+
+    The health check needs this to tell "the workers died" from "the workers
+    were never started" — only the first is a fault.
+    """
+    return _WORKERS_STARTED
 
 
 def max_retries() -> int:
@@ -479,7 +494,10 @@ def compact_messages(messages: list[dict], call_ai_fn=None) -> tuple[list[dict],
             f"{m.get('role')}: {(m.get('content') or '')[:800]}" for m in older
         )
         try:
-            digest = call_ai_fn(
+            # The fold is written once and then *replayed on every later step*
+            # and again on resume — a summariser that drops a file path or a
+            # failure reason loses it for the rest of the run.
+            digest = ai_routing.for_task(call_ai_fn, governor.TASK_SUMMARY)(
                 [{
                     "role": "user",
                     "content": (
@@ -691,7 +709,10 @@ def _approval_gate(run: dict):
         if run["allow_risky"]:
             # The owner pre-authorised this schedule for external actions.
             return True
-        return governor.tier_of(tool_name) != governor.EXTERNAL
+        # Pass the args: `mcp_call`'s reach depends on which server it names,
+        # and without them every MCP call — including one against a read-only
+        # server the owner classified as such — would park the run.
+        return governor.tier_of(tool_name, args) != governor.EXTERNAL
 
     return gate
 
@@ -1071,7 +1092,15 @@ def start_workers(count: int | None = None) -> int:
 
     n = count or worker_count()
     for i in range(n):
-        threading.Thread(target=_worker_loop, args=(f"w{i + 1}",), daemon=True).start()
+        # Named so the health endpoint can count how many are actually alive.
+        # A worker thread that died takes its share of the queue with it and
+        # nothing else notices — runs simply stop draining.
+        threading.Thread(
+            target=_worker_loop,
+            args=(f"w{i + 1}",),
+            name=f"{WORKER_THREAD_PREFIX}{i + 1}",
+            daemon=True,
+        ).start()
     return n
 
 

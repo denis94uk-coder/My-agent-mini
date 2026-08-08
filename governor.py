@@ -94,6 +94,17 @@ TOOL_TIERS = {
     "schedule_task": EXTERNAL,
     "cancel_schedule": EXTERNAL,
     "start_background_run": EXTERNAL,
+    # MCP. `mcp_list` only enumerates what a configured server offers.
+    "mcp_list": READ,
+    # Reads playbook files shipped with the code. No effects, no arguments
+    # that reach the network or the filesystem beyond `skills/`.
+    "find_skill": READ,
+    # `mcp_call` is the one tool whose reach is not knowable from its name: it
+    # dispatches to a remote server chosen at call time. Its static tier is
+    # EXTERNAL — the safe answer when the arguments are not in hand — and
+    # `tier_of` narrows it per call from the operator's own per-server
+    # classification. See the `args` parameter there.
+    "mcp_call": EXTERNAL,
 }
 
 
@@ -112,14 +123,40 @@ def external_tools() -> set:
     return {name for name, tier in TOOL_TIERS.items() if tier == EXTERNAL}
 
 
-def tier_of(tool_name: str) -> str:
+def tier_of(tool_name: str, args: dict | None = None) -> str:
     """
     Risk tier for a tool. Unknown tools are EXTERNAL — fail safe, not silent.
 
     A new tool that nobody classified is exactly the case where guessing wrong
     is expensive, so it gets the treatment that asks a human first.
+
+    `args` is optional and only consulted for tools whose reach genuinely
+    depends on them. Today that is `mcp_call`, which dispatches to whichever
+    MCP server the model names: a documentation server is a read, a deploy
+    server is not, and the tool name alone cannot tell them apart. The tier
+    comes from the operator's own per-server config, never from anything the
+    server or the model says about itself. Omitting `args` always yields the
+    conservative static tier, so a caller that does not pass them cannot end
+    up with a *weaker* answer than one that does.
     """
+    if tool_name == "mcp_call" and args:
+        return _mcp_call_tier(args)
     return TOOL_TIERS.get(tool_name, EXTERNAL)
+
+
+def _mcp_call_tier(args: dict) -> str:
+    """Per-server tier for one `mcp_call`, defaulting to EXTERNAL."""
+    server = str((args or {}).get("server") or "").strip()
+    if not server:
+        return EXTERNAL
+    try:
+        import mcp_client
+        tier = mcp_client.server_tier(server)
+    except Exception:
+        # A config the client cannot read must not silently downgrade a call
+        # to something that skips the approval queue.
+        return EXTERNAL
+    return tier if tier in TIER_ORDER else EXTERNAL
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -585,6 +622,70 @@ def route_order_rank(provider_name: str) -> int:
         if name in lowered:
             return index
     return _UNRANKED
+
+
+# The kinds of AI call this agent makes. They are not equally demanding, and
+# routing them identically is why the open roadmap item "critic/summariser on a
+# stronger route than the agent itself" existed: the critic re-reads a whole
+# transcript and decides whether work is done, which is the call least
+# tolerant of a weak model, while filling in a tool argument is the most.
+TASK_AGENT = "agent"        # the main loop: reason, pick a tool
+TASK_CRITIC = "critic"      # re-read goal + transcript, ACCEPT or REVISE
+TASK_SUMMARY = "summary"    # context fold and thread summaries
+TASK_CLASSES = (TASK_AGENT, TASK_CRITIC, TASK_SUMMARY)
+
+
+def task_route_preference(task: str) -> list[str]:
+    """Route-name fragments preferred for a class of call, best first.
+
+    Configured per class as `ROUTER_ROUTE_CRITIC=groq,gemini`. Matching is by
+    substring, the same rule as ROUTER_ORDER, so a renamed route keeps working.
+
+    This is a *preference*, not a restriction: the caller reorders the existing
+    route list and never removes anything from it. That distinction is the
+    whole safety story — a preferred route that is rate-limited, cooled down or
+    past its daily cap simply loses its place at the front, rather than taking
+    the call down with it. An unconfigured class routes exactly as before.
+    """
+    if task not in TASK_CLASSES:
+        return []
+    raw = os.getenv(f"ROUTER_ROUTE_{task.upper()}", "")
+    return [n.strip().lower() for n in raw.split(",") if n.strip()]
+
+
+def task_route_rank(provider_name: str, task: str) -> int:
+    """Position of a route in the preference for `task`; `_UNRANKED` if absent."""
+    lowered = (provider_name or "").lower()
+    for index, fragment in enumerate(task_route_preference(task)):
+        if fragment in lowered:
+            return index
+    return _UNRANKED
+
+
+def order_routes(providers: list, task: str, wait_seconds) -> list:
+    """Order candidate routes for one call. Returns a new list; removes nothing.
+
+    Two preferences, and the order between them is the whole design:
+
+      • **Task class** says which route is *best* for this kind of call.
+      • **Minute headroom** says which route can serve *right now* without
+        spending a 429 — and a 429 parks a route for its entire reset window,
+        so it costs far more than one call.
+
+    Headroom is the outer key, so a preference never costs a stall: among the
+    routes that can serve immediately the task's favourite goes first, while a
+    favourite that is out of token budget this minute simply loses its place
+    instead of making the call wait for it.
+
+    `providers` are the router's dicts and `wait_seconds` maps one to its
+    current wait. Nothing is filtered, so a preference naming a route that is
+    down, absent or misspelled degrades to the next route rather than failing.
+    """
+    def key(provider):
+        wait = wait_seconds(provider)
+        return (wait > 0, task_route_rank(provider["name"], task), wait)
+
+    return sorted(providers, key=key)
 
 
 def record_tokens(provider_name: str, tokens: int) -> None:

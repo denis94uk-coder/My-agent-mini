@@ -54,6 +54,7 @@ import governor
 import runner
 import triggers
 import workflows
+import health
 import concept_graph
 
 # ── Logging ──
@@ -667,8 +668,18 @@ def call_cohere(provider: dict, messages: list[dict], system_prompt: str, images
     return data["message"]["content"][0]["text"]
 
 
-def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] = None) -> str:
-    """Route through healthy providers, cooling down failures automatically."""
+def call_ai(
+    messages: list[dict],
+    system_prompt: str = None,
+    images: list[dict] = None,
+    task: str = governor.TASK_AGENT,
+) -> str:
+    """Route through healthy providers, cooling down failures automatically.
+
+    `task` names the kind of call so the router can prefer a different route
+    for it — see governor.task_route_preference. It is advisory: an
+    unconfigured task class routes exactly as it did before.
+    """
     if system_prompt is None:
         system_prompt = SYSTEM_PROMPT
 
@@ -707,7 +718,14 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
     # simply succeeds somewhere else.
     input_chars = sum(len(m.get("content") or "") for m in messages) + len(system_prompt)
     est_tokens = governor.estimate_tokens(input_chars)
-    available.sort(key=lambda p: governor.tpm_wait_seconds(p["name"], est_tokens))
+
+    # Minute headroom first, then the task's route preference among the routes
+    # that can serve immediately. See governor.order_routes for why that order.
+    available = governor.order_routes(
+        available,
+        task,
+        lambda p: governor.tpm_wait_seconds(p["name"], est_tokens),
+    )
 
     errors = []
     for provider in available:
@@ -946,7 +964,8 @@ def _maybe_summarize_thread(conv_key: str, user_id: str):
                 + f"CONVERSATION:\n{convo_text}"
             )
             summary = call_ai([{"role": "user", "content": prompt}],
-                              "You write terse, accurate conversation digests.")
+                              "You write terse, accurate conversation digests.",
+                              task=governor.TASK_SUMMARY)
             if summary and not summary.startswith("❌"):
                 memory.save_thread_summary(conv_key, user_id, summary, total)
                 # Deeper LLM-assisted graph extraction from the summary
@@ -1342,6 +1361,12 @@ def start_autonomy() -> tuple[int, bool]:
     )
     workers = runner.start_workers()
     scheduler_on = triggers.start_scheduler()
+
+    # Started after the workers so the endpoint never reports "0 alive" during
+    # the window before they exist. The route list is pushed in rather than
+    # imported, so health.py stays free of the Slack client.
+    health.set_route_source(lambda: [p["name"] for p in PROVIDERS])
+    health.start()
 
     # Context budgeting is invisible until a model rejects the request, so
     # state it at boot. The system prompt is sent on every call and dwarfs the

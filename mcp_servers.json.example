@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Copy to mcp_servers.json (gitignored) or set the same JSON in the",
+    "MCP_SERVERS environment variable, which takes precedence.",
+    "",
+    "Only the streamable-HTTP transport is supported. stdio servers are not:",
+    "each one is a node/python subprocess costing 50-150 MB against a 1 GB box",
+    "already running two workers, and spawning processes on the model's behalf",
+    "is what isolation.py exists to contain.",
+    "",
+    "`tier` is the governor risk tier and the operator's call, not the",
+    "server's. Omit it and the server is treated as EXTERNAL, meaning every",
+    "call from an unattended run parks for approval. Set it to `read` only",
+    "for servers that genuinely cannot change anything.",
+    "",
+    "mcp_call is owner-only regardless of tier: the tier bounds how far an",
+    "effect reaches, not who may invoke it."
+  ],
+
+  "servers": {
+    "docs": {
+      "url": "https://example.com/mcp",
+      "tier": "read",
+      "enabled": false
+    },
+    "deploy": {
+      "url": "https://example.com/deploy/mcp",
+      "headers": {"Authorization": "Bearer ${put-a-real-token-here}"},
+      "tier": "external",
+      "timeout": 120,
+      "enabled": false
+    }
+  }
+}

@@ -192,4 +192,4 @@ def test_loop_stops_at_max_iterations():
         call_ai_fn=always_tool,
         system_prompt="Test bot.",
     )
-    assert result == "Final summary."
+    assert result.startswith("Final summary.")

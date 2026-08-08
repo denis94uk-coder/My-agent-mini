@@ -16,6 +16,7 @@ The loop is built from `execute_step`, one AI call + at most one tool run.
 step to SQLite so an autonomous run can survive a restart and resume.
 """
 
+import os
 import re
 import json
 import logging
@@ -25,6 +26,12 @@ import governor
 import tools
 
 logger = logging.getLogger("my-agent-mini")
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    return os.getenv(name, "true" if default else "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 MAX_ITERATIONS = 10  # Safety limit to prevent infinite loops
 # Prose left in the last response after stripping its tool block, above which
@@ -195,9 +202,11 @@ to what fits in one reply:
 **Coding practices** — for real software engineering (not quick scripts):
 spec before code, small verifiable slices, reproduce-localize-fix-guard when
 debugging, self-review before calling it done, atomic commits explaining
-*why*, and `remember(category='decision')` for architectural calls. Full
-references live in `skills/coding-practices/` — read the relevant file when
-a task warrants it; see its README.md for the index.
+*why*, and `remember(category='decision')` for architectural calls. Call
+`find_skill` with a description of the task to get the full playbook for it
+(TDD, debugging, code review, git workflow, security hardening, and ~20
+more). It returns nothing when no playbook fits — that means use your own
+judgment, not that you looked in the wrong place.
 
 EXECUTION PRINCIPLES:
 - DO the task, don't describe how the user could do it themselves
@@ -435,7 +444,8 @@ def execute_step(
     # and EXTERNAL tools additionally need their own approval decision, which
     # a batch cannot express.
     if len(tool_calls) > 1 and all(
-        governor.tier_of(c.get("tool")) == governor.READ for c in tool_calls
+        governor.tier_of(c.get("tool"), c.get("args")) == governor.READ
+        for c in tool_calls
     ):
         return _execute_read_batch(
             working_messages, response, tool_calls,
@@ -624,10 +634,82 @@ def run_agent_loop(
     # an answer, and only pay for the extra call when there is not.
     logger.warning(f"⚠️ Agent hit max iterations ({MAX_ITERATIONS})")
     salvaged = extract_final_text(outcome.response) if outcome.response else ""
-    if len(salvaged) >= MIN_SALVAGEABLE_ANSWER_CHARS:
+    if len(salvaged) < MIN_SALVAGEABLE_ANSWER_CHARS:
+        salvaged = call_ai_fn(
+            working_messages + [{"role": "user", "content": "Please give your final answer now based on what you've gathered."}],
+            full_prompt,
+        )
+    else:
         logger.info("↩️ Using the last response as the answer instead of a wrap-up call")
-        return salvaged
-    return call_ai_fn(
-        working_messages + [{"role": "user", "content": "Please give your final answer now based on what you've gathered."}],
-        full_prompt,
+
+    # Ten iterations is a limit on *this* loop, not evidence the task is
+    # impossible — a task that needs eleven steps used to end with a partial
+    # answer and no way to continue, and the user's only recourse was to
+    # re-ask and pay for the first ten steps again. The run engine exists for
+    # exactly this: durable, resumable, budgeted, and not holding up the chat.
+    handoff = _hand_off_to_background_run(
+        goal_text, tool_trail, salvaged, user_id=user_id, conv_key=conv_key
+    )
+    return salvaged + handoff
+
+
+def _hand_off_to_background_run(
+    goal_text: str,
+    tool_trail: list[dict],
+    partial_answer: str,
+    *,
+    user_id: str,
+    conv_key: str,
+) -> str:
+    """Continue an over-long interactive turn as a background run.
+
+    Returns a note to append to the reply, or "" when no handoff happened.
+    Never raises: failing to hand off is a worse answer, not a failed one, and
+    the partial answer has already been earned.
+
+    Only ever called from the interactive loop. The run engine drives
+    `execute_step` directly, so a background run cannot reach this and spawn
+    another — which is the same reason `start_background_run` is in
+    UNATTENDED_BLOCKED_TOOLS.
+    """
+    if not _bool_env("HANDOFF_ON_MAX_ITERATIONS", True):
+        return ""
+    if not (goal_text or "").strip():
+        return ""
+
+    # The digest is assembled from the transcript, not summarised by the model.
+    # Paying for an AI call here would be paying at exactly the moment the turn
+    # has already proved expensive, and the tool trail is the part worth
+    # carrying anyway.
+    progress = critic.format_transcript(tool_trail, limit=15, result_chars=300)
+    goal = (
+        f"Continue work that ran out of steps in a live conversation.\n\n"
+        f"ORIGINAL REQUEST:\n{goal_text[:2000]}\n\n"
+        f"WHAT WAS ALREADY DONE (do not repeat it):\n{progress}\n\n"
+        f"THE PARTIAL ANSWER ALREADY SENT TO THE USER:\n{partial_answer[:1500]}\n\n"
+        f"Finish the remaining work and report only what is new."
+    )
+
+    try:
+        result = tools.run_tool("start_background_run", {
+            "goal": goal,
+            "_user_id": user_id,
+            "_conv_key": conv_key,
+            "_requesting_user_id": user_id,
+        })
+    except Exception as e:
+        logger.warning(f"Hand-off to a background run failed: {e}")
+        return ""
+
+    if isinstance(result, str) and result.startswith("❌"):
+        # Most often the owner lock: a non-owner cannot commit worker threads
+        # and metered calls to autonomous work. Their partial answer stands on
+        # its own, and saying "I would have continued but may not" is noise.
+        logger.info(f"No hand-off: {result[:120]}")
+        return ""
+
+    logger.info("↪️ Handed the rest of the work to a background run")
+    return (
+        "\n\n_Ran out of steps in this reply, so I've continued the rest as a "
+        f"background run — I'll post here when it's done._\n_{result.strip()}_"
     )
