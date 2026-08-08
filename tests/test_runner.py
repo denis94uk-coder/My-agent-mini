@@ -252,7 +252,7 @@ def test_unattended_runs_block_state_changing_tools(monkeypatch):
     monkeypatch.setenv("APPROVALS_ENABLED", "false")
     run = {"unattended": 1, "allow_risky": 0}
     blocked = runner._blocked_tools_for(run)
-    assert "deploy_static_site" in blocked
+    assert "push_branch" in blocked
     assert "push_branch" in blocked
     assert "start_background_run" in blocked
 
@@ -261,7 +261,7 @@ def test_allow_risky_unlocks_owner_tools_but_never_run_spawning(monkeypatch):
     monkeypatch.setenv("APPROVALS_ENABLED", "false")
     run = {"unattended": 1, "allow_risky": 1}
     blocked = runner._blocked_tools_for(run)
-    assert "deploy_static_site" not in blocked
+    assert "push_branch" not in blocked
     # Spawning more autonomous work stays blocked either way.
     assert blocked == set(tools.UNATTENDED_BLOCKED_TOOLS)
 
@@ -274,7 +274,7 @@ def test_blocked_tool_is_refused_but_the_run_continues(monkeypatch):
     """With no approver reachable, an external tool is a flat no, not a pause."""
     monkeypatch.setenv("APPROVALS_ENABLED", "false")
     ai = ScriptedAI(
-        tool_call("deploy_static_site", site_name="demo"),
+        tool_call("push_branch", branch="demo"),
         "I couldn't deploy — that needs a human.",
     )
     runner.configure(call_ai_fn=ai, system_prompt="Test bot.")
@@ -358,8 +358,10 @@ def test_a_run_that_stops_heartbeating_is_declared_stuck():
 
     assert runner.sweep_stuck_runs() == [run_id]
     run = runner.get_run(run_id)
-    # Transient by default, so it gets its retries before staying failed.
-    assert run["status"] == "queued"
+    # Failed, never re-queued: the worker may still be alive inside that tool,
+    # and `queued` counts as ACTIVE, so a retry would also leave the schedule
+    # behind this run blocked — the condition the sweep exists to clear.
+    assert run["status"] == "failed"
     assert run["attempts"] == 1
     assert "stopped heartbeating" in run["error"]
 

@@ -100,31 +100,36 @@ def _recover(form: str, text: str) -> str:
     return " ".join(out)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING G1 (HIGH) — the redaction boundary. tools.py:681 "
-    "_redact_shell_output is a regex over literal credential SHAPES, applied "
-    "to the output only. Any transformation defeats it: `echo $GITHUB_TOKEN | "
-    "base64`, `| xxd -p`, `| rev`, `| fold -w20` all put a fully recoverable "
-    "token into the Slack message. run_shell is owner-only, so the attacker is "
-    "an injected page steering the OWNER's session, not a stranger — but the "
-    "control cannot be described as preventing exfiltration."))
 @pytest.mark.parametrize("form", sorted(MANGLED))
-def test_transformed_tokens_are_redacted(audit_env, form):
+def test_transformed_tokens_are_redacted(audit_env, monkeypatch, form):
+    """FIXED (was FINDING G1): shape-matching alone could not survive an
+    encoding, so redaction now also knows the values this process actually
+    holds and strips them in any form."""
+    monkeypatch.setenv("GITHUB_TOKEN", GITHUB)
     out = tools._redact_shell_output(f"$ echo $GITHUB_TOKEN | {form}\n{MANGLED[form]}\n")
     assert GITHUB not in _recover(form, out), f"{form} form reached the model intact"
 
 
 @pytest.mark.xfail(strict=True, reason=(
-    "FINDING G2 (MEDIUM) — redaction is applied at three call sites "
-    "(run_shell, run_python, git helpers), not at the boundary where tool "
-    "output leaves the process. read_file returns workspace file contents "
-    "verbatim (tools.py:735), so a .env-shaped file in the workspace goes "
-    "straight into the model context and the Slack reply. Same for "
-    "repo_read_file and github_read_file."))
+    "FINDING G1b (LOW, residual) — the boundary that remains. Value-based "
+    "redaction covers every secret in this process's environment; a credential "
+    "that is NOT ours — read out of a file, or another account's token pasted "
+    "into a repo — is still only caught while it keeps its literal shape, so an "
+    "encoding hides it. Shape-matching cannot be made complete; the remaining "
+    "control is that the tools which read arbitrary bytes are owner-only."))
+@pytest.mark.parametrize("form", ["base64", "hex", "reversed"])
+def test_a_foreign_token_is_redacted_when_encoded(audit_env, monkeypatch, form):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    out = tools._redact_shell_output(f"$ cat stolen.txt\n{MANGLED[form]}\n")
+    assert GITHUB not in _recover(form, out)
+
+
 @pytest.mark.parametrize("tool_name,kwargs", [
     ("read_file", {"filename": "leak.env"}),
 ])
 def test_file_reading_tools_redact_secrets(audit_env, monkeypatch, tool_name, kwargs):
+    """FIXED (was FINDING G2): redaction moved to run_tool, so it covers every
+    tool's output rather than the three that remembered to call it."""
     monkeypatch.setattr(tools, "WORKSPACE", str(audit_env))
     (audit_env / "leak.env").write_text(f"GITHUB_TOKEN={GITHUB}\n")
     assert GITHUB not in tools.run_tool(tool_name, dict(kwargs))
@@ -166,16 +171,9 @@ def test_cost_report_contains_no_credentials(audit_env):
     assert "key=" not in report and "AIza" not in report and "mg_" not in report
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING G3 (HIGH) — the Gemini API key is in the request URL "
-    "(bot.py:556 `url += f'?key={provider[\"api_key\"]}'`), so requests' "
-    "HTTPError text is '400 Client Error … for url: …?key=AIza…'. That string "
-    "is returned to the channel by call_ai (bot.py:757), written to bot.log by "
-    "logger.warning (bot.py:753), and stored in ERROR_LOG, which /health prints "
-    "to whoever ran it. One bad Gemini response publishes the key to Slack. "
-    "Send the key as the x-goog-api-key header instead, and redact provider "
-    "errors before they are surfaced."))
 def test_provider_error_never_carries_the_api_key(audit_env, monkeypatch, tmp_path):
+    """FIXED (was FINDING G3): the key travels as the x-goog-api-key header, and
+    every provider error is scrubbed before it reaches Slack or the log."""
     slack_bolt = pytest.importorskip("slack_bolt")
     import requests
 

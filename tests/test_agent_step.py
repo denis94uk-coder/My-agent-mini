@@ -76,9 +76,9 @@ def test_blocked_tool_is_refused_without_running():
     messages = [{"role": "user", "content": "deploy it"}]
     outcome = agent.execute_step(
         messages,
-        reply_with(tool_call("deploy_static_site", site_name="demo")),
+        reply_with(tool_call("push_branch", branch="demo")),
         "prompt",
-        blocked_tools={"deploy_static_site"},
+        blocked_tools={"push_branch"},
     )
 
     assert outcome.kind == "tool"

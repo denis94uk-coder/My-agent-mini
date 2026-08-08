@@ -191,16 +191,22 @@ def test_injection_cannot_reach_a_privileged_tool_for_a_non_owner(
         f"a privileged tool ran from {source} injection:\n{transcript[:600]}")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING F2 (HIGH) — memory_search is unscoped. tools.py:432 calls "
-    "memory.search_history(query) with no conv_key and no user id, so the "
-    "READ-tier tool every workspace member can invoke searches EVERY "
-    "conversation the bot has ever had, including other people's DMs. One "
-    "message — 'search your memory for password' — is the whole exploit, and "
-    "an injected page can trigger it without the user asking."))
 def test_memory_search_is_scoped_to_the_caller(audit_env):
+    """FIXED (was FINDING F2): the tool searches the calling channel only, and
+    refuses outright when it is called without one."""
     import memory
     memory.add_message("D_PRIVATE:1", "user", "board deck password is hunter2")
-    out = tools.run_tool("memory_search", {"query": "password",
-                                           "_requesting_user_id": "U_STRANGER"})
-    assert "hunter2" not in out, "another user's DM was returned to a stranger"
+
+    from_another_channel = tools.run_tool("memory_search", {
+        "query": "password", "_conv_key": "C_PUBLIC:1",
+        "_requesting_user_id": "U_STRANGER"})
+    assert "hunter2" not in from_another_channel
+
+    unscoped = tools.run_tool("memory_search", {"query": "password",
+                                                "_requesting_user_id": "U_STRANGER"})
+    assert "hunter2" not in unscoped and "will not run an unscoped search" in unscoped
+
+    # The owner of that DM still finds it.
+    own = tools.run_tool("memory_search", {"query": "password",
+                                           "_conv_key": "D_PRIVATE:1"})
+    assert "hunter2" in own

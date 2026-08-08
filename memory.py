@@ -146,8 +146,25 @@ def get_history(conv_key: str, limit: int = 20) -> list[dict]:
         conn.close()
 
 
-def search_history(query: str, limit: int = 10) -> list[dict]:
-    """Search past conversations. Ranked FTS5 (BM25) when available, LIKE fallback."""
+def channel_of(conv_key: str) -> str:
+    """The Slack channel a conv_key belongs to (`C123:1699…` -> `C123`).
+
+    Scoping unit for every cross-thread read. A DM channel is private to one
+    person, so channel scope keeps one user's DMs out of another user's
+    results while still letting a new thread recall the rest of its channel.
+    """
+    return (conv_key or "").split(":", 1)[0]
+
+
+def search_history(query: str, limit: int = 10, scope_channel: str = "") -> list[dict]:
+    """
+    Search past conversations. Ranked FTS5 (BM25) when available, LIKE fallback.
+
+    `scope_channel` restricts the search to one Slack channel. Callers that can
+    identify a channel MUST pass it: an unscoped search reads every
+    conversation the bot has ever had, including other people's DMs.
+    """
+    like_scope = f"{scope_channel}:%" if scope_channel else "%"
     conn = get_db()
     try:
         if FTS_AVAILABLE:
@@ -157,8 +174,9 @@ def search_history(query: str, limit: int = 10) -> list[dict]:
                     rows = conn.execute(
                         "SELECT c.conv_key, c.role, c.content, c.timestamp "
                         "FROM conv_fts f JOIN conversations c ON c.id = f.rowid "
-                        "WHERE conv_fts MATCH ? ORDER BY bm25(conv_fts) LIMIT ?",
-                        (fts_q, limit),
+                        "WHERE conv_fts MATCH ? AND c.conv_key LIKE ? "
+                        "ORDER BY bm25(conv_fts) LIMIT ?",
+                        (fts_q, like_scope, limit),
                     ).fetchall()
                     return [
                         {"conv_key": r[0], "role": r[1], "content": r[2][:300], "time": r[3]}
@@ -168,8 +186,9 @@ def search_history(query: str, limit: int = 10) -> list[dict]:
                     pass  # malformed query → fall through to LIKE
         rows = conn.execute(
             "SELECT conv_key, role, content, timestamp FROM conversations "
-            "WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
-            (f"%{query}%", limit),
+            "WHERE content LIKE ? AND conv_key LIKE ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (f"%{query}%", like_scope, limit),
         ).fetchall()
         return [
             {"conv_key": r[0], "role": r[1], "content": r[2][:300], "time": r[3]}
@@ -179,14 +198,23 @@ def search_history(query: str, limit: int = 10) -> list[dict]:
         conn.close()
 
 
-def search_all_relevant(query: str, exclude_conv_key: str = "", limit: int = 4) -> list[dict]:
+def search_all_relevant(query: str, exclude_conv_key: str = "", limit: int = 4,
+                        scope_channel: str | None = None) -> list[dict]:
     """
-    Cross-thread memory: find messages from OTHER conversations relevant to
-    `query` — this is what lets a brand-new Slack thread recall decisions and
+    Cross-thread memory: find messages from OTHER threads relevant to `query`
+    — this is what lets a brand-new Slack thread recall decisions and
     discussions from weeks ago. Ranked by BM25 with a mild recency boost.
     Also searches saved thread summaries so long-dead threads surface as one
     compact digest instead of raw messages.
+
+    Scoped to one channel. "Other threads" never meant "other people": a DM
+    channel belongs to one person, and quoting it into someone else's thread
+    is a disclosure, not a recall. `scope_channel` defaults to the channel of
+    `exclude_conv_key`; pass "" only for a deliberately global search.
     """
+    if scope_channel is None:
+        scope_channel = channel_of(exclude_conv_key)
+    like_scope = f"{scope_channel}:%" if scope_channel else "%"
     results: list[dict] = []
     conn = get_db()
     try:
@@ -194,8 +222,8 @@ def search_all_relevant(query: str, exclude_conv_key: str = "", limit: int = 4) 
         for kw in list(_keywords(query))[:6]:
             rows = conn.execute(
                 "SELECT conv_key, summary, updated FROM thread_summaries "
-                "WHERE conv_key != ? AND summary LIKE ? LIMIT 3",
-                (exclude_conv_key, f"%{kw}%"),
+                "WHERE conv_key != ? AND conv_key LIKE ? AND summary LIKE ? LIMIT 3",
+                (exclude_conv_key, like_scope, f"%{kw}%"),
             ).fetchall()
             for r in rows:
                 if not any(x.get("conv_key") == r[0] and x["kind"] == "summary" for x in results):
@@ -211,8 +239,8 @@ def search_all_relevant(query: str, exclude_conv_key: str = "", limit: int = 4) 
                         "SELECT c.conv_key, c.role, c.content, c.timestamp, bm25(conv_fts) AS rank "
                         "FROM conv_fts f JOIN conversations c ON c.id = f.rowid "
                         "WHERE conv_fts MATCH ? AND c.conv_key != ? "
-                        "ORDER BY rank LIMIT 20",
-                        (fts_q, exclude_conv_key),
+                        "AND c.conv_key LIKE ? ORDER BY rank LIMIT 20",
+                        (fts_q, exclude_conv_key, like_scope),
                     ).fetchall()
                     scored = []
                     for conv_key, role, content, ts, rank in rows:

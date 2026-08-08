@@ -70,21 +70,18 @@ def test_one_users_decisions_never_reach_another(audit_env):
     assert "salary band" not in agent.get_agent_system_prompt("base", user_facts=other)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING I1 (HIGH) — cross-thread recall is not scoped by user. "
-    "memory.search_all_relevant (memory.py:182) takes only a query and an "
-    "excluded conv_key, and bot.process_message (bot.py:850) feeds its results "
-    "into the prompt for whoever is talking. One user's private DM with the bot "
-    "is therefore quotable into another user's public-channel thread whenever "
-    "the keywords overlap. Same root cause as FINDING F2 (memory_search); this "
-    "one needs no tool call and no injection — it happens on an ordinary "
-    "message."))
 def test_cross_thread_recall_does_not_cross_users(audit_env):
+    """FIXED (was FINDING I1): cross-thread recall is scoped to one channel, so
+    a DM channel — private to one person — never feeds another user's thread."""
     memory.add_message("D_ALICE:1", "user",
                        "confidential: my severance package is 250000 GBP")
     hits = memory.search_all_relevant("severance package", exclude_conv_key="C_PUBLIC:1")
     assert not any("250000" in h["content"] for h in hits), (
         "another user's DM is recallable into a stranger's thread")
+    # Still recalls within the same channel — the feature is intact.
+    memory.add_message("D_ALICE:2", "user", "as I said, severance package matters")
+    own = memory.search_all_relevant("severance package", exclude_conv_key="D_ALICE:1")
+    assert any("severance" in h["content"] for h in own)
 
 
 # ── /clear ──

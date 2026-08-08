@@ -103,7 +103,7 @@ def test_approved_owner_only_tool_runs_as_the_decider_not_as_the_run(audit_env, 
 
 
 def test_expiry_is_a_deny_and_the_run_resumes_with_the_refusal(audit_env):
-    ap = governor.request_approval(1, "deploy_static_site", {"site": "prod"})
+    ap = governor.request_approval(1, "push_branch", {"site": "prod"})
     expired = governor.expire_stale_approvals(now=ap["expires_at"] + 1)
     assert [e["id"] for e in expired] == [ap["id"]]
     row = governor.get_approval(ap["id"])
@@ -117,7 +117,7 @@ def test_expired_decision_is_replayed_into_the_transcript_as_a_refusal(audit_env
     row = runner.enqueue_run("deploy", source="schedule", owner_user_id="U_OWNER",
                              unattended=True)
     run_id = run_id_of(row)
-    ap = governor.request_approval(run_id, "deploy_static_site", {"site": "prod"})
+    ap = governor.request_approval(run_id, "push_branch", {"site": "prod"})
     governor.expire_stale_approvals(now=ap["expires_at"] + 1)
     messages = []
     runner._apply_pending_decision(runner.get_run(run_id), messages)

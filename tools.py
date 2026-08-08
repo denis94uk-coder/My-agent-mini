@@ -3,6 +3,7 @@ Agent tools — web search, URL fetching, Python execution, memory search.
 All tools are lightweight and run within the e2-micro's 1 GB RAM.
 """
 
+import base64
 import os
 import re
 import json
@@ -67,7 +68,6 @@ OWNER_ONLY_TOOLS = {
     "github_write_file",
     "github_create_issue",
     "restart_service",
-    "deploy_static_site",
     "push_branch",
     # Scheduling is owner-only for the same reason: it commits the bot to
     # acting later, on its own, using the owner's credentials.
@@ -83,6 +83,10 @@ OWNER_ONLY_TOOLS = {
 CONTEXT_TOOLS = {
     "start_background_run": ("_user_id", "_conv_key"),
     "schedule_task": ("_user_id", "_conv_key"),
+    # Scoping, not convenience: without the caller's conversation this tool
+    # searches every conversation the bot has ever had, including other
+    # people's DMs.
+    "memory_search": ("_conv_key",),
 }
 
 
@@ -124,12 +128,17 @@ def run_tool(name: str, args: dict) -> str:
 
     try:
         result = TOOLS[name]["func"](**args)
+        # Redact at the boundary. Doing it inside run_shell/run_python only
+        # covered the tools someone remembered to wrap — read_file,
+        # repo_read_file and github_read_file returned file contents verbatim,
+        # so a .env-shaped file went straight to the model and to Slack.
+        result = _redact_tool_output(result)
         # Truncate very long results
         if len(result) > 4000:
             result = result[:4000] + "\n\n... (truncated)"
         return result
     except Exception as e:
-        return f"❌ Tool error ({name}): {str(e)[:500]}"
+        return f"❌ Tool error ({name}): {_redact_tool_output(str(e))[:500]}"
 
 
 # ── Tool Implementations ──
@@ -428,10 +437,20 @@ def run_python(code: str) -> str:
         return f"❌ Execution error: {str(e)[:300]}"
 
 
-@tool("memory_search", "Search your past conversations for information.", "query")
-def memory_search(query: str) -> str:
-    """Search conversation history."""
-    results = memory.search_history(query, limit=5)
+@tool("memory_search", "Search past conversations in this channel for information.", "query")
+def memory_search(query: str, _conv_key: str = "") -> str:
+    """
+    Search conversation history, scoped to the channel this was asked in.
+
+    Unscoped, this is a workspace-wide read available to every Slack user and
+    to anything that can talk the model into calling it — one message would
+    return another person's DMs with the bot.
+    """
+    scope = memory.channel_of(_conv_key)
+    if not scope:
+        return ("❌ memory_search needs to know which conversation it was called "
+                "from and didn't get one, so it will not run an unscoped search.")
+    results = memory.search_history(query, limit=5, scope_channel=scope)
     if not results:
         return "No matching conversations found."
     lines = []
@@ -660,9 +679,18 @@ BLOCKED_PATTERNS = [
     r">\s*/dev/", r"\b(?:curl|wget)\b[^\n|;]*\|\s*(?:bash|sh)\b",
 ]
 
-# Never return common secret-bearing files if a command manages to read them.
-SECRET_OUTPUT_PATTERNS = (
+# Whole lines that merely *mention* a credential keyword. Aggressive by
+# design, and safe for shell/python output — an env dump or a config file is
+# never worth returning. NOT safe for arbitrary tool output: applied to
+# recalled conversation or a fetched page it deletes ordinary prose that
+# happens to contain the word "password".
+KEYWORD_LINE_PATTERNS = (
     re.compile(r"(?im)^.*(?:SLACK_BOT_TOKEN|SLACK_APP_TOKEN|API_KEY|SECRET|PASSWORD|TOKEN).*=?[^\n]*$"),
+)
+
+# Credential *shapes*. Safe to apply to anything, because nothing legitimate
+# looks like this.
+SECRET_OUTPUT_PATTERNS = (
     re.compile(r"(?im)^.*(?:BEGIN (?:RSA|OPENSSH|EC) PRIVATE KEY).*\\n?(?:.*\\n?){0,3}"),
     # Credential *shapes*, not just lines that happen to mention a keyword.
     # `echo $GITHUB_TOKEN` prints a bare token with no keyword anywhere near it
@@ -678,9 +706,85 @@ SECRET_OUTPUT_PATTERNS = (
 MAX_SHELL_OUTPUT = 3500
 
 
-def _redact_shell_output(output: str) -> str:
-    """Redact obvious credential lines before tool output reaches the model."""
+# Env var names whose *value* is a secret. Matching on the shape of a token
+# only works while the token still looks like one — `| base64`, `| xxd -p`,
+# `| rev` and `| fold` all defeat it. We know the actual values, so redact
+# those directly, in whatever form they come back.
+_SECRET_NAME_HINTS = ("TOKEN", "API_KEY", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+_MIN_SECRET_LEN = 12
+
+
+def _known_secret_values() -> list[str]:
+    """Every secret this process actually holds, longest first."""
+    values = set()
+    for name, value in os.environ.items():
+        if not any(hint in name.upper() for hint in _SECRET_NAME_HINTS):
+            continue
+        value = (value or "").strip()
+        if len(value) >= _MIN_SECRET_LEN:
+            values.add(value)
+    return sorted(values, key=len, reverse=True)
+
+
+def _spaced_pattern(text: str) -> re.Pattern:
+    """Match `text` even if whitespace was inserted anywhere inside it.
+
+    Covers `fold -w20`, a token split over two lines, and base64 line wrapping.
+    """
+    return re.compile(r"\s*".join(re.escape(ch) for ch in text))
+
+
+def _encodings_of(secret: str) -> list[str]:
+    """The forms a secret can leave the box in without looking like itself."""
+    forms = {secret, secret[::-1]}
+    for payload in (secret, secret + "\n"):          # `echo` adds the newline
+        raw = payload.encode()
+        forms.add(base64.b64encode(raw).decode())
+        forms.add(base64.b64encode(raw).decode().rstrip("="))
+        forms.add(raw.hex())
+        forms.add(raw.hex().upper())
+    return [f for f in forms if len(f) >= _MIN_SECRET_LEN]
+
+
+def _redact_known_values(output: str) -> str:
+    """Redact this process's real secrets, encoded or not."""
+    for secret in _known_secret_values():
+        for form in _encodings_of(secret):
+            if form in output:
+                output = output.replace(form, "[redacted secret]")
+                continue
+            # Only pay for the whitespace-tolerant scan if the plain one missed
+            # and the material could plausibly be in there.
+            if form[:6] in output.replace(" ", "").replace("\n", ""):
+                output = _spaced_pattern(form).sub("[redacted secret]", output)
+    return output
+
+
+def _redact_tool_output(output: str) -> str:
+    """
+    Strip credentials from any tool result on its way to the model.
+
+    Two passes, because neither is sufficient alone: known values catch a real
+    secret however it was encoded, and the shape patterns catch credentials
+    this process does not itself hold (one read out of a file, or another
+    account\'s token pasted into a repo).
+
+    Deliberately does NOT apply KEYWORD_LINE_PATTERNS: this runs over every
+    tool result, including recalled conversation and fetched pages, where
+    "the password is in 1Password" is prose, not a leak.
+    """
+    if not output:
+        return output
+    output = _redact_known_values(output)
     for pattern in SECRET_OUTPUT_PATTERNS:
+        output = pattern.sub("[redacted sensitive output]", output)
+    return output
+
+
+def _redact_shell_output(output: str) -> str:
+    """Redaction for shell/python output, where a keyword line is never wanted."""
+    output = _redact_tool_output(output)
+    for pattern in KEYWORD_LINE_PATTERNS:
         output = pattern.sub("[redacted sensitive output]", output)
     return output
 
@@ -1478,8 +1582,10 @@ def restart_service(service: str) -> str:
 
 # ── Website Building Tools ──
 # scaffold_site writes a small static site (HTML/CSS/JS) as a set of files
-# in the workspace; deploy_static_site then ships that folder to Vercel
-# via its REST API directly (no CLI/Node install needed on the e2-micro VM).
+# in the workspace, ready to preview or to publish with whatever the host
+# already uses. Publishing is deliberately not a tool: it was a Vercel-only
+# integration that nobody had configured, and an EXTERNAL-tier tool that
+# exists but is never used is attack surface with no upside.
 
 @tool(
     "scaffold_site",
@@ -1503,47 +1609,3 @@ def scaffold_site(site_name: str, files: dict) -> str:
         return f"✅ Scaffolded '{safe_name}' with {len(written)} files: {', '.join(written)}\nLocation: sites/{safe_name} (in the agent workspace)"
     except Exception as e:
         return f"❌ scaffold_site error: {str(e)[:300]}"
-
-
-@tool(
-    "deploy_static_site",
-    "Deploy a scaffolded static site folder (from scaffold_site) to Vercel and return the live URL.",
-    "site_name",
-)
-def deploy_static_site(site_name: str) -> str:
-    token = os.environ.get("VERCEL_TOKEN", "").strip()
-    if not token:
-        return "❌ VERCEL_TOKEN is not configured on the server."
-    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "-", site_name).strip("-") or "site"
-    site_dir = os.path.join(WORKSPACE, "sites", safe_name)
-    if not os.path.isdir(site_dir):
-        return f"❌ No such site folder: sites/{safe_name}. Run scaffold_site first."
-    try:
-        files_payload = []
-        for root, _dirs, filenames in os.walk(site_dir):
-            for fname in filenames:
-                full_path = os.path.join(root, fname)
-                rel_path = os.path.relpath(full_path, site_dir)
-                with open(full_path, "r", errors="replace") as f:
-                    data = f.read()
-                files_payload.append({"file": rel_path, "data": data})
-        if not files_payload:
-            return f"❌ Site folder sites/{safe_name} is empty."
-
-        resp = http_requests.post(
-            "https://api.vercel.com/v13/deployments",
-            headers={"Authorization": f"Bearer {token}"},
-            json={
-                "name": safe_name,
-                "files": files_payload,
-                "target": "production",
-                "projectSettings": {"framework": None},
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        url = data.get("url", "")
-        return f"✅ Deployed! Live at: https://{url}" if url else f"✅ Deployed. Response: {json.dumps(data)[:300]}"
-    except Exception as e:
-        return f"❌ deploy_static_site error: {str(e)[:300]}"

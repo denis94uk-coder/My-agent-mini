@@ -1036,8 +1036,16 @@ def sweep_stuck_runs(now: float | None = None) -> list[int]:
             f"Worker '{run['worker']}' may be leaked; restart the service to reclaim it."
         )
         add_event(run["id"], "error", error)
-        if not _fail_or_retry(run, error):
-            _notify(run, f"💀 Run #{run['id']} was stuck and has been stopped. {error}")
+        # Failed outright, never re-queued — not even through the retry path.
+        # The worker thread may still be alive inside that tool and Python
+        # cannot safely kill it, so a retry would let a second worker execute
+        # the same steps concurrently. Re-queueing also leaves the row in
+        # `queued`, which counts as ACTIVE, so the schedule this run belongs to
+        # would stay blocked — the exact condition this sweep exists to clear.
+        _update_run(run["id"], attempts=(run.get("attempts") or 0) + 1, worker="",
+                    next_attempt_at=None)
+        _finish(run, "failed", error=error)
+        _notify(run, f"💀 Run #{run['id']} was stuck and has been stopped. {error}")
     return [r["id"] for r in stuck]
 
 

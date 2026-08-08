@@ -121,15 +121,6 @@ def test_recovery_leaves_a_parked_run_alone(audit_env):
 
 # ── heartbeat watchdog ──
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING D2 (HIGH) — the watchdog does not achieve the one thing it exists "
-    "for. Because sweep_stuck_runs re-queues (see FINDING D1), the row lands in "
-    "status='queued', which is inside runner.ACTIVE_STATUSES, so "
-    "triggers._schedule_run_active (triggers.py:369) still reports the schedule "
-    "as running and the overlap guard (triggers.py:326) keeps skipping it. Its "
-    "docstring promises 'the schedule behind it is unblocked'; a hung "
-    "ops-watch/repo-review schedule therefore stays dead until someone "
-    "restarts the process."))
 def test_stuck_run_unblocks_its_schedule(audit_env, monkeypatch):
     """The row must stop counting as active, or the overlap guard would refuse
     to ever fire that schedule again."""
@@ -148,17 +139,10 @@ def test_stuck_run_unblocks_its_schedule(audit_env, monkeypatch):
         "the schedule is still blocked by the stuck run")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING D1 (HIGH) — a hung run is re-queued. sweep_stuck_runs "
-    "(runner.py:1039) hands the stall to _fail_or_retry (runner.py:644), whose "
-    "error text is not in _PERMANENT_ERROR_MARKERS, so the run goes back to "
-    "status='queued' with a 60s backoff. Both its own docstring "
-    "('This does NOT re-queue the run') and CLAUDE.md ('it must never re-queue "
-    "it, since the worker thread may still be live inside that tool') say the "
-    "opposite. A second worker then executes the same unattended steps while "
-    "the first is potentially still inside the tool — duplicate deploys, "
-    "duplicate PRs, duplicate GitHub writes."))
 def test_stuck_run_is_never_requeued(audit_env, monkeypatch):
+    """FIXED (was FINDING D1): the sweep fails the run outright. Retrying it
+    would let a second worker run the same steps while the first may still be
+    live inside the tool."""
     monkeypatch.setenv("RUN_STUCK_SECONDS", "60")
     row = runner.enqueue_run("hang forever", owner_user_id="U_OWNER", unattended=True)
     run_id = run_id_of(row)

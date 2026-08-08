@@ -71,7 +71,7 @@ def test_unknown_tools_are_treated_as_external():
     ("read_file", governor.READ),
     ("run_shell", governor.WRITE_LOCAL),
     ("write_file", governor.WRITE_LOCAL),
-    ("deploy_static_site", governor.EXTERNAL),
+    ("push_branch", governor.EXTERNAL),
     ("push_branch", governor.EXTERNAL),
     ("restart_service", governor.EXTERNAL),
 ])
@@ -102,7 +102,7 @@ def test_code_execution_is_owner_only_without_being_external():
 # ── Approval queue ──
 
 def test_request_and_decide():
-    approval = governor.request_approval(1, "deploy_static_site", {"site_name": "demo"})
+    approval = governor.request_approval(1, "push_branch", {"site_name": "demo"})
     assert approval["status"] == governor.PENDING
     assert approval["args"] == {"site_name": "demo"}
     assert approval["tier"] == governor.EXTERNAL
@@ -127,7 +127,7 @@ def test_deciding_twice_does_nothing():
 def test_expiry_is_a_deny_not_a_yes(monkeypatch):
     """The property that matters most: silence must never become consent."""
     monkeypatch.setenv("APPROVAL_TIMEOUT_SECONDS", "60")
-    approval = governor.request_approval(1, "deploy_static_site", {})
+    approval = governor.request_approval(1, "push_branch", {})
 
     assert governor.expire_stale_approvals(time.time()) == []      # not yet
     expired = governor.expire_stale_approvals(time.time() + 120)
@@ -147,10 +147,10 @@ def test_denial_text_carries_the_reason_and_forbids_workarounds():
 
 def test_approval_request_message_shows_what_it_wants_to_do():
     run_id = runner.enqueue_run("ship the marketing site")
-    approval = governor.request_approval(run_id, "deploy_static_site", {"site_name": "promo"})
+    approval = governor.request_approval(run_id, "push_branch", {"site_name": "promo"})
     text = governor.format_approval_request(approval, runner.get_run(run_id))
 
-    assert "deploy_static_site" in text
+    assert "push_branch" in text
     assert "promo" in text
     assert "ship the marketing site" in text
     assert f"/approve {approval['id']}" in text
@@ -161,7 +161,7 @@ def test_approval_request_message_shows_what_it_wants_to_do():
 
 def test_unattended_run_parks_on_an_external_tool():
     posted = []
-    ai = ScriptedAI(tool_call("deploy_static_site", site_name="demo"))
+    ai = ScriptedAI(tool_call("push_branch", branch="demo"))
     runner.configure(call_ai_fn=ai, system_prompt="Test bot.",
                      post_message=lambda c, t, x: posted.append(x))
 
@@ -170,7 +170,7 @@ def test_unattended_run_parks_on_an_external_tool():
 
     assert final["status"] == runner.AWAITING_APPROVAL
     pending = governor.pending_for_run(run_id)
-    assert pending["tool"] == "deploy_static_site"
+    assert pending["tool"] == "push_branch"
     assert posted and "Approval needed" in posted[0]
     # The tool did NOT run, and no result was invented for it.
     assert not any(e["kind"] == "tool_result" for e in runner.get_events(run_id))
@@ -219,7 +219,7 @@ def test_approved_tool_runs_on_resume_and_the_run_continues():
 
 def test_denied_tool_becomes_a_refusal_the_agent_works_around():
     ai = ScriptedAI(
-        tool_call("deploy_static_site", site_name="demo"),
+        tool_call("push_branch", branch="demo"),
         "Understood — I couldn't deploy, a human declined it.",
     )
     runner.configure(call_ai_fn=ai, system_prompt="Test bot.")
@@ -258,7 +258,7 @@ def test_expired_approval_lets_the_run_finish_and_report():
 
 def test_attended_runs_are_never_gated():
     """A human in the conversation is already the approval."""
-    ai = ScriptedAI(tool_call("deploy_static_site", site_name="demo"), "Done.")
+    ai = ScriptedAI(tool_call("push_branch", branch="demo"), "Done.")
     runner.configure(call_ai_fn=ai, system_prompt="Test bot.")
 
     run_id = runner.enqueue_run("deploy it", unattended=False)
@@ -269,7 +269,7 @@ def test_attended_runs_are_never_gated():
 
 def test_allow_risky_skips_the_queue():
     """An owner who pre-authorised a schedule isn't asked again every night."""
-    ai = ScriptedAI(tool_call("deploy_static_site", site_name="demo"), "Deployed.")
+    ai = ScriptedAI(tool_call("push_branch", branch="demo"), "Deployed.")
     runner.configure(call_ai_fn=ai, system_prompt="Test bot.")
 
     run_id = runner.enqueue_run("deploy it", unattended=True, allow_risky=True)
@@ -293,7 +293,7 @@ def test_run_spawning_tools_are_refused_not_queued():
 
 def test_approvals_can_be_switched_off_entirely(monkeypatch):
     monkeypatch.setenv("APPROVALS_ENABLED", "false")
-    ai = ScriptedAI(tool_call("deploy_static_site", site_name="demo"), "Blocked, reported.")
+    ai = ScriptedAI(tool_call("push_branch", branch="demo"), "Blocked, reported.")
     runner.configure(call_ai_fn=ai, system_prompt="Test bot.")
 
     run_id = runner.enqueue_run("deploy it", unattended=True)
@@ -305,7 +305,7 @@ def test_approvals_can_be_switched_off_entirely(monkeypatch):
 
 def test_parked_run_survives_a_restart():
     """The approval is on disk, so a restart doesn't lose the request."""
-    ai = ScriptedAI(tool_call("deploy_static_site", site_name="demo"))
+    ai = ScriptedAI(tool_call("push_branch", branch="demo"))
     runner.configure(call_ai_fn=ai, system_prompt="Test bot.")
     run_id = runner.enqueue_run("deploy it", unattended=True)
     runner.execute_run(runner.get_run(run_id))
@@ -313,7 +313,7 @@ def test_parked_run_survives_a_restart():
     # A parked run is not "running", so recovery must leave it alone.
     assert runner.recover_interrupted_runs() == 0
     assert runner.get_run(run_id)["status"] == runner.AWAITING_APPROVAL
-    assert governor.pending_for_run(run_id)["tool"] == "deploy_static_site"
+    assert governor.pending_for_run(run_id)["tool"] == "push_branch"
 
 
 # ── Cost accounting ──

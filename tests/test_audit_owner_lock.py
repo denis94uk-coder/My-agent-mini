@@ -182,16 +182,9 @@ def test_owner_only_slash_commands_refuse_a_stranger(slack_bot):
             f"{command} did not refuse a stranger: {say.last!r}")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING A3 (HIGH) — destructive slash commands with no owner check. "
-    "bot.py:1116 `/runs cancel <id>` and bot.py:1145 `/schedules cancel "
-    "<name>` call runner.cancel_run / triggers.cancel_schedule directly; "
-    "neither listener calls tools._is_owner, unlike /clear (bot.py:1058), "
-    "/workflow (bot.py:1074) and /approve (bot.py:1177). Any member of the "
-    "workspace can therefore kill the owner's background runs and delete the "
-    "owner's schedules — including the ops-watch and repo-review workflows — "
-    "and the schedule deletion is not recoverable from Slack."))
 def test_destructive_slash_commands_refuse_a_stranger(slack_bot):
+    """FIXED (was FINDING A3): /runs cancel and /schedules cancel now check the
+    owner, like every other destructive command."""
     bot, registry = slack_bot
     row = runner.enqueue_run("owner's job", owner_user_id="U_OWNER")
     run_id = run_id_of(row)

@@ -80,9 +80,22 @@ ERROR_LOG = []  # list of (timestamp, message), capped below
 MAX_ERROR_LOG = 25
 
 
+def scrub(text: str) -> str:
+    """Strip credentials from anything on its way to a human.
+
+    Provider errors quote the request they failed on, so a key in a URL, a
+    header dump or a JSON body ends up in Slack and in the log file. tools
+    owns the redaction; this is the one-line entry point for the Slack side.
+    """
+    try:
+        return tools._redact_shell_output(text or "")
+    except Exception:
+        return text or ""
+
+
 def record_error(context: str, error: Exception):
     """Track recent errors in memory for /health, in addition to full logging."""
-    ERROR_LOG.append((time.time(), f"{context}: {str(error)[:200]}"))
+    ERROR_LOG.append((time.time(), scrub(f"{context}: {str(error)[:200]}")))
     del ERROR_LOG[:-MAX_ERROR_LOG]
 
 # ── Slack Config ──
@@ -208,7 +221,7 @@ def _record_provider_failure(provider: dict, error: Exception) -> None:
         PROVIDER_HEALTH[provider["name"]] = {
             "cooldown_until": time.time() + cooldown,
             "failures": failures,
-            "last_error": f"HTTP {status}" if status else str(error)[:120],
+            "last_error": f"HTTP {status}" if status else scrub(str(error))[:120],
             "last_ok": old.get("last_ok", 0),
         }
 
@@ -554,7 +567,11 @@ def process_slack_files(files: list[dict]) -> tuple[list[dict], list[str]]:
 def call_gemini(provider: dict, messages: list[dict], system_prompt: str, images: list[dict] = None) -> str:
     """Call Google Gemini API with optional vision (images)."""
     url = provider["url"].format(model=provider["model"])
-    url += f"?key={provider['api_key']}"
+    # The key travels in a header, never in the URL. requests puts the full
+    # URL into every HTTPError message, and that message reaches the Slack
+    # channel, bot.log and the /health error list — a single 400 from Gemini
+    # used to publish the key to anyone in the workspace.
+    headers = {"x-goog-api-key": provider["api_key"], "Content-Type": "application/json"}
 
     contents = []
     for msg in messages:
@@ -593,7 +610,7 @@ def call_gemini(provider: dict, messages: list[dict], system_prompt: str, images
         }
     }
 
-    resp = http_requests.post(url, json=payload, timeout=120)
+    resp = http_requests.post(url, headers=headers, json=payload, timeout=120)
     resp.raise_for_status()
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -754,11 +771,11 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
 
         except Exception as e:
             _record_provider_failure(provider, e)
-            error_msg = str(e)[:200]
+            error_msg = scrub(str(e))[:200]
             logger.warning(f"⚠️ {provider['name']} failed; cooling down: {error_msg}")
             errors.append(f"• {provider['name']}: {error_msg}")
 
-    error_list = "\n".join(errors)
+    error_list = scrub("\n".join(errors))
     return f"❌ All AI providers failed:\n{error_list}\n\nThe router will retry cooled-down providers automatically."
 
 
@@ -851,7 +868,8 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
     # Cross-thread memory: pull in relevant snippets and thread summaries
     # from OTHER conversations, so a brand-new thread can recall decisions
     # and discussions from weeks ago (durable memory of our whole history).
-    cross = memory.search_all_relevant(full_message, exclude_conv_key=conv_key, limit=4)
+    cross = memory.search_all_relevant(full_message, exclude_conv_key=conv_key,
+                                       limit=4, scope_channel=channel)
     if cross:
         cross_lines = []
         for r in cross:
@@ -991,7 +1009,7 @@ def handle_message(event, say):
             slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
             pass
-        say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
+        say(text=f"Sorry, I hit an error: {scrub(str(e))[:200]}", thread_ts=thread_ts)
 
 
 @slack_app.event("app_mention")
@@ -1020,7 +1038,7 @@ def handle_mention(event, say):
             slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
             pass
-        say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
+        say(text=f"Sorry, I hit an error: {scrub(str(e))[:200]}", thread_ts=thread_ts)
 
 
 # ── Slash Commands ──
@@ -1121,6 +1139,12 @@ def handle_runs(ack, command, say):
     text = command.get("text", "").strip().split()
 
     if text and text[0] == "cancel":
+        # Cancelling is destructive and the run is the owner's work, started
+        # with the owner's credentials. Reading the list is open; stopping one
+        # is not.
+        if not tools._is_owner(command.get("user_id", "")):
+            say(text="❌ Only the bot's owner can cancel a run.", channel=channel)
+            return
         if len(text) < 2 or not text[1].isdigit():
             say(text="Usage: `/runs cancel <run id>`", channel=channel)
             return
@@ -1150,6 +1174,11 @@ def handle_schedules(ack, command, say):
     text = command.get("text", "").strip().split(maxsplit=1)
 
     if text and text[0] == "cancel":
+        # Same rule as schedule_task, which is owner-only to create: deleting
+        # one is not recoverable from Slack.
+        if not tools._is_owner(command.get("user_id", "")):
+            say(text="❌ Only the bot's owner can cancel a schedule.", channel=channel)
+            return
         if len(text) < 2:
             say(text="Usage: `/schedules cancel <name>`", channel=channel)
             return

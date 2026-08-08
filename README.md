@@ -201,7 +201,7 @@ them automatically:
 | **GitHub automation** (single file) | `github_read_file`, `github_write_file` (opens a PR, never commits to main), `github_list_issues`, `github_create_issue` | `GITHUB_TOKEN` (+ optional `GITHUB_DEFAULT_OWNER`/`GITHUB_DEFAULT_REPO`) |
 | **Coding workspace** (multi-file) | `clone_repo`, `repo_read_file`/`repo_write_file`/`repo_list_files`, `run_shell` (to test), `push_branch` (opens a PR, never commits to main) | `GITHUB_TOKEN` |
 | **Server administration** | `server_health`, `restart_service` (allow-listed services only) | `ALLOWED_SERVICES` + passwordless `sudo systemctl restart <service>` for that exact unit |
-| **Website building** | `scaffold_site` (writes static site files), `deploy_static_site` (ships them to Vercel) | `VERCEL_TOKEN` |
+| **Website building** | `scaffold_site` (writes static site files into the workspace) | none |
 
 All degrade gracefully with a clear error if their token/config isn't set —
 see `.env.example` for setup steps. Plain `git push` typed into `run_shell`
@@ -212,7 +212,7 @@ PR for human review instead of committing straight to a base branch.
 
 **Owner lock — fails closed.** `run_shell`, `run_python`,
 `github_write_file`, `github_create_issue`, `restart_service`,
-`deploy_static_site`, `push_branch`, `schedule_task`, `cancel_schedule`, and
+`push_branch`, `schedule_task`, `cancel_schedule`, and
 `start_background_run` run only for the Slack user ID in `OWNER_SLACK_ID`.
 
 Shell and Python are on that list because they are remote code execution on

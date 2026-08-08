@@ -216,7 +216,7 @@ def test_blocked_tool_report_is_not_sent_back_forever(monkeypatch):
     monkeypatch.setenv("CRITIC_MAX_ROUNDS", "2")
     monkeypatch.setenv("APPROVALS_ENABLED", "false")
     ai = ScriptedAI(
-        tool_call("deploy_static_site", site_name="x"),
+        tool_call("push_branch", branch="x"),
         "Could not deploy — the tool is blocked for unattended runs. Needs a human.",
         "VERDICT: REVISE\nREASON: The site was not deployed.",   # a bad critic
         "As I said: deploying is blocked here. A human has to run it.",

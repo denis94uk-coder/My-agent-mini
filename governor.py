@@ -89,7 +89,6 @@ TOOL_TIERS = {
     "github_write_file": EXTERNAL,
     "github_create_issue": EXTERNAL,
     "push_branch": EXTERNAL,
-    "deploy_static_site": EXTERNAL,
     "restart_service": EXTERNAL,
     "schedule_task": EXTERNAL,
     "cancel_schedule": EXTERNAL,
