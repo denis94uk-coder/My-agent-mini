@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 
 import memory
 import concept_graph
+import isolation
 
 logger = logging.getLogger("my-agent-mini")
 
@@ -394,21 +395,27 @@ def fetch_url(url: str) -> str:
 @tool("run_python", "Execute Python code and return the output. Use for calculations, data processing, etc.", "code")
 def run_python(code: str) -> str:
     """Execute Python code in a sandboxed subprocess with timeout."""
+    temp_path = ""
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        # The script has to live somewhere the sandbox can still see it. Inside
+        # the wrap /tmp is a private tmpfs, so a file written to the host's /tmp
+        # would simply not exist for the child; the scratch directory below sits
+        # under WORKSPACE, which is bound read-write into the namespace.
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, dir=_PY_SCRATCH,
+        ) as f:
             f.write(code)
             f.flush()
             temp_path = f.name
 
         result = subprocess.run(
-            ["python3", temp_path],
+            isolation.wrap(["python3", temp_path], writable=[WORKSPACE]),
             capture_output=True,
             text=True,
             timeout=30,  # 30 second timeout
-            cwd="/tmp",
+            cwd=_PY_SCRATCH,
+            env=isolation.scrubbed_env(),
         )
-
-        os.unlink(temp_path)
 
         output = ""
         if result.stdout:
@@ -426,6 +433,14 @@ def run_python(code: str) -> str:
         return "❌ Code execution timed out (30s limit)"
     except Exception as e:
         return f"❌ Execution error: {str(e)[:300]}"
+    finally:
+        # A timeout used to leave the script behind, because the unlink sat on
+        # the success path only.
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 @tool("memory_search", "Search your past conversations for information.", "query")
@@ -645,6 +660,12 @@ UNATTENDED_BLOCKED_TOOLS = {
 WORKSPACE = os.path.expanduser("~/agent_workspace")
 os.makedirs(WORKSPACE, exist_ok=True)
 
+# Scratch space for `run_python`. It lives under WORKSPACE rather than /tmp
+# because the sandbox gives the child a private tmpfs at /tmp, so a script
+# written to the host's /tmp is not there when the interpreter looks for it.
+_PY_SCRATCH = os.path.join(WORKSPACE, ".run_python")
+os.makedirs(_PY_SCRATCH, exist_ok=True)
+
 # Commands that are never allowed (protect the VM). The agent has no
 # interactive confirmation step, so high-impact commands are denied instead
 # of being guessed at. Read-only checks and normal development commands remain
@@ -694,12 +715,19 @@ def run_shell(command: str) -> str:
         if re.search(pattern, command, re.IGNORECASE):
             return "❌ Blocked for safety: high-impact or privileged shell commands are not allowed."
     try:
+        # BLOCKED_PATTERNS above is a speed bump, not a boundary — the sandbox
+        # is what actually confines this. Both stay: the denylist gives a clear
+        # refusal message for the obvious cases, the sandbox handles the rest.
         result = subprocess.run(
-            ["bash", "-c", command],
+            isolation.wrap(
+                ["bash", "-c", command],
+                writable=[WORKSPACE, REPOS_DIR],
+            ),
             capture_output=True,
             text=True,
             timeout=60,
             cwd=WORKSPACE,
+            env=isolation.scrubbed_env(),
         )
         output = ""
         if result.stdout:
@@ -1448,6 +1476,10 @@ def server_health() -> str:
             parts.append(f"--- {svc} ---\n{(r.stdout or r.stderr).strip()}")
         except Exception as e:
             parts.append(f"--- {svc} ---\n(unavailable: {str(e)[:120]})")
+    # Report the sandbox posture here rather than only in the logs. Isolation
+    # degrades quietly when bwrap is missing, and a degraded sandbox that
+    # nobody can see is the same as no sandbox.
+    parts.append(f"--- sandbox ---\n{isolation.sandbox_status()}")
     return "\n\n".join(parts)[:MAX_SHELL_OUTPUT]
 
 
