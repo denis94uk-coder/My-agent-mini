@@ -114,14 +114,26 @@ def test_a_schedule_in_the_dst_window_fires_exactly_once_a_day(audit_env, london
     assert len({f.split()[0] for f in autumn}) == len(autumn), f"duplicate day: {autumn}"
 
 
-def test_the_spring_forward_gap_skips_a_day_rather_than_doubling_up(audit_env, london):
-    """ACCEPTED BEHAVIOUR (residual of FINDING E3). 01:30 does not exist on the
-    spring-forward day, so that schedule moves to the next day rather than
-    firing at a substituted hour. Recorded because it is a real surprise for a
-    once-a-day job — and because the safe direction to fail is 'not twice'."""
-    spring = _fires("daily 01:30", time.mktime((2026, 3, 28, 23, 0, 0, 0, 0, -1)), 2)
-    assert spring[0].startswith("2026-03-30"), spring
-    assert not any(f.startswith("2026-03-29") for f in spring)
+def test_a_schedule_inside_the_spring_forward_gap_still_runs_that_day(audit_env, london):
+    """FIXED (was the residual half of FINDING E3): 01:30 does not exist on the
+    day the clocks go forward, and the schedule used to skip the day entirely.
+    It now fires at the first minute on the far side of the gap — the same day
+    the user asked for."""
+    spring = _fires("daily 01:30", time.mktime((2026, 3, 28, 23, 0, 0, 0, 0, -1)), 3)
+    assert spring[0] == "2026-03-29 02:00 BST", spring
+    assert spring[1].startswith("2026-03-30 01:30")
+
+
+def test_the_dst_special_case_does_not_disturb_ordinary_schedules(audit_env, london):
+    """The gap rule only applies to a fixed hour+minute, and only when the clock
+    jumps over it. Everything else scans exactly as before."""
+    assert _fires("daily 09:00", time.mktime((2026, 3, 28, 23, 0, 0, 0, 0, -1)), 2) == [
+        "2026-03-29 09:00 BST", "2026-03-30 09:00 BST"]
+    assert _fires("weekly mon 08:15", time.mktime((2026, 6, 1, 0, 0, 0, 0, 0, -1)), 2) == [
+        "2026-06-01 08:15 BST", "2026-06-08 08:15 BST"]
+    # A wildcard minute has other minutes to match, so it needs no special case.
+    assert _fires("*/5 * * * *", time.mktime((2026, 3, 29, 0, 50, 0, 0, 0, -1)), 2) == [
+        "2026-03-29 00:55 GMT", "2026-03-29 02:00 BST"]
 
 
 # ── CRUD ──

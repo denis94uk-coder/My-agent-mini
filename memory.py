@@ -9,6 +9,8 @@ import sqlite3
 import json
 import time
 import logging
+import os
+import threading
 from pathlib import Path
 
 logger = logging.getLogger("my-agent-mini")
@@ -16,11 +18,73 @@ logger = logging.getLogger("my-agent-mini")
 DB_PATH = Path.home() / "my-agent-mini" / "memory.db"
 
 
+# One SQLite file is shared by the worker threads, the scheduler, the plan
+# sweeper and live chat. Two things follow, and both were missing:
+#
+#  • A writer that finds the lock held must wait, not give up. sqlite3's
+#    default 5s timeout was reachable under ordinary load — two run workers
+#    writing events while the sweeper scans — and surfaced as
+#    OperationalError('database is locked') in the middle of a run.
+#  • The schema bootstrap belongs in the process, not in every connection.
+#    Re-running CREATE TABLE IF NOT EXISTS, the FTS setup and the migration
+#    check on every single get_db() made each connection hold locks it had no
+#    reason to take.
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY: set[tuple[str, str]] = set()
+
+
+def ensure_schema(owner: str, build) -> None:
+    """Run `build` once per (owner, database file), with everyone else waiting.
+
+    Every module that owns tables used to re-run its CREATE TABLE IF NOT
+    EXISTS script on every connection, taking write locks it had no reason to
+    take. Doing it once is the point — but the flag has to be set *after* the
+    build, under a lock, or a second thread sails past a half-built schema.
+    Keyed by path as well as owner because tests point DB_PATH at a fresh tmp
+    file per test.
+    """
+    key = (owner, str(DB_PATH))
+    with _SCHEMA_LOCK:
+        if key in _SCHEMA_READY:
+            return
+        build()
+        _SCHEMA_READY.add(key)
+
+
+def _busy_timeout_ms() -> int:
+    try:
+        return max(1000, int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000")))
+    except ValueError:
+        return 30000
+
+
+def forget_schema_state() -> None:
+    """Rebuild the schema on the next connection for this database file.
+
+    Building once per process means a database that disappears underneath us —
+    someone deletes memory.db to reset the bot, a volume is remounted — would
+    otherwise leave every query failing with "no such table" until a restart.
+    Connecting to a path with no file is exactly that case.
+    """
+    path_key = str(DB_PATH)
+    with _SCHEMA_LOCK:
+        for key in [k for k in _SCHEMA_READY if k[1] == path_key]:
+            _SCHEMA_READY.discard(key)
+
+
 def get_db() -> sqlite3.Connection:
-    """Get a database connection, creating tables if needed."""
+    """Get a connection with the core memory schema present."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    if not DB_PATH.exists():
+        forget_schema_state()
+    conn = sqlite3.connect(str(DB_PATH), timeout=_busy_timeout_ms() / 1000)
+    conn.execute(f"PRAGMA busy_timeout = {_busy_timeout_ms()}")
     conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent access
+    ensure_schema("memory", lambda: _build_core_schema(conn))
+    return conn
+
+
+def _build_core_schema(conn: sqlite3.Connection) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,7 +135,6 @@ def get_db() -> sqlite3.Connection:
         conn.commit()
     conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON facts(category)")
     conn.commit()
-    return conn
 
 
 # ── Full-text search (FTS5) ──

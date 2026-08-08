@@ -183,8 +183,12 @@ EXPIRED = "expired"
 
 def _db():
     conn = memory.get_db()
-    conn.executescript(_SCHEMA)
-    conn.commit()
+
+    def _build():
+        conn.executescript(_SCHEMA)
+        conn.commit()
+
+    memory.ensure_schema("governor", _build)
     return conn
 
 

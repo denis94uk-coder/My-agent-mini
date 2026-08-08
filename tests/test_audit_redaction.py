@@ -110,18 +110,30 @@ def test_transformed_tokens_are_redacted(audit_env, monkeypatch, form):
     assert GITHUB not in _recover(form, out), f"{form} form reached the model intact"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING G1b (LOW, residual) — the boundary that remains. Value-based "
-    "redaction covers every secret in this process's environment; a credential "
-    "that is NOT ours — read out of a file, or another account's token pasted "
-    "into a repo — is still only caught while it keeps its literal shape, so an "
-    "encoding hides it. Shape-matching cannot be made complete; the remaining "
-    "control is that the tools which read arbitrary bytes are owner-only."))
-@pytest.mark.parametrize("form", ["base64", "hex", "reversed"])
+@pytest.mark.parametrize("form", sorted(MANGLED))
 def test_a_foreign_token_is_redacted_when_encoded(audit_env, monkeypatch, form):
+    """FIXED (was FINDING G1b): a credential that is NOT ours — read out of a
+    file, or pasted into a repo we cloned — is now decoded, un-reversed and
+    un-wrapped before the shape patterns run, so the transformation that used
+    to hide it no longer does."""
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     out = tools._redact_shell_output(f"$ cat stolen.txt\n{MANGLED[form]}\n")
     assert GITHUB not in _recover(form, out)
+
+
+def test_an_encoding_we_do_not_model_still_escapes(audit_env, monkeypatch):
+    """ACCEPTED LIMIT. Base64, hex, reversal and whitespace-splitting are
+    modelled because they are what a shell one-liner reaches for. A cipher, a
+    compressor or a custom alphabet is not, and cannot be — redacting output
+    can never be complete. What stands behind it: the tools that read arbitrary
+    bytes (run_shell, run_python) are owner-only, so reaching this requires the
+    owner's own session, not a stranger's."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    rot13 = GITHUB.translate(str.maketrans(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "nopqrstuvwxyzabcdefghijklmNOPQRSTUVWXYZABCDEFGHIJKLM"))
+    out = tools._redact_shell_output(f"$ cat stolen.txt | tr A-Za-z N-ZA-Mn-za-m\n{rot13}\n")
+    assert rot13 in out, "if this now redacts, tighten the claim in the report"
 
 
 @pytest.mark.parametrize("tool_name,kwargs", [

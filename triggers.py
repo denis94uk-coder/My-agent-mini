@@ -57,8 +57,12 @@ def _db():
     # runner._db() brings the core memory tables *and* runs/run_events, which
     # the plan sweeper queries — so a first-ever tick on a fresh DB works.
     conn = runner._db()
-    conn.executescript(_SCHEMA)
-    conn.commit()
+
+    def _build():
+        conn.executescript(_SCHEMA)
+        conn.commit()
+
+    memory.ensure_schema("triggers", _build)
     return conn
 
 
@@ -243,17 +247,40 @@ def _validate_cron(cron: str):
         _validate_cron_field(field, low, high, name)
 
 
-def _cron_matches(cron: str, when: float) -> bool:
+def _cron_matches_parts(cron: str, minute: int, hour: int, mday: int, mon: int,
+                        wday: int) -> bool:
+    """Match a cron line against wall-clock parts rather than an instant.
+
+    Split out because of the spring-forward gap: the question "would this cron
+    have fired at 01:30 today?" has to be answerable for a local time that has
+    no instant at all.
+    """
     minute_f, hour_f, dom_f, month_f, dow_f = cron.split()
-    t = time.localtime(when)
-    cron_dow = (t.tm_wday + 1) % 7  # python: Mon=0 … Sun=6 → cron: Sun=0 … Sat=6
+    cron_dow = (wday + 1) % 7  # python: Mon=0 … Sun=6 → cron: Sun=0 … Sat=6
     return (
-        _field_matches(minute_f, t.tm_min)
-        and _field_matches(hour_f, t.tm_hour)
-        and _field_matches(dom_f, t.tm_mday)
-        and _field_matches(month_f, t.tm_mon)
+        _field_matches(minute_f, minute)
+        and _field_matches(hour_f, hour)
+        and _field_matches(dom_f, mday)
+        and _field_matches(month_f, mon)
         and _field_matches(dow_f, cron_dow, wrap=7)
     )
+
+
+def _cron_matches(cron: str, when: float) -> bool:
+    t = time.localtime(when)
+    return _cron_matches_parts(cron, t.tm_min, t.tm_hour, t.tm_mday, t.tm_mon, t.tm_wday)
+
+
+def _fixed_target_minute(cron: str) -> tuple[int, int] | None:
+    """(hour, minute) when both are a single literal, else None.
+
+    Only a fixed time can be *skipped* by a DST jump. A wildcard or a list
+    still has other minutes to match that day, so it needs no special case.
+    """
+    minute_f, hour_f = cron.split()[0], cron.split()[1]
+    if minute_f.isdigit() and hour_f.isdigit():
+        return int(hour_f), int(minute_f)
+    return None
 
 
 def next_run_after(spec: str, after: float | None = None) -> float:
@@ -273,11 +300,26 @@ def next_run_after(spec: str, after: float | None = None) -> float:
     # local Y-M-D H:M as the run we are scheduling after collapses the repeat
     # back to one firing. (The spring-forward hour simply does not exist; that
     # schedule moves to the next day, which is the safe direction.)
+    # The spring-forward hour does not exist: at 01:00 the clock becomes 02:00,
+    # so `daily 01:30` has no minute to match that day and would silently skip
+    # it. When the wall clock jumps *over* a fixed target time, fire at the
+    # first minute on the far side of the gap — the same behaviour a person
+    # would expect from "every day at 01:30", and the same day they expected it.
+    target = _fixed_target_minute(value)
     fired_minute = time.localtime(after)[:5]
     candidate = (int(after) // 60) * 60 + 60
+    previous = time.localtime(candidate - 60)
     for _ in range(60 * 24 * 400):
-        if _cron_matches(value, candidate) and time.localtime(candidate)[:5] != fired_minute:
+        current = time.localtime(candidate)
+        if _cron_matches(value, candidate) and current[:5] != fired_minute:
             return float(candidate)
+        if (target is not None
+                and current.tm_mday == previous.tm_mday
+                and (previous.tm_hour, previous.tm_min) < target < (current.tm_hour, current.tm_min)
+                and _cron_matches_parts(value, target[1], target[0], current.tm_mday,
+                                        current.tm_mon, current.tm_wday)):
+            return float(candidate)
+        previous = current
         candidate += 60
     raise ValueError(f"Schedule '{spec}' never matches a real date.")
 

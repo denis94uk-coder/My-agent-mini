@@ -368,7 +368,7 @@ def _execute_read_batch(
             args["conv_key"] = conv_key
         for context_arg in tools.CONTEXT_TOOLS.get(name, ()):
             args[context_arg] = {"_user_id": user_id, "_conv_key": conv_key}[context_arg]
-        if name in tools.OWNER_ONLY_TOOLS:
+        if name in tools.owner_only_tools():
             args["_requesting_user_id"] = user_id
 
         if blocked_tools and name in blocked_tools:
@@ -470,7 +470,7 @@ def execute_step(
         tool_args[context_arg] = {"_user_id": user_id, "_conv_key": conv_key}[context_arg]
     # Owner-gated tools need to know who is actually asking, so a
     # non-owner can't get the model to run them on their behalf.
-    if tool_name in tools.OWNER_ONLY_TOOLS:
+    if tool_name in tools.owner_only_tools():
         tool_args["_requesting_user_id"] = user_id
 
     # Approval is checked before the block list: "ask a human" is a better

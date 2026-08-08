@@ -121,13 +121,17 @@ _MIGRATIONS = (
 def _db():
     """Connection with both the core memory schema and the run tables present."""
     conn = memory.get_db()
-    conn.executescript(_SCHEMA)
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
-    for column, spec in _MIGRATIONS:
-        if column not in existing:
-            conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {spec}")
-            logger.info(f"Migrated runs table: added {column}")
-    conn.commit()
+
+    def _build():
+        conn.executescript(_SCHEMA)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        for column, spec in _MIGRATIONS:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {spec}")
+                logger.info(f"Migrated runs table: added {column}")
+        conn.commit()
+
+    memory.ensure_schema("runner", _build)
     return conn
 
 
@@ -710,7 +714,7 @@ def _apply_pending_decision(run: dict, messages: list[dict]):
 
     if decision["status"] == governor.APPROVED:
         args = dict(decision["args"])
-        if decision["tool"] in tools.OWNER_ONLY_TOOLS:
+        if decision["tool"] in tools.owner_only_tools():
             # The owner lock still applies; approval says *this* action is
             # sanctioned, not that the run has become the owner.
             args["_requesting_user_id"] = decision["decided_by"] or run["owner_user_id"]

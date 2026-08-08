@@ -78,6 +78,38 @@ OWNER_ONLY_TOOLS = {
     "start_background_run",
 }
 
+# Tools that write to this server's disk or to a repo clone on it. They are not
+# remote code execution and they stay WRITE_LOCAL — tier answers "how far does
+# the effect reach", and these stay on the box. But "who may write at all" is a
+# separate question, and the honest answer for a bot any workspace member can
+# DM is: not everyone. A stranger writing files into the workspace, or editing
+# a clone the owner may later push, is a supply-chain step, not a chat feature.
+#
+# Set WORKSPACE_WRITES_OWNER_ONLY=false in a workspace where everyone is
+# trusted — the default is closed, because the failure mode of the other
+# default is silent.
+WORKSPACE_WRITE_TOOLS = {
+    "write_file",
+    "clone_repo",
+    "repo_write_file",
+    "repo_edit_file",
+    "repo_check",
+    "scaffold_site",
+}
+
+
+def _workspace_writes_are_owner_only() -> bool:
+    return os.getenv("WORKSPACE_WRITES_OWNER_ONLY", "true").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def owner_only_tools() -> set:
+    """The live owner-only set, including the configurable workspace writes."""
+    if _workspace_writes_are_owner_only():
+        return set(OWNER_ONLY_TOOLS) | WORKSPACE_WRITE_TOOLS
+    return set(OWNER_ONLY_TOOLS)
+
 # Tools that need to know which conversation they were called from — the
 # agent loop fills these in so the model never has to pass them.
 CONTEXT_TOOLS = {
@@ -158,7 +190,7 @@ def run_tool(name: str, args: dict) -> str:
         return f"❌ Unknown tool: {name}. Available: {', '.join(TOOLS.keys())}"
 
     requesting_user_id = args.pop("_requesting_user_id", None)
-    if name in OWNER_ONLY_TOOLS and not _is_owner(requesting_user_id or ""):
+    if name in owner_only_tools() and not _is_owner(requesting_user_id or ""):
         return (
             f"❌ Not authorized: '{name}' can only be used by the bot's owner. "
             "Ask the workspace owner to run this instead."
@@ -847,14 +879,79 @@ def _redact_known_values(output: str) -> str:
     return output
 
 
+def _looks_like_a_credential(text: str) -> bool:
+    return any(pattern.search(text) for pattern in SECRET_OUTPUT_PATTERNS)
+
+
+def _decoded_candidates(token: str) -> list[str]:
+    """Everything `token` could decode to. Both encodings are tried, never one
+    or the other: hex digits are also valid base64, so a hex-encoded token
+    "successfully" base64-decodes to garbage and would mask the real reading."""
+    stripped = token.strip().strip('"\'`,;')
+    if len(stripped) < 16:
+        return []
+    candidates = []
+    if re.fullmatch(r"[A-Za-z0-9+/=_-]+", stripped):
+        try:
+            padded = stripped.replace("-", "+").replace("_", "/")
+            padded += "=" * (-len(padded) % 4)
+            candidates.append(base64.b64decode(padded, validate=True).decode("utf-8", "replace"))
+        except Exception:
+            pass
+    if len(stripped) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", stripped):
+        try:
+            candidates.append(bytes.fromhex(stripped).decode("utf-8", "replace"))
+        except ValueError:
+            pass
+    return candidates
+
+
+def _redact_encoded_shapes(output: str) -> str:
+    """
+    Catch a credential *shape* that was encoded on its way out.
+
+    `_redact_known_values` covers secrets this process holds, whatever form
+    they take. This covers the other direction: a token that is not ours — read
+    out of a file, or pasted into a repo we cloned — which the shape patterns
+    would have caught if `| base64`, `| xxd -p`, `| rev` or `| fold` had not
+    hidden it. Decode what looks decodable, un-reverse, un-wrap, and if a
+    credential appears, redact the form it actually arrived in.
+    """
+    if not output:
+        return output
+
+    # base64 / hex, token by token
+    for token in set(re.findall(r"[A-Za-z0-9+/=_-]{16,}", output)):
+        if any(_looks_like_a_credential(d) for d in _decoded_candidates(token)):
+            output = output.replace(token, "[redacted encoded credential]")
+
+    # reversed
+    backwards = output[::-1]
+    for pattern in SECRET_OUTPUT_PATTERNS:
+        for match in pattern.finditer(backwards):
+            output = output.replace(match.group(0)[::-1], "[redacted reversed credential]")
+
+    # split across lines, or folded into columns
+    compact = re.sub(r"\s+", "", output)
+    for pattern in SECRET_OUTPUT_PATTERNS:
+        for match in pattern.finditer(compact):
+            output = _spaced_pattern(match.group(0)).sub("[redacted split credential]", output)
+    return output
+
+
 def _redact_tool_output(output: str) -> str:
     """
     Strip credentials from any tool result on its way to the model.
 
-    Two passes, because neither is sufficient alone: known values catch a real
-    secret however it was encoded, and the shape patterns catch credentials
-    this process does not itself hold (one read out of a file, or another
-    account\'s token pasted into a repo).
+    Three passes, because none is sufficient alone: known values catch a real
+    secret however it was encoded, the shape patterns catch credentials this
+    process does not itself hold, and the encoded-shape pass catches those same
+    foreign credentials after a transformation that hides their shape.
+
+    A novel encoding this does not model (compression, a cipher, a custom
+    alphabet) still gets through — that is inherent to redacting output rather
+    than restricting what may read secrets, which is why the tools that read
+    arbitrary bytes are owner-only.
 
     Deliberately does NOT apply KEYWORD_LINE_PATTERNS: this runs over every
     tool result, including recalled conversation and fetched pages, where
@@ -865,7 +962,7 @@ def _redact_tool_output(output: str) -> str:
     output = _redact_known_values(output)
     for pattern in SECRET_OUTPUT_PATTERNS:
         output = pattern.sub("[redacted sensitive output]", output)
-    return output
+    return _redact_encoded_shapes(output)
 
 
 def _redact_shell_output(output: str) -> str:
