@@ -621,6 +621,70 @@ def route_order_rank(provider_name: str) -> int:
     return _UNRANKED
 
 
+# The kinds of AI call this agent makes. They are not equally demanding, and
+# routing them identically is why the open roadmap item "critic/summariser on a
+# stronger route than the agent itself" existed: the critic re-reads a whole
+# transcript and decides whether work is done, which is the call least
+# tolerant of a weak model, while filling in a tool argument is the most.
+TASK_AGENT = "agent"        # the main loop: reason, pick a tool
+TASK_CRITIC = "critic"      # re-read goal + transcript, ACCEPT or REVISE
+TASK_SUMMARY = "summary"    # context fold and thread summaries
+TASK_CLASSES = (TASK_AGENT, TASK_CRITIC, TASK_SUMMARY)
+
+
+def task_route_preference(task: str) -> list[str]:
+    """Route-name fragments preferred for a class of call, best first.
+
+    Configured per class as `ROUTER_ROUTE_CRITIC=groq,gemini`. Matching is by
+    substring, the same rule as ROUTER_ORDER, so a renamed route keeps working.
+
+    This is a *preference*, not a restriction: the caller reorders the existing
+    route list and never removes anything from it. That distinction is the
+    whole safety story — a preferred route that is rate-limited, cooled down or
+    past its daily cap simply loses its place at the front, rather than taking
+    the call down with it. An unconfigured class routes exactly as before.
+    """
+    if task not in TASK_CLASSES:
+        return []
+    raw = os.getenv(f"ROUTER_ROUTE_{task.upper()}", "")
+    return [n.strip().lower() for n in raw.split(",") if n.strip()]
+
+
+def task_route_rank(provider_name: str, task: str) -> int:
+    """Position of a route in the preference for `task`; `_UNRANKED` if absent."""
+    lowered = (provider_name or "").lower()
+    for index, fragment in enumerate(task_route_preference(task)):
+        if fragment in lowered:
+            return index
+    return _UNRANKED
+
+
+def order_routes(providers: list, task: str, wait_seconds) -> list:
+    """Order candidate routes for one call. Returns a new list; removes nothing.
+
+    Two preferences, and the order between them is the whole design:
+
+      • **Task class** says which route is *best* for this kind of call.
+      • **Minute headroom** says which route can serve *right now* without
+        spending a 429 — and a 429 parks a route for its entire reset window,
+        so it costs far more than one call.
+
+    Headroom is the outer key, so a preference never costs a stall: among the
+    routes that can serve immediately the task's favourite goes first, while a
+    favourite that is out of token budget this minute simply loses its place
+    instead of making the call wait for it.
+
+    `providers` are the router's dicts and `wait_seconds` maps one to its
+    current wait. Nothing is filtered, so a preference naming a route that is
+    down, absent or misspelled degrades to the next route rather than failing.
+    """
+    def key(provider):
+        wait = wait_seconds(provider)
+        return (wait > 0, task_route_rank(provider["name"], task), wait)
+
+    return sorted(providers, key=key)
+
+
 def record_tokens(provider_name: str, tokens: int) -> None:
     """Add a call's token cost to the rolling minute window."""
     now = time.time()

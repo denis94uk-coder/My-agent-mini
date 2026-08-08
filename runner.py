@@ -33,6 +33,7 @@ import threading
 import logging
 
 import agent
+import ai_routing
 import critic
 import governor
 import memory
@@ -479,7 +480,10 @@ def compact_messages(messages: list[dict], call_ai_fn=None) -> tuple[list[dict],
             f"{m.get('role')}: {(m.get('content') or '')[:800]}" for m in older
         )
         try:
-            digest = call_ai_fn(
+            # The fold is written once and then *replayed on every later step*
+            # and again on resume — a summariser that drops a file path or a
+            # failure reason loses it for the rest of the run.
+            digest = ai_routing.for_task(call_ai_fn, governor.TASK_SUMMARY)(
                 [{
                     "role": "user",
                     "content": (
