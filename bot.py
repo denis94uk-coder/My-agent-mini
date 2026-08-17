@@ -53,6 +53,8 @@ import agent
 import governor
 import runner
 import triggers
+import workflows
+import health
 import concept_graph
 
 # ── Logging ──
@@ -161,6 +163,10 @@ import requests as http_requests
 # Inspired by OmniRoute, but kept inside this process so the 1 GB VM needs
 # no second gateway service. Health is in-memory only and contains no secrets.
 ROUTER_COOLDOWN_SECONDS = max(10, int(os.getenv("ROUTER_COOLDOWN_SECONDS", "90")))
+# How long a call may pause for a route's token/minute window to roll before
+# moving on. A short wait beats a 429 that parks the route entirely; a long
+# one just moves the stall from the provider into the Slack reply.
+ROUTER_MAX_TPM_WAIT_SECONDS = max(0, int(os.getenv("ROUTER_MAX_TPM_WAIT_SECONDS", "20")))
 ROUTER_LOCK = threading.Lock()
 PROVIDER_HEALTH = {}
 
@@ -183,12 +189,19 @@ def _record_provider_success(provider: dict) -> None:
 
 def _record_provider_failure(provider: dict, error: Exception) -> None:
     """Back off rate-limited/unhealthy routes instead of hammering them."""
-    status = getattr(getattr(error, "response", None), "status_code", None)
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
     with ROUTER_LOCK:
         old = PROVIDER_HEALTH.get(provider["name"], {})
         failures = int(old.get("failures", 0)) + 1
         if status == 429:
-            cooldown = ROUTER_COOLDOWN_SECONDS
+            # A rate-limited route says when it will accept traffic again.
+            # Guessing instead costs availability in both directions: the flat
+            # 90s sat out a token-per-minute window that clears in seconds,
+            # while a genuine daily exhaustion needs far longer than 90s.
+            cooldown = governor.retry_after_seconds(response, ROUTER_COOLDOWN_SECONDS)
+            if cooldown is None:
+                cooldown = ROUTER_COOLDOWN_SECONDS
         elif status is not None and status >= 500:
             cooldown = min(ROUTER_COOLDOWN_SECONDS, 30)
         else:
@@ -205,11 +218,25 @@ def _provider_status(provider: dict) -> str:
     with ROUTER_LOCK:
         state = PROVIDER_HEALTH.get(provider["name"], {})
     remaining = max(0, int(state.get("cooldown_until", 0) - time.time()))
+    # Show the minute window alongside health. A route can be "healthy" and
+    # still be one call from a 429, which is invisible without this.
+    parts = []
+    if governor.tpm_limit(provider["name"]):
+        parts.append(
+            f"{governor.tokens_last_minute(provider['name']):,}/"
+            f"{governor.tpm_limit(provider['name']):,} tok/min"
+        )
+    if governor.rpm_limit(provider["name"]):
+        parts.append(
+            f"{governor.requests_last_minute(provider['name'])}/"
+            f"{governor.rpm_limit(provider['name'])} req/min"
+        )
+    budget = (", " + ", ".join(parts)) if parts else ""
     if remaining:
-        return f"cooldown ({remaining}s)"
+        return f"cooldown ({remaining}s){budget}"
     if state.get("last_ok"):
-        return "healthy"
-    return "ready"
+        return f"healthy{budget}"
+    return f"ready{budget}"
 
 
 def build_providers():
@@ -219,7 +246,9 @@ def build_providers():
 
     # Keyless best-effort route. It is first by default so stale/expired API
     # keys in an older .env cannot delay or block the free route. Set
-    # ROUTER_PREFER_KEYLESS=false to use configured keys first.
+    # ROUTER_PREFER_KEYLESS=false to use configured keys first. ROUTER_ORDER,
+    # if set, names the order outright and supersedes this flag for any route
+    # it mentions.
     keyless_provider = None
     if os.getenv("POLLINATIONS_ENABLED", "true").lower() not in ("0", "false", "no"):
         keyless_provider = {
@@ -236,7 +265,10 @@ def build_providers():
             "name": "Gemini",
             "type": "gemini",
             "api_key": os.environ["GEMINI_API_KEY"],
-            "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            # gemini-2.0-flash retired 2026-03-03. Free-tier access is the
+            # Flash line; override with GEMINI_MODEL and check the current
+            # name at ai.google.dev/gemini-api/docs/models if a call 404s.
+            "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             "url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         })
 
@@ -368,12 +400,24 @@ def build_providers():
     # free tier sitting *behind* the paid gateway, so a Pollinations failure
     # would spend credit while a free route went untried. A stable sort keeps
     # every other preference (keyless first, then the free keys in order) intact.
-    PROVIDERS.sort(key=lambda p: 1 if governor.is_paid(p["name"]) else 0)
+    #
+    # ROUTER_ORDER then decides the order among the free routes, because
+    # registration order is not a preference anyone chose — it happened to put
+    # Gemini ahead of Groq only because its block is written first. Paid stays
+    # the outer key: it is a budget guard, not a preference to be overridden.
+    PROVIDERS.sort(
+        key=lambda p: (
+            1 if governor.is_paid(p["name"]) else 0,
+            governor.route_order_rank(p["name"]),
+        )
+    )
 
     paid = [p["name"] for p in PROVIDERS if governor.is_paid(p["name"])]
     logger.info(f"🧠 Loaded {len(PROVIDERS)} AI routes: {[p['name'] for p in PROVIDERS]}")
     if paid:
         logger.info(f"💳 Paid routes (tried last, capped daily): {paid}")
+    if os.getenv("ROUTER_ORDER", "").strip():
+        logger.info(f"   Route order from ROUTER_ORDER: {os.environ['ROUTER_ORDER']}")
 
 
 # ── File Handling ──
@@ -624,8 +668,18 @@ def call_cohere(provider: dict, messages: list[dict], system_prompt: str, images
     return data["message"]["content"][0]["text"]
 
 
-def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] = None) -> str:
-    """Route through healthy providers, cooling down failures automatically."""
+def call_ai(
+    messages: list[dict],
+    system_prompt: str = None,
+    images: list[dict] = None,
+    task: str = governor.TASK_AGENT,
+) -> str:
+    """Route through healthy providers, cooling down failures automatically.
+
+    `task` names the kind of call so the router can prefer a different route
+    for it — see governor.task_route_preference. It is advisory: an
+    unconfigured task class routes exactly as it did before.
+    """
     if system_prompt is None:
         system_prompt = SYSTEM_PROMPT
 
@@ -657,9 +711,42 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
     if not available:
         return "❌ All AI routes are temporarily cooling down after errors or rate limits. Try again shortly."
 
+    # Tokens per minute, not per day, is what the agent loop actually hits: it
+    # fires up to MAX_ITERATIONS calls back to back, each re-sending the whole
+    # system prompt. Reordering so a route with headroom goes first turns a
+    # 429 (which parks the route for its whole reset window) into a call that
+    # simply succeeds somewhere else.
+    input_chars = sum(len(m.get("content") or "") for m in messages) + len(system_prompt)
+    est_tokens = governor.estimate_tokens(input_chars)
+
+    # Minute headroom first, then the task's route preference among the routes
+    # that can serve immediately. See governor.order_routes for why that order.
+    available = governor.order_routes(
+        available,
+        task,
+        lambda p: governor.tpm_wait_seconds(p["name"], est_tokens),
+    )
+
     errors = []
     for provider in available:
         try:
+            # With no route free of its minute window, waiting beats spending a
+            # 429 — but only briefly, and only when nothing else can serve.
+            wait = governor.tpm_wait_seconds(provider["name"], est_tokens)
+            if wait > 0:
+                if wait > ROUTER_MAX_TPM_WAIT_SECONDS:
+                    errors.append(
+                        f"• {provider['name']}: would exceed its token/minute limit "
+                        f"for another {int(wait)}s"
+                    )
+                    continue
+                logger.info(
+                    f"⏳ {provider['name']} at {governor.tokens_last_minute(provider['name']):,}"
+                    f"/{governor.tpm_limit(provider['name']):,} tokens this minute — "
+                    f"waiting {wait:.1f}s"
+                )
+                time.sleep(wait)
+
             logger.info(f"🔄 Trying {provider['name']} ({provider['model']})...")
             start = time.time()
             provider_images = images if provider["type"] == "gemini" else None
@@ -674,8 +761,11 @@ def call_ai(messages: list[dict], system_prompt: str = None, images: list[dict] 
             _record_provider_success(provider)
             governor.record_ai_call(
                 provider["name"],
-                input_chars=sum(len(m.get("content") or "") for m in messages) + len(system_prompt),
+                input_chars=input_chars,
                 output_chars=len(result or ""),
+            )
+            governor.record_tokens(
+                provider["name"], (input_chars + len(result or "")) // 4
             )
             logger.info(f"✅ {provider['name']} responded in {round(time.time() - start, 1)}s")
             return result
@@ -874,7 +964,8 @@ def _maybe_summarize_thread(conv_key: str, user_id: str):
                 + f"CONVERSATION:\n{convo_text}"
             )
             summary = call_ai([{"role": "user", "content": prompt}],
-                              "You write terse, accurate conversation digests.")
+                              "You write terse, accurate conversation digests.",
+                              task=governor.TASK_SUMMARY)
             if summary and not summary.startswith("❌"):
                 memory.save_thread_summary(conv_key, user_id, summary, total)
                 # Deeper LLM-assisted graph extraction from the summary
@@ -997,6 +1088,33 @@ def handle_clear(ack, command, say):
     finally:
         conn.close()
     say(text="🧹 Memory cleared!", channel=channel)
+
+
+@slack_app.command("/workflow")
+def handle_workflow(ack, command, say):
+    """`/workflow` to list the recurring jobs, `/workflow start <name>` to schedule one."""
+    ack()
+    channel = command["channel_id"]
+    args = (command.get("text") or "").strip().split()
+
+    if not args or args[0] in ("list", "help"):
+        say(text=workflows.describe(), channel=channel)
+        return
+
+    if args[0] != "start" or len(args) < 2:
+        say(text="Usage: `/workflow` or `/workflow start <name>`", channel=channel)
+        return
+
+    # Scheduling commits the bot to acting later with the owner's credentials,
+    # which is the same reason schedule_task is owner-only.
+    if not tools._is_owner(command["user_id"]):
+        say(text="❌ Only the bot's owner can schedule workflows.", channel=channel)
+        return
+
+    say(
+        text=workflows.start(args[1], owner_user_id=command["user_id"], channel=channel),
+        channel=channel,
+    )
 
 
 @slack_app.command("/providers")
@@ -1243,6 +1361,12 @@ def start_autonomy() -> tuple[int, bool]:
     )
     workers = runner.start_workers()
     scheduler_on = triggers.start_scheduler()
+
+    # Started after the workers so the endpoint never reports "0 alive" during
+    # the window before they exist. The route list is pushed in rather than
+    # imported, so health.py stays free of the Slack client.
+    health.set_route_source(lambda: [p["name"] for p in PROVIDERS])
+    health.start()
 
     # Context budgeting is invisible until a model rejects the request, so
     # state it at boot. The system prompt is sent on every call and dwarfs the

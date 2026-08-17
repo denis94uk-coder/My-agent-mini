@@ -19,3 +19,6 @@ __pycache__/
 venv/
 *.log
 .deploy_keys/
+
+# Local MCP server table — may carry bearer tokens in headers.
+mcp_servers.json

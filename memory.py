@@ -9,6 +9,7 @@ import sqlite3
 import json
 import time
 import logging
+import threading
 from pathlib import Path
 
 logger = logging.getLogger("my-agent-mini")
@@ -16,10 +17,49 @@ logger = logging.getLogger("my-agent-mini")
 DB_PATH = Path.home() / "my-agent-mini" / "memory.db"
 
 
+# Schema creation is a write transaction. Running it on every `get_db()` call
+# meant every read opened by taking a write lock, so the workers, the scheduler
+# and the sweeper serialised against each other on a file they were only
+# reading — and under real concurrency that surfaced as 'database is locked'.
+# The schema is created once per database path per process instead. Keyed on
+# the path rather than a bare flag because the tests point DB_PATH at a tmpdir,
+# and a process-wide flag would leave those databases with no tables at all.
+_SCHEMA_READY: set[str] = set()
+_SCHEMA_LOCK = threading.Lock()
+
+# How long a writer waits for a competing write to finish before giving up.
+# SQLite's default is 5s, which is generous for a single statement and far too
+# short for a queue drain behind a slow one; the failure mode is a lost run.
+_BUSY_TIMEOUT_SECONDS = 30.0
+
+
 def get_db() -> sqlite3.Connection:
     """Get a database connection, creating tables if needed."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    # Check for the file *before* connecting, because connecting creates it.
+    # Without this, a database deleted out from under a running process would
+    # be reopened empty and never re-created — the old code got this right by
+    # accident, by running the schema every single time.
+    db_existed = DB_PATH.exists()
+    conn = sqlite3.connect(str(DB_PATH), timeout=_BUSY_TIMEOUT_SECONDS)
+    # `timeout` above only covers the Python driver's own retry loop; statements
+    # SQLite runs internally honour busy_timeout instead. Set both.
+    conn.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_SECONDS * 1000)}")
+
+    path_key = str(DB_PATH)
+    if db_existed and path_key in _SCHEMA_READY:
+        return conn
+
+    with _SCHEMA_LOCK:
+        if db_existed and path_key in _SCHEMA_READY:
+            return conn
+        _ensure_schema(conn)
+        _SCHEMA_READY.add(path_key)
+    return conn
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create tables and indexes. Runs once per database path per process."""
     conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent access
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS conversations (
@@ -71,7 +111,6 @@ def get_db() -> sqlite3.Connection:
         conn.commit()
     conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON facts(category)")
     conn.commit()
-    return conn
 
 
 # ── Full-text search (FTS5) ──

@@ -16,16 +16,27 @@ The loop is built from `execute_step`, one AI call + at most one tool run.
 step to SQLite so an autonomous run can survive a restart and resume.
 """
 
+import os
 import re
 import json
 import logging
 
 import critic
+import governor
 import tools
 
 logger = logging.getLogger("my-agent-mini")
 
+
+def _bool_env(name: str, default: bool) -> bool:
+    return os.getenv(name, "true" if default else "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
 MAX_ITERATIONS = 10  # Safety limit to prevent infinite loops
+# Prose left in the last response after stripping its tool block, above which
+# it can stand as the answer instead of buying another call to rephrase it.
+MIN_SALVAGEABLE_ANSWER_CHARS = 200
 
 
 def get_agent_system_prompt(base_prompt: str, user_facts: dict[str, list[str]] | None = None) -> str:
@@ -92,9 +103,19 @@ Respond with exactly this format when you need a tool:
 {{"tool": "tool_name", "args": {{"param": "value"}}}}
 [/TOOL_CALL]
 
-ONE tool per response. You'll get the result back, then you can use
-another tool or give your final answer. You have up to 10 tool steps
-per task — use them to actually complete work, not just talk about it.
+ONE tool per response, and you get the result back before choosing again.
+You have up to 10 tool steps per task — use them to complete work, not to
+talk about it.
+
+ONE EXCEPTION — read-only tools batch. When you need several independent
+reads (web_search, fetch_url, read_file, list_files, repo_read_file,
+repo_list_files, github_read_file, github_list_issues, memory_search,
+graph_recall, server_health, list_tasks, list_schedules, run_status), emit
+every [TOOL_CALL] block in the SAME response and you get all the results
+together. Only batch reads whose arguments you already know — if one read's
+arguments depend on another's result, they are not independent, so issue
+them in separate responses. Never batch a tool that writes, pushes, deploys,
+schedules, or remembers.
 
 CRITICAL RULE — never narrate an action without taking it: if your
 response contains phrases like "Now I will...", "Let me...", "I'll save/
@@ -181,9 +202,11 @@ to what fits in one reply:
 **Coding practices** — for real software engineering (not quick scripts):
 spec before code, small verifiable slices, reproduce-localize-fix-guard when
 debugging, self-review before calling it done, atomic commits explaining
-*why*, and `remember(category='decision')` for architectural calls. Full
-references live in `skills/coding-practices/` — read the relevant file when
-a task warrants it; see its README.md for the index.
+*why*, and `remember(category='decision')` for architectural calls. Call
+`find_skill` with a description of the task to get the full playbook for it
+(TDD, debugging, code review, git workflow, security hardening, and ~20
+more). It returns nothing when no playbook fits — that means use your own
+judgment, not that you looked in the wrong place.
 
 EXECUTION PRINCIPLES:
 - DO the task, don't describe how the user could do it themselves
@@ -228,24 +251,51 @@ def looks_like_unactioned_intent(text: str) -> bool:
     return bool(_INTENT_ONLY_RE.search(text))
 
 
-def parse_tool_call(text: str) -> dict | None:
-    """Extract a tool call from the AI response."""
-    match = re.search(r"\[TOOL_CALL\]\s*(\{.*\})\s*\[/TOOL_CALL\]", text, re.DOTALL)
-    if not match:
-        # Fallback: model forgot the closing tag
-        match = re.search(r"\[TOOL_CALL\]\s*(\{.*\})", text, re.DOTALL)
-    if not match:
-        return None
-    raw = match.group(1).strip()
-    # Try parsing; if extra text follows the JSON, trim to the last brace
-    for candidate in (raw, raw[: raw.rfind("}") + 1]):
+def _parse_one_call(body: str) -> dict | None:
+    """Parse the JSON inside a single [TOOL_CALL] block."""
+    raw = body.strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    candidates = [raw]
+    if start >= 0 and end > start:
+        candidates.append(raw[start:end + 1])
+    for candidate in candidates:
         try:
             call = json.loads(candidate)
-            if isinstance(call, dict) and "tool" in call and "args" in call:
-                return call
         except (json.JSONDecodeError, ValueError):
             continue
+        if isinstance(call, dict) and "tool" in call and "args" in call:
+            return call
     return None
+
+
+def parse_tool_calls(text: str) -> list[dict]:
+    """
+    Every tool call in the response, in order.
+
+    Blocks are delimited by their tags rather than by brace matching, so an
+    argument containing braces (a code snippet, a JSON payload) does not end
+    the block early. A missing closing tag is tolerated: the block then runs
+    to the next opening tag or to the end of the response.
+
+    The single-call regex this replaces was greedy, so two blocks in one
+    response matched from the first opening tag to the last closing tag and
+    parsed as nothing at all. The response was then treated as a final
+    answer — the model's narration was posted while neither tool ran.
+    """
+    calls = []
+    for match in re.finditer(
+        r"\[TOOL_CALL\](.*?)(?:\[/TOOL_CALL\]|(?=\[TOOL_CALL\])|\Z)", text, re.DOTALL
+    ):
+        call = _parse_one_call(match.group(1))
+        if call is not None:
+            calls.append(call)
+    return calls
+
+
+def parse_tool_call(text: str) -> dict | None:
+    """The first tool call in the response, or None."""
+    calls = parse_tool_calls(text)
+    return calls[0] if calls else None
 
 
 def extract_final_text(text: str) -> str:
@@ -287,7 +337,7 @@ class StepOutcome:
                  replays this exact call once a human decides.
     """
 
-    __slots__ = ("kind", "response", "tool_args", "tool_name", "tool_result")
+    __slots__ = ("kind", "response", "tool_args", "tool_name", "tool_result", "batch")
 
     def __init__(self, kind, response, tool_name=None, tool_args=None, tool_result=None):
         self.kind = kind
@@ -295,6 +345,63 @@ class StepOutcome:
         self.tool_name = tool_name
         self.tool_args = tool_args
         self.tool_result = tool_result
+        # Per-tool detail when several read-only tools ran in one step. The
+        # scalar fields above stay the combined view, so durability and replay
+        # treat a batch exactly like any other step.
+        self.batch = []
+
+
+def _batch_label(tool_calls: list[dict]) -> str:
+    """Name for a batched step, used in the transcript and in run events."""
+    return " + ".join(dict.fromkeys(str(c.get("tool")) for c in tool_calls))
+
+
+def _execute_read_batch(
+    working_messages: list[dict],
+    response: str,
+    tool_calls: list[dict],
+    user_id: str = "default",
+    conv_key: str = "default",
+    blocked_tools: set | None = None,
+) -> StepOutcome:
+    """
+    Run several read-only tools from one response and feed back one result.
+
+    The combined text is appended through `tool_result_message`, exactly as a
+    single-tool step is, so a run that resumes from persisted events rebuilds
+    the identical transcript rather than a re-shaped one.
+    """
+    sections, results = [], []
+    for call in tool_calls:
+        name = call["tool"]
+        args = call["args"] if isinstance(call.get("args"), dict) else {}
+        if name in ("list_tasks",):
+            args["conv_key"] = conv_key
+        for context_arg in tools.CONTEXT_TOOLS.get(name, ()):
+            args[context_arg] = {"_user_id": user_id, "_conv_key": conv_key}[context_arg]
+        if name in tools.OWNER_ONLY_TOOLS:
+            args["_requesting_user_id"] = user_id
+
+        if blocked_tools and name in blocked_tools:
+            result = (
+                f"❌ Blocked: '{name}' cannot run in an unattended background run."
+            )
+        else:
+            result = tools.run_tool(name, args)
+        logger.info(f"🔧 Batched tool: {name} → {result[:120]}...")
+        sections.append(f"── {name} ──\n{result}")
+        results.append({"tool": name, "args": args, "result": result})
+
+    label = _batch_label(tool_calls)
+    combined = "\n\n".join(sections)
+    logger.info(f"📦 Ran {len(tool_calls)} read-only tools in one step: {label}")
+
+    working_messages.append({"role": "assistant", "content": response})
+    working_messages.append({"role": "user", "content": tool_result_message(label, combined)})
+
+    outcome = StepOutcome("tool", response, label, {}, combined)
+    outcome.batch = results
+    return outcome
 
 
 def execute_step(
@@ -324,7 +431,28 @@ def execute_step(
         which is a flat no the agent works around immediately.
     """
     response = call_ai_fn(working_messages, full_prompt)
-    tool_call = parse_tool_call(response)
+    tool_calls = parse_tool_calls(response)
+
+    # Several read-only tools in one response run as a batch. Each extra
+    # round trip re-sends the whole system prompt, which is the dominant cost
+    # per call and the reason free-tier token/minute limits bite: three files
+    # read one at a time is three prompts, batched it is one.
+    #
+    # Only READ tier batches. A read is idempotent and side-effect-free, so
+    # ordering and partial failure are harmless. Anything that writes runs one
+    # per response, where the model sees each result before choosing again —
+    # and EXTERNAL tools additionally need their own approval decision, which
+    # a batch cannot express.
+    if len(tool_calls) > 1 and all(
+        governor.tier_of(c.get("tool"), c.get("args")) == governor.READ
+        for c in tool_calls
+    ):
+        return _execute_read_batch(
+            working_messages, response, tool_calls,
+            user_id=user_id, conv_key=conv_key, blocked_tools=blocked_tools,
+        )
+
+    tool_call = tool_calls[0] if tool_calls else None
 
     if tool_call is None:
         # The model didn't include a [TOOL_CALL] block. Usually that means
@@ -453,6 +581,11 @@ def run_agent_loop(
         if outcome.kind == "final":
             # Critic gate (off by default here — see critic.interactive_enabled;
             # a human is reading this reply and can push back themselves).
+            # Deliberately not skipped when no tool ran. An empty tool trail
+            # looks like the cheapest call to save and is the opposite: an
+            # answer claiming work with nothing behind it ("I've noted that
+            # down", no remember call) is exactly what the critic exists to
+            # catch, and it can only see that when it still runs.
             if (
                 critic.interactive_enabled()
                 and critic_rounds < critic.max_rounds()
@@ -479,7 +612,14 @@ def run_agent_loop(
             return outcome.response
 
         if outcome.kind == "tool":
-            tool_trail.append({"tool": outcome.tool_name, "result": outcome.tool_result})
+            # A batch grades as its individual tools — the critic reasons
+            # about what was actually checked, not about a joined label.
+            if outcome.batch:
+                tool_trail.extend(
+                    {"tool": r["tool"], "result": r["result"]} for r in outcome.batch
+                )
+            else:
+                tool_trail.append({"tool": outcome.tool_name, "result": outcome.tool_result})
 
         if outcome.kind == "nudge":
             narration_nudges_used += 1
@@ -488,9 +628,88 @@ def run_agent_loop(
                 f"{MAX_NARRATION_NUDGES}), auto-continuing instead of stopping"
             )
 
-    # Hit max iterations — return what we have
+    # Hit max iterations. Asking for a wrap-up costs another full call, and
+    # the last response usually already carries usable prose alongside its
+    # tool block — send that instead when there is enough of it to stand as
+    # an answer, and only pay for the extra call when there is not.
     logger.warning(f"⚠️ Agent hit max iterations ({MAX_ITERATIONS})")
-    return call_ai_fn(
-        working_messages + [{"role": "user", "content": "Please give your final answer now based on what you've gathered."}],
-        full_prompt,
+    salvaged = extract_final_text(outcome.response) if outcome.response else ""
+    if len(salvaged) < MIN_SALVAGEABLE_ANSWER_CHARS:
+        salvaged = call_ai_fn(
+            working_messages + [{"role": "user", "content": "Please give your final answer now based on what you've gathered."}],
+            full_prompt,
+        )
+    else:
+        logger.info("↩️ Using the last response as the answer instead of a wrap-up call")
+
+    # Ten iterations is a limit on *this* loop, not evidence the task is
+    # impossible — a task that needs eleven steps used to end with a partial
+    # answer and no way to continue, and the user's only recourse was to
+    # re-ask and pay for the first ten steps again. The run engine exists for
+    # exactly this: durable, resumable, budgeted, and not holding up the chat.
+    handoff = _hand_off_to_background_run(
+        goal_text, tool_trail, salvaged, user_id=user_id, conv_key=conv_key
+    )
+    return salvaged + handoff
+
+
+def _hand_off_to_background_run(
+    goal_text: str,
+    tool_trail: list[dict],
+    partial_answer: str,
+    *,
+    user_id: str,
+    conv_key: str,
+) -> str:
+    """Continue an over-long interactive turn as a background run.
+
+    Returns a note to append to the reply, or "" when no handoff happened.
+    Never raises: failing to hand off is a worse answer, not a failed one, and
+    the partial answer has already been earned.
+
+    Only ever called from the interactive loop. The run engine drives
+    `execute_step` directly, so a background run cannot reach this and spawn
+    another — which is the same reason `start_background_run` is in
+    UNATTENDED_BLOCKED_TOOLS.
+    """
+    if not _bool_env("HANDOFF_ON_MAX_ITERATIONS", True):
+        return ""
+    if not (goal_text or "").strip():
+        return ""
+
+    # The digest is assembled from the transcript, not summarised by the model.
+    # Paying for an AI call here would be paying at exactly the moment the turn
+    # has already proved expensive, and the tool trail is the part worth
+    # carrying anyway.
+    progress = critic.format_transcript(tool_trail, limit=15, result_chars=300)
+    goal = (
+        f"Continue work that ran out of steps in a live conversation.\n\n"
+        f"ORIGINAL REQUEST:\n{goal_text[:2000]}\n\n"
+        f"WHAT WAS ALREADY DONE (do not repeat it):\n{progress}\n\n"
+        f"THE PARTIAL ANSWER ALREADY SENT TO THE USER:\n{partial_answer[:1500]}\n\n"
+        f"Finish the remaining work and report only what is new."
+    )
+
+    try:
+        result = tools.run_tool("start_background_run", {
+            "goal": goal,
+            "_user_id": user_id,
+            "_conv_key": conv_key,
+            "_requesting_user_id": user_id,
+        })
+    except Exception as e:
+        logger.warning(f"Hand-off to a background run failed: {e}")
+        return ""
+
+    if isinstance(result, str) and result.startswith("❌"):
+        # Most often the owner lock: a non-owner cannot commit worker threads
+        # and metered calls to autonomous work. Their partial answer stands on
+        # its own, and saying "I would have continued but may not" is noise.
+        logger.info(f"No hand-off: {result[:120]}")
+        return ""
+
+    logger.info("↪️ Handed the rest of the work to a background run")
+    return (
+        "\n\n_Ran out of steps in this reply, so I've continued the rest as a "
+        f"background run — I'll post here when it's done._\n_{result.strip()}_"
     )

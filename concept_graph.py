@@ -25,6 +25,10 @@ import logging
 import threading
 from pathlib import Path
 
+# For the shared busy-timeout constant only — this module opens the same file.
+# memory.py does not import concept_graph, so this cannot cycle.
+import memory
+
 try:
     import networkx as nx
     NX_AVAILABLE = True
@@ -72,11 +76,33 @@ _graph_cache_ts: float = 0.0
 CACHE_TTL = 300  # rebuild in-memory graph every 5 min
 
 
+# This module opens the *same* file as memory.py, so it has to make the same
+# two promises or the fix in memory.get_db only covers half the writers: run
+# the schema once rather than on every connection (each executescript is a
+# write transaction), and wait properly for a competing write instead of
+# giving up at sqlite3's 5s default.
+_SCHEMA_READY: set[str] = set()
+_SCHEMA_LOCK = threading.Lock()
+
+
 def _get_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(_SCHEMA)
+    db_existed = DB_PATH.exists()
+    conn = sqlite3.connect(str(DB_PATH), timeout=memory._BUSY_TIMEOUT_SECONDS)
+    conn.execute(
+        f"PRAGMA busy_timeout={int(memory._BUSY_TIMEOUT_SECONDS * 1000)}"
+    )
+
+    path_key = str(DB_PATH)
+    if db_existed and path_key in _SCHEMA_READY:
+        return conn
+
+    with _SCHEMA_LOCK:
+        if db_existed and path_key in _SCHEMA_READY:
+            return conn
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_SCHEMA)
+        _SCHEMA_READY.add(path_key)
     return conn
 
 

@@ -16,6 +16,9 @@ from bs4 import BeautifulSoup
 
 import memory
 import concept_graph
+import isolation
+import mcp_client
+import skills_index
 
 logger = logging.getLogger("my-agent-mini")
 
@@ -76,6 +79,12 @@ OWNER_ONLY_TOOLS = {
     # Starting a background run commits shared resources — worker threads on a
     # 1 GB box and calls against a metered paid route — to autonomous work.
     "start_background_run",
+    # mcp_call dispatches to whatever the operator configured, with whatever
+    # credentials are in that server's headers. Its *tier* narrows per server
+    # (a docs server is a read), but the owner axis does not: "who may invoke
+    # this" stays the owner, because the set of reachable effects is only as
+    # bounded as the config, and the config is the owner's.
+    "mcp_call",
 }
 
 # Tools that need to know which conversation they were called from — the
@@ -394,21 +403,27 @@ def fetch_url(url: str) -> str:
 @tool("run_python", "Execute Python code and return the output. Use for calculations, data processing, etc.", "code")
 def run_python(code: str) -> str:
     """Execute Python code in a sandboxed subprocess with timeout."""
+    temp_path = ""
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        # The script has to live somewhere the sandbox can still see it. Inside
+        # the wrap /tmp is a private tmpfs, so a file written to the host's /tmp
+        # would simply not exist for the child; the scratch directory below sits
+        # under WORKSPACE, which is bound read-write into the namespace.
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, dir=_PY_SCRATCH,
+        ) as f:
             f.write(code)
             f.flush()
             temp_path = f.name
 
         result = subprocess.run(
-            ["python3", temp_path],
+            isolation.wrap(["python3", temp_path], writable=[WORKSPACE]),
             capture_output=True,
             text=True,
             timeout=30,  # 30 second timeout
-            cwd="/tmp",
+            cwd=_PY_SCRATCH,
+            env=isolation.scrubbed_env(),
         )
-
-        os.unlink(temp_path)
 
         output = ""
         if result.stdout:
@@ -426,6 +441,140 @@ def run_python(code: str) -> str:
         return "❌ Code execution timed out (30s limit)"
     except Exception as e:
         return f"❌ Execution error: {str(e)[:300]}"
+    finally:
+        # A timeout used to leave the script behind, because the unlink sat on
+        # the success path only.
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+@tool(
+    "find_skill",
+    "Look up a reusable engineering playbook (TDD, debugging, code review, "
+    "git workflow, security hardening, and ~20 more) before doing real "
+    "software work. Call with a query describing the task, or with no query "
+    "to see the full index.",
+    "query='', name=''",
+)
+def find_skill(query: str = "", name: str = "") -> str:
+    query, name = (query or "").strip(), (name or "").strip()
+
+    if name:
+        skill = skills_index.get(name)
+        if not skill:
+            available = ", ".join(s.name for s in skills_index.all_skills())
+            return f"❌ No skill named '{name}'. Available: {available}"
+        return skills_index.render(skill)
+
+    if not query:
+        lines = skills_index.index_lines()
+        if not lines:
+            return "No skill playbooks are installed."
+        return (
+            "Available playbooks (call find_skill with a query, or name= to "
+            "read one in full):\n" + "\n".join(lines)
+        )
+
+    matches = skills_index.search(query)
+    if not matches:
+        # Deliberately empty rather than the least-bad match: the model reads a
+        # returned playbook as instruction, so an irrelevant one is worse than
+        # none at all.
+        return (
+            f"No playbook covers '{query[:80]}'. Use your own judgment — call "
+            "find_skill with no query to see what does exist."
+        )
+
+    best = skills_index.render(matches[0])
+    if len(matches) > 1:
+        others = ", ".join(s.name for s in matches[1:])
+        best += f"\n\n---\nAlso possibly relevant (read with name=): {others}"
+    return best
+
+
+# ── MCP (Model Context Protocol) ──
+#
+# Two tools, not one per remote tool. Registering each MCP tool individually
+# would put an unbounded, server-controlled set of names into TOOLS, and
+# `test_every_registered_tool_has_a_tier` would fail the build for every one of
+# them — correctly, because nobody classified them. Worse, the system prompt
+# lists every registered tool, so a server offering 80 tools would crowd out
+# the prompt on a box whose whole problem is tokens per minute.
+#
+# So MCP tools stay off the registry and are reached through one dispatcher.
+# `mcp_list` is the discovery step that replaces having them in the prompt.
+
+
+@tool(
+    "mcp_list",
+    "List the tools available from configured MCP servers. Call with no server "
+    "to see which servers exist, or with a server name to see its tools and "
+    "their arguments. Do this before mcp_call.",
+    "server=''",
+)
+def mcp_list(server: str = "") -> str:
+    server = (server or "").strip()
+    names = mcp_client.configured_server_names()
+    if not names:
+        return (
+            "No MCP servers are configured. The owner can add them in "
+            "mcp_servers.json or the MCP_SERVERS environment variable."
+        )
+
+    if not server:
+        return "Configured MCP servers:\n" + "\n".join(
+            f"  • {n} (tier: {mcp_client.server_tier(n)})" for n in names
+        ) + "\n\nCall mcp_list with a server name to see its tools."
+
+    try:
+        tools_list = mcp_client.list_tools(server)
+    except mcp_client.MCPError as e:
+        return f"❌ {e}"
+
+    if not tools_list:
+        return f"{server} exposes no tools."
+
+    lines = [f"Tools on {server}:"]
+    for t in tools_list:
+        description = (t.get("description") or "").strip().replace("\n", " ")
+        if len(description) > 200:
+            description = description[:200] + "…"
+        schema = t.get("inputSchema") or {}
+        params = ", ".join((schema.get("properties") or {}).keys())
+        lines.append(f"  • {t.get('name')}({params}) — {description}")
+    return "\n".join(lines)
+
+
+@tool(
+    "mcp_call",
+    "Call a tool on a configured MCP server. Use mcp_list first to find the "
+    "server, tool name and its arguments. `arguments` is a JSON object.",
+    "server, tool, arguments={}",
+)
+def mcp_call(server: str, tool: str, arguments: dict | None = None) -> str:
+    server, tool = (server or "").strip(), (tool or "").strip()
+    if not server or not tool:
+        return "❌ mcp_call needs both a server and a tool name."
+
+    # The model sometimes emits the arguments object as a JSON string rather
+    # than an object, because the whole tool protocol is text.
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError:
+            return "❌ `arguments` was a string but not valid JSON."
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return "❌ `arguments` must be a JSON object."
+
+    try:
+        return mcp_client.call_tool(server, tool, arguments)
+    except mcp_client.MCPError as e:
+        return f"❌ {e}"
 
 
 @tool("memory_search", "Search your past conversations for information.", "query")
@@ -645,6 +794,12 @@ UNATTENDED_BLOCKED_TOOLS = {
 WORKSPACE = os.path.expanduser("~/agent_workspace")
 os.makedirs(WORKSPACE, exist_ok=True)
 
+# Scratch space for `run_python`. It lives under WORKSPACE rather than /tmp
+# because the sandbox gives the child a private tmpfs at /tmp, so a script
+# written to the host's /tmp is not there when the interpreter looks for it.
+_PY_SCRATCH = os.path.join(WORKSPACE, ".run_python")
+os.makedirs(_PY_SCRATCH, exist_ok=True)
+
 # Commands that are never allowed (protect the VM). The agent has no
 # interactive confirmation step, so high-impact commands are denied instead
 # of being guessed at. Read-only checks and normal development commands remain
@@ -694,12 +849,19 @@ def run_shell(command: str) -> str:
         if re.search(pattern, command, re.IGNORECASE):
             return "❌ Blocked for safety: high-impact or privileged shell commands are not allowed."
     try:
+        # BLOCKED_PATTERNS above is a speed bump, not a boundary — the sandbox
+        # is what actually confines this. Both stay: the denylist gives a clear
+        # refusal message for the obvious cases, the sandbox handles the rest.
         result = subprocess.run(
-            ["bash", "-c", command],
+            isolation.wrap(
+                ["bash", "-c", command],
+                writable=[WORKSPACE, REPOS_DIR],
+            ),
             capture_output=True,
             text=True,
             timeout=60,
             cwd=WORKSPACE,
+            env=isolation.scrubbed_env(),
         )
         output = ""
         if result.stdout:
@@ -1260,8 +1422,102 @@ def push_branch(
 
 
 @tool(
+    "github_list_pull_requests",
+    "List open (or closed) pull requests: number, title, author, branch, draft "
+    "state. github_list_issues deliberately excludes PRs, so this is the only "
+    "way to see them.",
+    "owner='', repo='', state='open'",
+)
+def github_list_pull_requests(owner: str = "", repo: str = "", state: str = "open") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        resp = http_requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls",
+            headers=headers,
+            params={"state": state, "per_page": 20},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        prs = resp.json()
+        if not prs:
+            return f"No {state} pull requests."
+        lines = []
+        for p in prs:
+            draft = " [draft]" if p.get("draft") else ""
+            lines.append(
+                f"#{p['number']} {p['title']}{draft} — @{p['user']['login']}, "
+                f"{p['head']['ref']} → {p['base']['ref']}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ GitHub PR list error: {str(e)[:300]}"
+
+
+@tool(
+    "github_pr_status",
+    "Mergeability and CI results for one pull request: review state, merge "
+    "conflicts, and which checks failed. Use before deciding whether a PR "
+    "needs work.",
+    "number, owner='', repo=''",
+)
+def github_pr_status(number: int, owner: str = "", repo: str = "") -> str:
+    headers = _github_headers()
+    if not headers:
+        return "❌ GITHUB_TOKEN is not configured on the server."
+    owner, repo = _github_repo_slug(owner, repo)
+    if not owner or not repo:
+        return "❌ No owner/repo given and no GITHUB_DEFAULT_OWNER/REPO configured."
+    try:
+        base = f"{GITHUB_API}/repos/{owner}/{repo}"
+        pr = http_requests.get(f"{base}/pulls/{number}", headers=headers, timeout=15)
+        pr.raise_for_status()
+        pr = pr.json()
+
+        lines = [f"#{pr['number']} {pr['title']} ({pr['state']})"]
+        if pr.get("merged"):
+            lines.append("Merged — no further work needed.")
+            return "\n".join(lines)
+        # mergeable is computed asynchronously by GitHub; null means "ask again"
+        # rather than "fine", and reporting null as mergeable is how an agent
+        # talks itself into pushing onto a conflicted branch.
+        mergeable = pr.get("mergeable")
+        lines.append(
+            "Mergeable: " + {True: "yes", False: "NO — conflicts with base"}.get(
+                mergeable, "not computed yet, re-check shortly"
+            )
+        )
+
+        checks = http_requests.get(
+            f"{base}/commits/{pr['head']['sha']}/check-runs", headers=headers, timeout=15
+        )
+        if checks.ok:
+            runs = checks.json().get("check_runs", [])
+            failed = [r for r in runs if r.get("conclusion") in ("failure", "timed_out")]
+            pending = [r for r in runs if r.get("status") != "completed"]
+            if not runs:
+                lines.append("CI: no checks reported.")
+            elif failed:
+                lines.append(f"CI: {len(failed)} of {len(runs)} FAILED")
+                for r in failed[:5]:
+                    lines.append(f"  ✗ {r['name']} — {r.get('html_url', '')}")
+            elif pending:
+                lines.append(f"CI: {len(pending)} still running.")
+            else:
+                lines.append(f"CI: all {len(runs)} checks passed.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ GitHub PR status error: {str(e)[:300]}"
+
+
+@tool(
     "github_list_issues",
-    "List open (or closed) issues in a GitHub repo.",
+    "List open (or closed) issues in a GitHub repo. Excludes pull requests — "
+    "use github_list_pull_requests for those.",
     "owner='', repo='', state='open'",
 )
 def github_list_issues(owner: str = "", repo: str = "", state: str = "open") -> str:
@@ -1354,6 +1610,10 @@ def server_health() -> str:
             parts.append(f"--- {svc} ---\n{(r.stdout or r.stderr).strip()}")
         except Exception as e:
             parts.append(f"--- {svc} ---\n(unavailable: {str(e)[:120]})")
+    # Report the sandbox posture here rather than only in the logs. Isolation
+    # degrades quietly when bwrap is missing, and a degraded sandbox that
+    # nobody can see is the same as no sandbox.
+    parts.append(f"--- sandbox ---\n{isolation.sandbox_status()}")
     return "\n\n".join(parts)[:MAX_SHELL_OUTPUT]
 
 
