@@ -59,7 +59,7 @@ def test_cohere(key):
 
 # Register all providers
 add_provider("Gemini",      "GEMINI_API_KEY",      test_gemini)
-add_provider("Groq",        "GROQ_API_KEY",        make_openai_test("https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile"))
+add_provider("Groq",        "GROQ_API_KEY",        make_openai_test("https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b"))
 add_provider("Grok (xAI)",  "XAI_API_KEY",         make_openai_test("https://api.x.ai/v1/chat/completions", "grok-3-mini-fast"))
 add_provider("Cerebras",    "CEREBRAS_API_KEY",     make_openai_test("https://api.cerebras.ai/v1/chat/completions", "llama-3.3-70b"))
 add_provider("SambaNova",   "SAMBANOVA_API_KEY",    make_openai_test("https://api.sambanova.ai/v1/chat/completions", "Meta-Llama-3.3-70B-Instruct"))

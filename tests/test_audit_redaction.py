@@ -166,19 +166,11 @@ def test_cost_report_contains_no_credentials(audit_env):
     assert "key=" not in report and "AIza" not in report and "mg_" not in report
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING G3 (HIGH) — the Gemini API key is in the request URL "
-    "(bot.py:556 `url += f'?key={provider[\"api_key\"]}'`), so requests' "
-    "HTTPError text is '400 Client Error … for url: …?key=AIza…'. That string "
-    "is returned to the channel by call_ai (bot.py:757), written to bot.log by "
-    "logger.warning (bot.py:753), and stored in ERROR_LOG, which /health prints "
-    "to whoever ran it. One bad Gemini response publishes the key to Slack. "
-    "Send the key as the x-goog-api-key header instead, and redact provider "
-    "errors before they are surfaced."))
 def test_provider_error_never_carries_the_api_key(audit_env, monkeypatch, tmp_path):
     slack_bolt = pytest.importorskip("slack_bolt")
     import requests
 
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     key = "AIzaSyREAL_LOOKING_KEY_FOR_THE_AUDIT_99"
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-fake-for-tests")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-fake-for-tests")
@@ -214,3 +206,4 @@ def test_provider_error_never_carries_the_api_key(audit_env, monkeypatch, tmp_pa
 
     surfaced = bot.call_ai([{"role": "user", "content": "hi"}], "sys")
     assert key not in surfaced, "the API key was returned to the Slack channel"
+    assert "HTTP 400" in surfaced

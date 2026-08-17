@@ -434,12 +434,9 @@ def context_limit_chars() -> int:
 
     This budget covers the transcript ONLY. The system prompt is sent on every
     call on top of it and is not small: base prompt + operating manual + tool
-    descriptions + playbooks measures ~35k chars (~8.8k tokens), so the real
-    worst case per call is ~59k chars / ~15k tokens. A model needs >= 16k
-    context to run this at the default — 8k models cannot, whatever this value
-    is set to. Both shipped routes (Pollinations, merge.dev) are 128k-class, so
-    the default is comfortable; a small local model is the case to watch, and
-    `start_autonomy` logs the real numbers at boot.
+    descriptions is kept below ~3k chars (~750 tokens), so the real worst case
+    at the default is ~27k chars / ~6.8k tokens. Long transcripts still need
+    compaction; `start_autonomy` logs the real numbers at boot.
     """
     return max(2000, _int_env("RUN_CONTEXT_LIMIT_CHARS", 24000))
 

@@ -104,35 +104,10 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT",
-    f"""You are {BOT_NAME}, a sharp AI assistant on Slack.
-
-PERSONALITY:
-- Be direct and actionable — skip filler phrases like "Great question!" or "Sure!"
-- Give concrete answers, not overviews. If someone asks how to do X, show them.
-- Use short paragraphs. Bullet points for lists. Code blocks for code.
-- When you don't know something, say so and offer to search the web.
-- Remember past conversations and facts about the user.
-
-CAPABILITIES:
-- 🔍 Search the web for real-time info
-- 🌐 Read any webpage or URL
-- 🐍 Run Python code for calculations, data processing
-- 💻 Run shell commands on the server (install, git, files, system tasks)
-- 📁 Save and read files in a persistent workspace
-- 🖼️ Analyze images (screenshots, photos, diagrams, documents)
-- 📄 Read uploaded files (PDF, text, code, CSV)
-- 🧾 Extract text from scans and images with local OCR
-- 🧠 Remember things about users across conversations
-
-You are a doer, not just a talker. When asked to accomplish something,
-actually do it with your tools, verify it worked, and report the result.
-
-FORMAT FOR SLACK:
-- Use *bold* for emphasis (not **bold**)
-- Use `code` for inline code
-- Use ```code blocks``` for multi-line code
-- Use > for quotes
-- Keep responses concise — expand only if asked"""
+    f"""You are {BOT_NAME}, an AI assistant on Slack.
+Be direct and concise. Use tools to perform and verify requested work; never
+claim an action was taken when it was not. State limits honestly.
+Use Slack formatting: *bold*, `code`, and code blocks."""
 )
 
 # ── Operating Manual (optional) ──
@@ -279,7 +254,7 @@ def build_providers():
             "name": "Groq",
             "type": "openai_compat",
             "api_key": os.environ["GROQ_API_KEY"],
-            "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
             "url": "https://api.groq.com/openai/v1/chat/completions",
         })
 
@@ -572,7 +547,10 @@ def process_slack_files(files: list[dict], ocr_requested: bool = False) -> tuple
 def call_gemini(provider: dict, messages: list[dict], system_prompt: str, images: list[dict] = None) -> str:
     """Call Google Gemini API with optional vision (images)."""
     url = provider["url"].format(model=provider["model"])
-    url += f"?key={provider['api_key']}"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": provider["api_key"],
+    }
 
     contents = []
     for msg in messages:
@@ -611,7 +589,7 @@ def call_gemini(provider: dict, messages: list[dict], system_prompt: str, images
         }
     }
 
-    resp = http_requests.post(url, json=payload, timeout=120)
+    resp = http_requests.post(url, headers=headers, json=payload, timeout=120)
     resp.raise_for_status()
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -643,7 +621,7 @@ def call_openai_compat(provider: dict, messages: list[dict], system_prompt: str,
     payload = {
         "model": provider["model"],
         "messages": api_messages,
-        "max_tokens": 4000,
+        "max_tokens": 512,
         "temperature": 0.7,
     }
 
@@ -683,6 +661,12 @@ def call_cohere(provider: dict, messages: list[dict], system_prompt: str, images
     resp.raise_for_status()
     data = resp.json()
     return data["message"]["content"][0]["text"]
+
+
+def _provider_error(error: Exception) -> str:
+    """A safe error summary for Slack and logs; never include request URLs."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    return f"HTTP {status}" if status else str(error).split(" for url:", 1)[0][:200]
 
 
 def call_ai(
@@ -789,7 +773,7 @@ def call_ai(
 
         except Exception as e:
             _record_provider_failure(provider, e)
-            error_msg = str(e)[:200]
+            error_msg = _provider_error(e)
             logger.warning(f"⚠️ {provider['name']} failed; cooling down: {error_msg}")
             errors.append(f"• {provider['name']}: {error_msg}")
 
@@ -960,7 +944,7 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
         logger.debug(f"Thread summarization skipped: {e}")
 
 
-SUMMARY_EVERY = int(os.getenv("SUMMARY_EVERY", "12"))
+SUMMARY_EVERY = int(os.getenv("SUMMARY_EVERY", "1000000"))
 
 
 def _maybe_summarize_thread(conv_key: str, user_id: str):

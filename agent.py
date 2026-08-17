@@ -69,7 +69,26 @@ def get_agent_system_prompt(base_prompt: str, user_facts: dict[str, list[str]] |
             "Use these to personalize your responses.\n"
         )
 
-    return f"""{base_prompt}
+    return f"""{base_prompt}{facts_section}
+
+TOOLS: {tools_desc}
+
+For a tool, respond exactly:
+[TOOL_CALL]
+{{"tool": "tool_name", "args": {{"param": "value"}}}}
+[/TOOL_CALL]
+
+Use tools to do requested work and verify results; never claim an action was
+taken without its tool call. For multi-step work, create a plan first.
+
+ONE EXCEPTION — read-only tools batch: web_search, fetch_url, read_file,
+list_files, repo_read_file, repo_list_files, github_read_file,
+github_list_issues, memory_search, graph_recall, server_health, list_tasks,
+list_schedules, run_status. Only batch reads whose arguments are independent;
+never batch writes, deployments, schedules, or remembers.
+"""
+
+    f"""{base_prompt}
 
 {facts_section}
 ═══════════════════════════════════════════════
