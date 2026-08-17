@@ -21,7 +21,7 @@ REPO_URL="https://github.com/denis94uk-coder/my-agent-mini.git"
 # ── Step 1: System packages ──
 echo "📦 Installing system packages..."
 sudo apt update -qq
-sudo apt install -y -qq python3 python3-venv python3-pip git curl > /dev/null 2>&1
+sudo apt install -y -qq python3 python3-venv python3-pip git curl tesseract-ocr > /dev/null 2>&1
 echo "   ✅ System packages ready"
 
 # ── Step 2: Clone or update repo ──

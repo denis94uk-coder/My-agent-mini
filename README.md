@@ -293,6 +293,17 @@ The built-in router can also use the provider integrations already in the bot, i
 
 > The default Pollinations route is keyless. Optional free API keys improve reliability, but every provider still has its own quota and terms. Merge Gateway can be added as a paid-credit route using one `mg_...` key; it is not an unlimited/free provider.
 
+## 📄 Local OCR for the free micro VM
+
+Images can be OCRed locally with Tesseract—no Docker, GPU, or OCR API key. `setup.sh` installs it; on an existing VM run:
+
+```bash
+sudo apt update && sudo apt install -y tesseract-ocr
+sudo systemctl restart my-agent
+```
+
+Send an image with “OCR this” or “extract the text”. Scanned PDFs use the same bounded path (5 pages at 150 DPI) to stay within 1 GB RAM.
+
 ## 🚀 Quick Start
 
 ### 1. Create a free VM

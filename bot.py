@@ -56,6 +56,7 @@ import triggers
 import workflows
 import health
 import concept_graph
+import local_ocr
 
 # ── Logging ──
 # Console (for `journalctl`/systemd) + a rotating file so history survives
@@ -120,6 +121,7 @@ CAPABILITIES:
 - 📁 Save and read files in a persistent workspace
 - 🖼️ Analyze images (screenshots, photos, diagrams, documents)
 - 📄 Read uploaded files (PDF, text, code, CSV)
+- 🧾 Extract text from scans and images with local OCR
 - 🧠 Remember things about users across conversations
 
 You are a doer, not just a talker. When asked to accomplish something,
@@ -424,6 +426,7 @@ def build_providers():
 
 # Image types that Gemini Vision can process
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+OCR_IMAGE_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
 
 # Document types we can extract text from
 DOC_TYPES = {
@@ -482,7 +485,7 @@ def is_text_file(filename: str, mimetype: str) -> bool:
     return False
 
 
-def process_slack_files(files: list[dict]) -> tuple[list[dict], list[str]]:
+def process_slack_files(files: list[dict], ocr_requested: bool = False) -> tuple[list[dict], list[str]]:
     """
     Process files attached to a Slack message.
     Returns: (images_for_vision, text_descriptions)
@@ -518,11 +521,25 @@ def process_slack_files(files: list[dict]) -> tuple[list[dict], list[str]]:
                 b64 = base64.b64encode(data).decode("utf-8")
                 images.append({"mime_type": mimetype, "data": b64})
                 texts.append(f"🖼️ [Image: {filename}]")
+                if ocr_requested and local_ocr.is_available():
+                    try:
+                        ocr_text = local_ocr.extract_image(data, OCR_IMAGE_SUFFIXES[mimetype])
+                        if ocr_text:
+                            texts.append(f"📄 *OCR: {filename}*\n```\n{ocr_text[:6000]}\n```")
+                    except Exception as error:
+                        logger.warning(f"  → OCR failed for {filename}: {error}")
                 logger.info(f"  → Image ready for vision ({len(data)} bytes)")
 
             # PDF → extract text
             elif mimetype == "application/pdf":
                 pdf_text = extract_text_from_pdf(data)
+                if pdf_text.startswith("(PDF has no extractable text") and local_ocr.is_available():
+                    try:
+                        ocr_text = local_ocr.extract_pdf(data)
+                        if ocr_text:
+                            pdf_text = ocr_text
+                    except Exception as error:
+                        logger.warning(f"  → PDF OCR failed for {filename}: {error}")
                 if len(pdf_text) > 6000:
                     pdf_text = pdf_text[:6000] + "\n\n... (truncated, document is very long)"
                 texts.append(f"📄 *Document: {filename}*\n```\n{pdf_text}\n```")
@@ -822,7 +839,7 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
     images = []
     file_texts = []
     if files:
-        images, file_texts = process_slack_files(files)
+        images, file_texts = process_slack_files(files, ocr_requested=local_ocr.is_requested(user_text))
 
     # Build the full user message with file content
     full_message = user_text
@@ -838,6 +855,8 @@ def process_message(user_text: str, channel: str, thread_ts: str, user_id: str, 
         full_message = "The user shared an image. Describe what you see and offer to help with anything related to it."
     elif images and user_text.strip():
         full_message = f"{user_text}\n\n(The user also attached an image — analyze it in context of their message.)"
+    if file_texts and images:
+        full_message += "\n\n" + "\n\n".join(file_texts)
 
     # Store in persistent memory (text only, not image data)
     memory.add_message(conv_key, "user", full_message[:2000])
@@ -1259,6 +1278,7 @@ def handle_status(ack, command, say):
         has_pdf = True
     except ImportError:
         has_pdf = False
+    has_local_ocr = local_ocr.is_available()
 
     graph_stats = concept_graph.get_graph_stats()
     status_text = (
@@ -1266,6 +1286,7 @@ def handle_status(ack, command, say):
         f"*AI routes:* {len(PROVIDERS)} active (automatic fallback + cooldowns)\n"
         f"*Vision:* {'✅ Gemini' if has_vision else '❌ Add GEMINI_API_KEY'}\n"
         f"*PDF reading:* {'✅' if has_pdf else '❌ Install PyMuPDF'}\n"
+        f"*Scan OCR:* {'✅ Local Tesseract' if has_local_ocr else '○ Install Tesseract'}\n"
         f"*Memory:*\n"
         f"  • {stats['messages']} messages stored\n"
         f"  • {stats['facts']} facts remembered\n"
