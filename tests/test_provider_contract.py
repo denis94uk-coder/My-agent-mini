@@ -83,3 +83,23 @@ def test_gpt_oss_uses_low_reasoning_effort(bot_module, monkeypatch):
 
     assert captured["payload"]["max_tokens"] == 512
     assert captured["payload"]["reasoning_effort"] == "low"
+
+
+def test_pdf_file_share_reaches_message_processor(bot_module, monkeypatch):
+    seen = {}
+
+    def capture(*_args, **kwargs):
+        seen["files"] = kwargs["files"]
+
+    monkeypatch.setattr(bot_module, "process_message", capture)
+    bot_module.handle_message({
+        "channel": "D1",
+        "channel_type": "im",
+        "files": [{"name": "report.pdf", "mimetype": "application/pdf"}],
+        "subtype": "file_share",
+        "text": "",
+        "ts": "1.0",
+        "user": "U1",
+    }, lambda **_message: None)
+
+    assert seen["files"][0]["name"] == "report.pdf"
