@@ -987,7 +987,7 @@ def _maybe_summarize_thread(conv_key: str, user_id: str):
 @slack_app.event("message")
 def handle_message(event, say):
     """Handle DMs — now with file support."""
-    if event.get("bot_id") or event.get("subtype"):
+    if event.get("bot_id") or event.get("subtype") not in (None, "file_share"):
         return
 
     channel = event["channel"]
