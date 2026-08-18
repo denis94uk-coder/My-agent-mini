@@ -29,10 +29,11 @@ def add_provider(name, env_var, test_fn):
 
 # 1. Gemini
 def test_gemini(key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {"contents": [{"parts": [{"text": "Say hello in one word."}]}],
                "generationConfig": {"maxOutputTokens": 20}}
-    r = requests.post(url, json=payload, timeout=30)
+    r = requests.post(url, headers={"x-goog-api-key": key}, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()["candidates"][0]["content"]["parts"][0]["text"][:80]
 
@@ -59,7 +60,17 @@ def test_cohere(key):
 
 # Register all providers
 add_provider("Gemini",      "GEMINI_API_KEY",      test_gemini)
-add_provider("Groq",        "GROQ_API_KEY",        make_openai_test("https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b"))
+add_provider("Groq",        "GROQ_API_KEY",        make_openai_test("https://api.groq.com/openai/v1/chat/completions", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")))
+merge_key = os.getenv("MERGE_GATEWAY_API_KEY") or os.getenv("MERGE_API_KEY")
+if merge_key:
+    PROVIDERS.append({
+        "name": "Merge Gateway", "env_var": "MERGE_GATEWAY_API_KEY",
+        "key": merge_key,
+        "test": make_openai_test(
+            "https://api-gateway.merge.dev/v1/openai/chat/completions",
+            os.getenv("MERGE_GATEWAY_MODEL", os.getenv("MERGE_MODEL", "openai/gpt-4o-mini")),
+        ),
+    })
 add_provider("Grok (xAI)",  "XAI_API_KEY",         make_openai_test("https://api.x.ai/v1/chat/completions", "grok-3-mini-fast"))
 add_provider("Cerebras",    "CEREBRAS_API_KEY",     make_openai_test("https://api.cerebras.ai/v1/chat/completions", "llama-3.3-70b"))
 add_provider("SambaNova",   "SAMBANOVA_API_KEY",    make_openai_test("https://api.sambanova.ai/v1/chat/completions", "Meta-Llama-3.3-70B-Instruct"))
