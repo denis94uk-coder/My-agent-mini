@@ -207,3 +207,75 @@ def test_provider_error_never_carries_the_api_key(audit_env, monkeypatch, tmp_pa
     surfaced = bot.call_ai([{"role": "user", "content": "hi"}], "sys")
     assert key not in surfaced, "the API key was returned to the Slack channel"
     assert "HTTP 400" in surfaced
+
+
+def test_provider_transport_error_never_carries_the_api_key(audit_env, monkeypatch, tmp_path):
+    """A request without an HTTP response must not fall back to its URL text."""
+    slack_bolt = pytest.importorskip("slack_bolt")
+    import requests
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    key = "AIzaSyREAL_LOOKING_KEY_FOR_THE_AUDIT_99"
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-fake-for-tests")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-fake-for-tests")
+
+    class FakeApp:
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, _):
+            return lambda *a, **k: (lambda fn: fn)
+
+    monkeypatch.setattr(slack_bolt, "App", FakeApp)
+    for name in [m for m in list(sys.modules) if m == "bot"]:
+        del sys.modules[name]
+    import bot
+
+    error = requests.ConnectionError(
+        f"connection failed: https://example.test/?key={key}"
+    )
+    assert key not in bot._provider_error(error)
+
+
+def test_slack_exception_never_echoes_a_secret(audit_env, monkeypatch, tmp_path):
+    """The outer Slack handler must not reveal an unexpected provider error."""
+    slack_bolt = pytest.importorskip("slack_bolt")
+    import requests
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    key = "AIzaSyREAL_LOOKING_KEY_FOR_THE_AUDIT_99"
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-fake-for-tests")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-fake-for-tests")
+
+    class FakeApp:
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, _):
+            return lambda *a, **k: (lambda fn: fn)
+
+    class FakeClient:
+        def reactions_remove(self, **_):
+            pass
+
+    monkeypatch.setattr(slack_bolt, "App", FakeApp)
+    for name in [m for m in list(sys.modules) if m == "bot"]:
+        del sys.modules[name]
+    import bot
+    bot.ERROR_LOG.clear()
+    monkeypatch.setattr(bot, "slack_client", FakeClient())
+
+    def raise_provider_error(*_, **__):
+        raise requests.ConnectionError(
+            f"connection failed for url: https://example.test/?key={key}"
+        )
+
+    monkeypatch.setattr(bot, "process_message", raise_provider_error)
+    sent = []
+    bot.handle_message(
+        {"channel": "D1", "ts": "1.0", "text": "hi", "user": "U1", "channel_type": "im"},
+        lambda **message: sent.append(message),
+    )
+
+    assert key not in sent[0]["text"]
+    assert key not in "\n".join(message for _, message in bot.ERROR_LOG)

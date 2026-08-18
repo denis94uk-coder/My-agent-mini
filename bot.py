@@ -32,7 +32,6 @@ import time
 import base64
 import logging
 import mimetypes
-import traceback
 import threading
 from pathlib import Path
 
@@ -80,11 +79,18 @@ logger = logging.getLogger("my-agent-mini")
 START_TIME = time.time()
 ERROR_LOG = []  # list of (timestamp, message), capped below
 MAX_ERROR_LOG = 25
+PUBLIC_ERROR = "Sorry, I hit an internal error. Please try again shortly."
+
+
+def _safe_error_summary(error: Exception) -> str:
+    """Return a diagnostic that cannot expose URLs, credentials, or payloads."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    return f"HTTP {status}" if status else type(error).__name__
 
 
 def record_error(context: str, error: Exception):
     """Track recent errors in memory for /health, in addition to full logging."""
-    ERROR_LOG.append((time.time(), f"{context}: {str(error)[:200]}"))
+    ERROR_LOG.append((time.time(), f"{context}: {_safe_error_summary(error)}"))
     del ERROR_LOG[:-MAX_ERROR_LOG]
 
 # ── Slack Config ──
@@ -186,7 +192,7 @@ def _record_provider_failure(provider: dict, error: Exception) -> None:
         PROVIDER_HEALTH[provider["name"]] = {
             "cooldown_until": time.time() + cooldown,
             "failures": failures,
-            "last_error": f"HTTP {status}" if status else str(error)[:120],
+            "last_error": _safe_error_summary(error),
             "last_ok": old.get("last_ok", 0),
         }
 
@@ -447,7 +453,8 @@ def extract_text_from_pdf(data: bytes) -> str:
         # Fallback without PyMuPDF
         return "(PDF reading requires PyMuPDF — install with: pip install PyMuPDF)"
     except Exception as e:
-        return f"(Error reading PDF: {str(e)[:200]})"
+        logger.warning("PDF extraction failed: %s", _safe_error_summary(e))
+        return "(Error reading PDF)"
 
 
 def is_text_file(filename: str, mimetype: str) -> bool:
@@ -536,8 +543,8 @@ def process_slack_files(files: list[dict], ocr_requested: bool = False) -> tuple
                 texts.append(f"📎 {filename} ({mimetype} — unsupported file type)")
 
         except Exception as e:
-            logger.error(f"  → Failed to process {filename}: {e}")
-            texts.append(f"📎 {filename} (failed to download: {str(e)[:100]})")
+            logger.error("  → Failed to process %s: %s", filename, _safe_error_summary(e))
+            texts.append(f"📎 {filename} (failed to download)")
 
     return images, texts
 
@@ -667,8 +674,7 @@ def call_cohere(provider: dict, messages: list[dict], system_prompt: str, images
 
 def _provider_error(error: Exception) -> str:
     """A safe error summary for Slack and logs; never include request URLs."""
-    status = getattr(getattr(error, "response", None), "status_code", None)
-    return f"HTTP {status}" if status else str(error).split(" for url:", 1)[0][:200]
+    return _safe_error_summary(error)
 
 
 def call_ai(
@@ -1009,13 +1015,13 @@ def handle_message(event, say):
     try:
         process_message(user_text, channel, thread_ts, user_id, say, files=files, message_ts=msg_ts)
     except Exception as e:
-        logger.error(f"❌ Error: {traceback.format_exc()}")
+        logger.error("❌ DM processing failed: %s", _safe_error_summary(e))
         record_error("process_message", e)
         try:
             slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
             pass
-        say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
+        say(text=PUBLIC_ERROR, thread_ts=thread_ts)
 
 
 @slack_app.event("app_mention")
@@ -1038,13 +1044,13 @@ def handle_mention(event, say):
     try:
         process_message(user_text, channel, thread_ts, user_id, say, files=files, message_ts=msg_ts)
     except Exception as e:
-        logger.error(f"❌ Error: {traceback.format_exc()}")
+        logger.error("❌ Mention processing failed: %s", _safe_error_summary(e))
         record_error("process_message", e)
         try:
             slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name=os.getenv("LOADING_REACTION", "hourglass_flowing_sand"))
         except Exception:
             pass
-        say(text=f"Sorry, I hit an error: {str(e)[:200]}", thread_ts=thread_ts)
+        say(text=PUBLIC_ERROR, thread_ts=thread_ts)
 
 
 # ── Slash Commands ──

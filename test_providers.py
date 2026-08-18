@@ -130,7 +130,8 @@ def main():
             results.append({"name": name, "status": "✅", "time": f"{elapsed}s"})
             passed += 1
         except Exception as e:
-            error = str(e)[:120]
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            error = f"HTTP {status}" if status else type(e).__name__
             print(f"❌ FAILED → {error}")
             results.append({"name": name, "status": "❌", "error": error})
             failed += 1
