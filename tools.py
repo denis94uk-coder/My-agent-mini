@@ -42,11 +42,8 @@ def tool(name: str, description: str, params: str):
 
 
 def get_tools_description() -> str:
-    """Get formatted description of all available tools for the system prompt."""
-    lines = []
-    for t in TOOLS.values():
-        lines.append(f"  • {t['name']}({t['params']}) — {t['description']}")
-    return "\n".join(lines)
+    """Compact tool signatures for the prompt sent on every AI call."""
+    return "; ".join(f"{t['name']}({t['params']})" for t in TOOLS.values())
 
 
 # Tools that can change external state on behalf of the whole workspace

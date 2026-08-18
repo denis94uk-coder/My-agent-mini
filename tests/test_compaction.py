@@ -177,16 +177,14 @@ def test_compaction_counts_against_the_step_budget(monkeypatch):
 def test_system_prompt_stays_within_a_sane_size():
     """
     The system prompt is sent on every call and silently grows every time a
-    tool or playbook is added — with the operating manual attached it is
-    ~26k chars (~6.4k tokens), still larger than the whole transcript budget.
-    Past ~45k the default config stops fitting a 16k-context route, so this
-    fails before a user discovers it as a mid-run provider rejection.
+    tool is added. It must leave enough minute quota for normal follow-up
+    messages on the free routes this bot targets.
 
     It got there once: a free-tier route rejected the assembled payload with
     HTTP 413, and since it was the only route configured, the bot had none.
     """
     prompt = agent.get_agent_system_prompt("You are a test bot.")
-    assert len(prompt) < 45_000, (
+    assert len(prompt) < 3_000, (
         f"system prompt has grown to {len(prompt):,} chars "
         f"(~{len(prompt) // 4:,} tokens) — re-check the context budget"
     )
@@ -196,5 +194,4 @@ def test_worst_case_context_is_documented_accurately():
     """Pins the arithmetic the .env.example and runner docstring state."""
     prompt = agent.get_agent_system_prompt("You are a test bot.")
     worst_case_tokens = (len(prompt) + runner.context_limit_chars()) // 4
-    # The docs claim >= 16k context is required at the default budget.
-    assert 8_000 < worst_case_tokens < 16_000
+    assert 4_000 < worst_case_tokens < 8_000
