@@ -245,7 +245,7 @@ def build_providers():
             # gemini-2.0-flash retired 2026-03-03. Free-tier access is the
             # Flash line; override with GEMINI_MODEL and check the current
             # name at ai.google.dev/gemini-api/docs/models if a call 404s.
-            "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            "model": os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
             "url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         })
 
@@ -624,6 +624,8 @@ def call_openai_compat(provider: dict, messages: list[dict], system_prompt: str,
         "max_tokens": 512,
         "temperature": 0.7,
     }
+    if provider["model"].startswith("openai/gpt-oss-"):
+        payload["reasoning_effort"] = "low"
 
     request_url = provider["url"].format(model=provider["model"])
     resp = http_requests.post(request_url, headers=headers, json=payload, timeout=120)
