@@ -45,7 +45,10 @@ def make_openai_test(url, model):
                    "max_tokens": 20, "temperature": 0}
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"][:80]
+        content = r.json()["choices"][0]["message"].get("content")
+        if not content:
+            raise RuntimeError("provider returned empty content")
+        return content[:80]
     return test_fn
 
 # Cohere test
