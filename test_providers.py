@@ -4,6 +4,9 @@ Tests all 10 AI providers to verify your API keys are working.
 Run: python test_providers.py
 """
 
+# This is an executable health-check script, not a pytest module.
+__test__ = False
+
 import os
 import time
 import json
@@ -29,7 +32,7 @@ def add_provider(name, env_var, test_fn):
 
 # 1. Gemini
 def test_gemini(key):
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {"contents": [{"parts": [{"text": "Say hello in one word."}]}],
                "generationConfig": {"maxOutputTokens": 20}}
@@ -42,7 +45,9 @@ def make_openai_test(url, model):
     def test_fn(key):
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         payload = {"model": model, "messages": [{"role": "user", "content": "Say hello in one word."}],
-                   "max_tokens": 20, "temperature": 0}
+                   "max_tokens": 512, "temperature": 0}
+        if model.startswith("openai/gpt-oss-"):
+            payload["reasoning_effort"] = "low"
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
         content = r.json()["choices"][0]["message"].get("content")
